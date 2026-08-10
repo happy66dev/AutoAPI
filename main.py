@@ -24,6 +24,8 @@ import logging
 import sys
 # threading 用来在 REPL 敲 quit 后停掉 uvicorn 喵
 import threading
+# time 用来等 uvicorn 真正启动完成，避免跳过它的停机流程喵
+import time
 
 # uvicorn 是跑 FastAPI 的 ASGI 服务器喵
 import uvicorn
@@ -135,10 +137,36 @@ def main() -> int:
         repl = start_repl_thread(state)
 
         def watch_exit() -> None:
-            """等 REPL 的退出信号，收到就通知 uvicorn 优雅停机喵~"""
-            # 阻塞等待退出事件被置位喵
+            """
+            等 REPL 的退出信号，收到就通知 uvicorn 优雅停机喵~
+
+            为什么要先等 server.started：
+                uvicorn 的 _serve() 里是这么写的 ——
+                    await self.startup()
+                    if self.should_exit: return     # 直接返回，跳过了 shutdown()
+                    await self.main_loop()
+                    await self.shutdown()
+                也就是说，如果在 startup 刚做完的那一刻 should_exit 已经是 True，
+                uvicorn 会直接返回而不调用 shutdown()。而 shutdown() 才是通知 lifespan
+                收尾的那一步，跳过它就意味着我们在 lifespan 里写的清理逻辑
+                （关掉 httpx 客户端、取消热重载任务）根本不会执行，
+                同时 lifespan 任务会因为收不到关闭消息而被硬取消，在终端上吐一串
+                CancelledError 的 traceback 喵。
+
+                手敲命令时人的手速不可能这么快，所以平时看不见；但用管道把命令喂进来
+                （比如脚本化测试）会稳定踩中。所以这里先等服务真正起来再置标志喵。
+            """
+            # 阻塞等待 REPL 的退出事件被置位喵
             repl.should_exit.wait()
+            # 等 uvicorn 真正完成启动，最多等 10 秒（100 次 × 0.1 秒）喵
+            for _ in range(100):
+                # started 为 True 说明 startup 已经做完，此时置标志会走完整的停机流程喵
+                if server.started:
+                    break
+                # 还没起来就再等一小会喵
+                time.sleep(0.1)
             # 置位 uvicorn 的退出标志，它会在当前请求处理完后优雅停机喵
+            # 喵~防御：即使上面等超时了也照样置位，免得主人敲了 quit 却怎么都退不出去喵
             server.should_exit = True
 
         # 起一个 daemon 线程专门等这个信号，不能放在 REPL 线程里因为那边要继续读输入喵

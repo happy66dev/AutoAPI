@@ -986,6 +986,232 @@ async def test_非流式的200里带error也算假成功():
     assert hits == ["primary.test", "backup.test"]
 
 
+# ============ 7. 交互式改配置喵 ============
+
+
+def make_repl(tmp_path):
+    """
+    造一个连着真配置文件的 REPL 喵~
+
+    输入：pytest 给的临时目录
+    输出：(repl 对象, 配置文件路径)
+    说明：改配置的命令会真的读写这个临时文件，所以能验证「立即生效 + 写回磁盘」两件事喵。
+    """
+    # 引入 REPL 类喵
+    from autoapi.repl import Repl
+    # 引入 YAML 库用来写初始配置喵
+    import yaml as _yaml
+    # 引入配置加载函数喵
+    from autoapi.config import load_config
+    # 在临时目录里写一份初始配置喵
+    path = tmp_path / "config.yaml"
+    # 用测试用的配置字典序列化成 YAML 喵
+    path.write_text(_yaml.safe_dump(make_config_dict(), allow_unicode=True), encoding="utf-8")
+    # 加载它并创建运行时状态喵
+    state = RuntimeState(load_config(path))
+    # 返回 REPL 和配置文件路径喵
+    return Repl(state), path
+
+
+def test_交互式追加候选(tmp_path):
+    """cand add 应该把新候选追加到链尾，并立即生效喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 追加一个候选喵
+    repl.dispatch(
+        'cand add auto-test {"name": "新中转", "base_url": "https://new.test", '
+        '"api_key": "sk-new-key-9999", "model": "gpt-4o-mini"}'
+    )
+    # 内存里的候选链应该从 2 个变成 3 个喵
+    chain = repl.state.config.virtual_models["auto-test"]
+    assert len(chain) == 3
+    # 新候选应该在链尾，也就是优先级最低喵
+    assert chain[2].name == "新中转"
+    assert chain[2].model == "gpt-4o-mini"
+    # 磁盘上的文件也应该被更新了喵
+    assert "new.test" in path.read_text(encoding="utf-8")
+
+
+def test_交互式删候选(tmp_path):
+    """cand rm 应该删掉指定序号的候选喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 删掉第一个候选喵
+    repl.dispatch("cand rm auto-test 1")
+    # 应该只剩一个候选喵
+    chain = repl.state.config.virtual_models["auto-test"]
+    assert len(chain) == 1
+    # 剩下的应该是原来的第二个（备用）喵
+    assert chain[0].name == "备用"
+
+
+def test_不许把候选链删空(tmp_path):
+    """删到只剩一个时应该拒绝，因为空链的虚拟模型无法服务喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 先删掉一个，剩一个喵
+    repl.dispatch("cand rm auto-test 1")
+    # 再删应该被拒绝，配置保持不变喵
+    repl.dispatch("cand rm auto-test 1")
+    # 应该还剩着那一个，没被删掉喵
+    assert len(repl.state.config.virtual_models["auto-test"]) == 1
+
+
+def test_交互式调整候选优先级(tmp_path):
+    """cand mv 应该能把备用提到链首喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 把第 2 个候选挪到第 1 位喵
+    repl.dispatch("cand mv auto-test 2 1")
+    # 现在链首应该是原来的备用喵
+    chain = repl.state.config.virtual_models["auto-test"]
+    assert chain[0].name == "备用"
+    # 原来的主力应该退到第 2 位喵
+    assert chain[1].name == "主力"
+
+
+def test_交互式新建和删除虚拟模型(tmp_path):
+    """vm add / vm rm 应该能增删整个虚拟模型喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 新建一个虚拟模型并配上第一个候选喵
+    repl.dispatch(
+        'vm add my-new {"base_url": "https://mine.test", "api_key": "sk-mine-1234", "model": "my-model"}'
+    )
+    # 现在应该有两个虚拟模型喵
+    assert set(repl.state.list_virtual_models()) == {"auto-test", "my-new"}
+    # 新虚拟模型应该有一个候选喵
+    assert len(repl.state.config.virtual_models["my-new"]) == 1
+    # 再把它删掉喵
+    repl.dispatch("vm rm my-new")
+    # 应该只剩原来那个喵
+    assert repl.state.list_virtual_models() == ["auto-test"]
+
+
+def test_不许新建重名的虚拟模型(tmp_path):
+    """重名时应该拒绝，否则会悄悄把已有的候选链整条覆盖掉喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 用已经存在的名字新建喵
+    repl.dispatch('vm add auto-test {"base_url": "https://x.test", "api_key": "sk-1", "model": "m"}')
+    # 原来的两个候选应该完好无损喵
+    assert len(repl.state.config.virtual_models["auto-test"]) == 2
+
+
+def test_不许删掉最后一个虚拟模型(tmp_path):
+    """删光了代理就没东西可服务了，应该拒绝喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 尝试删掉唯一的虚拟模型喵
+    repl.dispatch("vm rm auto-test")
+    # 应该还在喵
+    assert repl.state.list_virtual_models() == ["auto-test"]
+
+
+def test_交互式改超时配置(tmp_path):
+    """set 应该能改 server 段的超时并立即生效喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 改掉首内容超时喵
+    repl.dispatch("set first_content_timeout 99")
+    # 内存里的配置应该立刻变了喵
+    assert repl.state.config.server.first_content_timeout == 99.0
+    # 磁盘上也应该被更新喵
+    assert "99" in path.read_text(encoding="utf-8")
+
+
+def test_改坏配置不会影响运行中的代理(tmp_path):
+    """
+    这是改配置流程最重要的保障喵：一次手滑不能把跑着的代理搞停摆。
+    校验失败时内存配置和磁盘文件都该保持原样喵。
+    """
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 记下改动前的磁盘内容和候选数量喵
+    before_text = path.read_text(encoding="utf-8")
+    before_count = len(repl.state.config.virtual_models["auto-test"])
+    # 追加一个缺少必填字段 api_key 的坏候选喵
+    repl.dispatch('cand add auto-test {"base_url": "https://bad.test", "model": "m"}')
+    # 内存里的候选数量应该没变，坏候选没被应用喵
+    assert len(repl.state.config.virtual_models["auto-test"]) == before_count
+    # 磁盘上的文件也应该一个字节都没被动过喵
+    assert path.read_text(encoding="utf-8") == before_text
+
+
+def test_改规则的JSON写坏了也不影响运行(tmp_path):
+    """JSON 语法错误应该在解析阶段就被挡下，配置完全不动喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 记下改动前的规则数量喵
+    before = len(repl.state.config.rules)
+    # 喂一段语法坏掉的 JSON 喵
+    repl.dispatch('rule add {"match": {"status": 429,, "action": "next"}')
+    # 规则数量应该没变喵
+    assert len(repl.state.config.rules) == before
+
+
+def test_操作不存在的虚拟模型会被拒绝(tmp_path):
+    """虚拟模型名打错时应该拒绝并提示，而不是静默失败喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 记下改动前的规则和虚拟模型状态喵
+    before = repl.state.list_virtual_models()
+    # 对一个不存在的虚拟模型加候选喵
+    repl.dispatch('cand add 打错的名字 {"base_url": "https://x.test", "api_key": "sk-1", "model": "m"}')
+    # 虚拟模型表应该完全没变喵
+    assert repl.state.list_virtual_models() == before
+
+
+def test_不认识的命令不会崩(tmp_path):
+    """乱敲命令只该打印提示，不能让 REPL 线程挂掉喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 敲一堆不认识的东西，都不该抛异常喵
+    repl.dispatch("这是什么命令")
+    repl.dispatch("rule")
+    repl.dispatch("cand")
+    repl.dispatch("vm 乱七八糟")
+    repl.dispatch("set")
+    repl.dispatch("set 不存在的字段 123")
+    repl.dispatch("set port 不是数字")
+    # 空行也该被安静忽略喵
+    repl.dispatch("")
+    # 配置应该完全没被影响喵
+    assert repl.state.list_virtual_models() == ["auto-test"]
+
+
+@pytest.mark.asyncio
+async def test_改完配置立刻对新请求生效(tmp_path):
+    """
+    端到端验证：交互式把备用提到链首之后，下一条请求就该直接打备用喵。
+    这是「改完立即生效」这个承诺的真实验证喵。
+    """
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：两个地址都正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 返回正常响应喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造 REPL（它内部带着运行时状态）喵
+    repl, path = make_repl(tmp_path)
+    # 造假上游客户端喵
+    client = make_client(handler)
+    # 先发一条请求，应该打链首的主力喵
+    await run_proxy(client, repl.state, {"model": "auto-test"})
+    # 确认打的是主力喵
+    assert hits == ["primary.test"]
+    # 交互式把备用提到链首喵
+    repl.dispatch("cand mv auto-test 2 1")
+    # 再发一条请求喵
+    await run_proxy(client, repl.state, {"model": "auto-test"})
+    # 这次应该直接打备用，证明改动立刻生效了喵
+    assert hits == ["primary.test", "backup.test"]
+
+
 @pytest.mark.asyncio
 async def test_并发请求能正常处理():
     """
