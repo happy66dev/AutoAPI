@@ -1987,6 +1987,44 @@ def test_不同节点的连续失败计数互相独立():
     assert state.record_failure(chain[1], "错误", 5) == 0
 
 
+@pytest.mark.asyncio
+async def test_count_tokens错误不进入目标模式重试(monkeypatch):
+    """count_tokens 错误即使开启目标模式也只执行一轮，不循环等待重试喵~"""
+    # 记录目标模式是否错误地等待下一轮喵
+    sleep_calls: list[float] = []
+    async def fake_sleep(seconds: float) -> None:
+        # 收集所有等待，正常 count_tokens 失败不应产生目标模式等待喵
+        sleep_calls.append(seconds)
+    # 替换目标模式等待函数，避免测试真实等待喵
+    monkeypatch.setattr("autoapi.proxy.asyncio.sleep", fake_sleep)
+    # 记录上游请求次数喵
+    request_count = 0
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 所有候选都返回普通上游错误喵
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(503, json={"error": {"message": "unavailable"}})
+    # 创建并开启目标模式的运行状态喵
+    state = make_state()
+    state.set_target_mode(True)
+    # 直接使用 count_tokens 路径发起请求喵
+    outcome = await handle_request(
+        make_client(handler),
+        state,
+        "POST",
+        "/v1/messages/count_tokens",
+        "",
+        {},
+        json.dumps({"model": "auto-test", "messages": []}).encode("utf-8"),
+    )
+    # 失败应在一轮结束后返回普通失败，不返回目标模式 429 喵
+    assert outcome.success is False
+    assert outcome.status == 502
+    # 两个候选各自按规则重试一次，但没有目标模式第二轮喵
+    assert request_count == 4
+    assert sleep_calls == [1.0, 1.0]
+
+
 def test_避险配置能被正确解析():
     """新增的两个配置项要能正常读出来，并且有安全下限喵~"""
     # 默认值喵

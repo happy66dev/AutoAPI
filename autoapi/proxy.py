@@ -468,11 +468,19 @@ async def handle_request(
             failures.append(f"{candidate.label} → 状态 {result.status}：{result.error_text[:150]}")
         # 整条候选链都走完了还没成功喵
         state.total_exhausted += 1
-        # 正常模式只跑一轮，保留原有 502 行为喵
-        if not target_mode:
-            logger.error(
-                "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
-            )
+        # count_tokens 失败不代表 LLM 输出链路失效，目标模式不得为它循环重试喵
+        if not target_mode or _is_count_tokens_request(method, path):
+            # count_tokens 也沿用普通失败响应，避免进入目标模式等待循环喵
+            if _is_count_tokens_request(method, path):
+                logger.warning(
+                    "[%s] count_tokens 失败，跳过目标模式重试喵：%s",
+                    req_id,
+                    " | ".join(failures),
+                )
+            else:
+                logger.error(
+                    "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
+                )
             return ProxyOutcome(
                 success=False,
                 status=502,
