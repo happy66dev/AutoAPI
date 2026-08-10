@@ -28,6 +28,9 @@ from dataclasses import dataclass, field
 # 从配置模块引入候选和配置类型喵
 from .config import AppConfig, Candidate
 
+# RPM 和 TPM 固定只统计最近 60 秒的成功请求喵~
+RATE_WINDOW_SECONDS = 60.0
+
 
 @dataclass
 class CandidateStats:
@@ -49,7 +52,7 @@ class CandidateStats:
 
 @dataclass
 class RequestMetric:
-    """一条已成功请求在滚动 RPM/TPM 窗口内的记录喵~"""
+    """一条成功请求的统计记录，速率与平均耗时使用各自窗口喵~"""
 
     # 成功被确认的单调时钟时刻，单位：秒喵
     at: float
@@ -336,12 +339,16 @@ class RuntimeState:
             event.elapsed_ms = elapsed_ms
 
     def _prune_rate_events_locked(self, now: float) -> None:
-        """在已持锁状态下删掉滚动窗口外的请求记录喵~"""
-        # 算出当前配置对应的滚动窗口边界，单位：秒喵
-        cutoff = now - (self._config.server.metrics_window_minutes * 60.0)
+        """在已持锁状态下删掉两个统计窗口都不再需要的请求记录喵~"""
+        # 计算平均耗时配置窗口的秒数，单位：秒喵
+        elapsed_window_seconds = self._config.server.metrics_window_minutes * 60.0
+        # 保留较长窗口，避免清理掉仍需参与平均耗时计算的事件喵
+        retention_seconds = max(RATE_WINDOW_SECONDS, elapsed_window_seconds)
+        # 计算统一事件列表的清理边界，单位：单调时钟秒喵
+        cutoff = now - retention_seconds
         # 逐个虚拟模型清理喵
         for virtual_model, events in list(self._rate_events.items()):
-            # 保留边界之后的记录，保持原始时间顺序喵
+            # 保留两个统计窗口中任意一个仍可能使用的记录喵
             kept = [event for event in events if event.at >= cutoff]
             # 还有记录就替换回去喵
             if kept:
@@ -352,30 +359,42 @@ class RuntimeState:
 
     def snapshot_virtual_model_rates(self) -> list[VirtualModelRate]:
         """
-        返回所有当前虚拟模型近 60 秒的 RPM/TPM 快照喵~
+        返回所有虚拟模型的速率与平均耗时快照喵~
 
-        TPM 只在窗口内每一条成功请求都收到上游 usage 时才显示数值；只要有一条没有，
+        RPM/TPM 固定统计最近 60 秒；平均耗时使用配置文件中的性能统计窗口喵。
+        TPM 只在速率窗口内每一条成功请求都收到上游 usage 时才显示数值；只要有一条没有，
         就返回 None，让横幅明确写「TPM 未完整上报」，避免总数看起来像是准确的喵。
         """
         # 加锁做清理和汇总喵
         with self._lock:
             # 取一次现在，整次快照统一用它做窗口边界喵
             now = time.monotonic()
-            # 先清掉过期记录喵
+            # 先清掉两个统计窗口都不再需要的记录喵
             self._prune_rate_events_locked(now)
+            # 计算 RPM/TPM 固定 60 秒窗口边界喵
+            rate_cutoff = now - RATE_WINDOW_SECONDS
+            # 计算平均耗时配置窗口边界喵
+            elapsed_cutoff = now - (self._config.server.metrics_window_minutes * 60.0)
             # 按当前配置顺序遍历，这样横幅顺序稳定喵
             rows: list[VirtualModelRate] = []
             for virtual_model in self._config.virtual_models:
                 # 没有记录时用空列表喵
                 events = self._rate_events.get(virtual_model, [])
-                # 统计总请求数喵
-                rpm = len(events)
-                # 只收集上游明确上报 usage 的记录喵
-                known = [event.usage_tokens for event in events if event.usage_tokens is not None]
-                # 只有全窗口的请求都上报 usage 时，TPM 才可作为完整数字展示喵
+                # 只保留最近 60 秒内的事件用于 RPM/TPM 喵
+                rate_events = [event for event in events if event.at >= rate_cutoff]
+                # 只保留配置窗口内且已结束的事件用于平均耗时喵
+                elapsed_events = [
+                    event for event in events
+                    if event.at >= elapsed_cutoff and event.elapsed_ms is not None
+                ]
+                # 统计固定 60 秒窗口内的成功请求数喵
+                rpm = len(rate_events)
+                # 只收集固定 60 秒窗口内上游明确上报 usage 的记录喵
+                known = [event.usage_tokens for event in rate_events if event.usage_tokens is not None]
+                # 只有速率窗口内的请求都上报 usage 时，TPM 才可作为完整数字展示喵
                 tpm = sum(known) if rpm > 0 and len(known) == rpm else None
-                # 只让已经完整结束的请求参与平均耗时喵
-                completed = [event.elapsed_ms for event in events if event.elapsed_ms is not None]
+                # 提取配置窗口内已经完整结束请求的耗时喵
+                completed = [event.elapsed_ms for event in elapsed_events]
                 # 结束请求越多，平均值越稳定；没有完成请求时保持未知喵
                 average_elapsed_ms = sum(completed) / len(completed) if completed else None
                 # 组装这一行快照喵

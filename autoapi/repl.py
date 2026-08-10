@@ -82,7 +82,7 @@ HELP_TEXT = """
                               min_content_chars      放行前要累积的内容字符数
                               auto_hedge_threshold   连续失败几次就自动避险，0=关闭
                               auto_hedge_minutes     自动避险冻结多少分钟
-                              metrics_window_minutes 动态 RPM/TPM/平均耗时窗口（分钟），默认 30
+                              metrics_window_minutes 平均耗时统计窗口（分钟），默认 30
                               connect_timeout        连接握手超时（秒）
                               reload_poll_interval   配置热重载轮询间隔（秒），0=关闭
                               port                   监听端口

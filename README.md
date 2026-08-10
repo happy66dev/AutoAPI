@@ -243,7 +243,7 @@ INFO autoapi.server 流式请求结束 虚拟模型=auto-strong 总时长=12840m
 - 流式请求的放行时长：从请求开始到代理确认流健康并开始转发喵~
 - 流式请求的总时长：等上游流结束后记录，放行后不会再受 `stream_timeout` 截断喵~
 
-REPL 底部状态栏会按虚拟模型显示最近 **30 分钟滚动窗口** 的动态 RPM、TPM 与平均耗时喵~ 统计窗口默认是 30 分钟，可以用 `set metrics_window_minutes <分钟>` 修改喵~ RPM 是窗口内成功请求数，TPM **只使用上游响应中的 usage token**，不会按字符数或本地 tokenizer 估算喵~ 如果上游没有返回 usage，RPM 仍会统计，但 TPM 会显示「未完整上报」，避免把不准确的数字当成真实消耗喵~ 没有成功请求的虚拟模型（RPM=0）不会显示，节约状态栏空间喵~ 平均耗时只统计窗口内已经完整结束的请求，流式请求要等整条流结束后才会计入喵~
+REPL 底部状态栏会按虚拟模型显示最近 **60 秒** 的动态 RPM/TPM，以及配置窗口内的平均耗时喵~ RPM/TPM 固定统计最近 60 秒，平均耗时统计窗口默认是 30 分钟，可以用 `set metrics_window_minutes <分钟>` 修改喵~ RPM 是 60 秒内成功请求数，TPM **只使用上游响应中的 usage token**，不会按字符数或本地 tokenizer 估算喵~ 如果上游没有返回 usage，RPM 仍会统计，但 TPM 会显示「未完整上报」，避免把不准确的数字当成真实消耗喵~ 没有成功请求的虚拟模型（RPM=0）不会显示，节约状态栏空间喵~ 平均耗时只统计配置窗口内已经完整结束的请求，流式请求要等整条流结束后才会计入喵~
 
 常见 usage 字段包括 OpenAI 的 `usage.total_tokens`，或 `prompt_tokens + completion_tokens`，以及 Anthropic 的 `input_tokens + output_tokens` 喵~ 上游不返回这些字段时，代理不会擅自修改请求或猜测 token 数喵。
 

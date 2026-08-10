@@ -748,14 +748,33 @@ def test_超过60秒的负载事件会自动清理(monkeypatch):
     state = make_state()
     # 先记录一条事件喵
     event = state.record_rate_event("auto-test", 50)
-    # 人为把它挪到默认 30 分钟窗口外，避免真实等半小时让测试变慢喵
-    event.at -= 1801
-    # 读取快照会顺手清掉过期事件喵
+    # 人为把它挪到固定 60 秒速率窗口外喵
+    event.at -= 61
+    # 读取快照会按速率窗口过滤事件喵
     row = state.snapshot_virtual_model_rates()[0]
-    # 窗口内应该已无请求喵
+    # 速率窗口内应该已无请求喵
     assert row.rpm == 0
     # 没有请求时 TPM 也应保持未知喵
     assert row.tpm is None
+
+
+def test_速率窗口与平均耗时窗口彼此独立():
+    """超过 60 秒的事件不计入 RPM/TPM，但仍可进入默认平均耗时窗口喵~"""
+    # 解析默认 30 分钟平均耗时窗口配置喵
+    state = make_state()
+    # 记录一条已完成请求喵
+    event = state.record_rate_event("auto-test", 50)
+    state.attach_elapsed_ms(event, 700.0)
+    # 将事件移出 60 秒速率窗口但保留在平均耗时窗口内喵
+    event.at -= 61
+    # 读取拆分窗口后的快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # RPM/TPM 不应继续统计 60 秒之外的事件喵
+    assert row.rpm == 0
+    assert row.tpm is None
+    # 平均耗时仍应统计配置窗口内的已完成事件喵
+    assert row.completed_requests == 1
+    assert row.average_elapsed_ms == 700.0
 
 
 def test_平均耗时只统计已完成请求():
