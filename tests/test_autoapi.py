@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 # json 用来构造测试用的请求体和 SSE 负载喵
 import json
+# logging 用来测试日志上色喵
+import logging
 # time 用来测试冻结过期喵
 import time
 
@@ -1841,6 +1843,118 @@ def test_操作不存在的虚拟模型会被拒绝(tmp_path):
     repl.dispatch('cand add 打错的名字 {"base_url": "https://x.test", "api_key": "sk-1", "model": "m"}')
     # 虚拟模型表应该完全没变喵
     assert repl.state.list_virtual_models() == before
+
+
+def test_主动冻结按模型名(tmp_path):
+    """freeze add 应该能按真实模型名冻结节点喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 按模型名冻结 600 秒喵
+    repl.dispatch("freeze add auto-test gpt-4o 600")
+    # 那个节点应该被冻上了喵
+    primary = repl.state.config.virtual_models["auto-test"][0]
+    assert 595 < repl.state.is_frozen(primary) <= 600
+    # 另一个节点不该受影响喵
+    assert repl.state.is_frozen(repl.state.config.virtual_models["auto-test"][1]) == 0
+
+
+def test_主动冻结按序号(tmp_path):
+    """freeze add 也应该能按 vm 里显示的序号冻结喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 按序号冻结第 2 个节点喵
+    repl.dispatch("freeze add auto-test 2 300")
+    # 第 2 个应该被冻上喵
+    assert 295 < repl.state.is_frozen(repl.state.config.virtual_models["auto-test"][1]) <= 300
+    # 第 1 个不该受影响喵
+    assert repl.state.is_frozen(repl.state.config.virtual_models["auto-test"][0]) == 0
+
+
+def test_主动冻结的原因可区分(tmp_path):
+    """手动冻结的原因要写明是手动的，好和自动避险、额度限制区分开喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 冻结一个节点喵
+    repl.dispatch("freeze add auto-test gpt-4o 600")
+    # 取冻结列表喵
+    freezes = repl.state.list_freezes()
+    # 原因里应该有「手动」字样喵
+    assert "手动" in freezes[0][2]
+
+
+def test_解冻指定节点(tmp_path):
+    """freeze rm 应该只解冻点名的那一个，不影响别的喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 取出两个节点喵
+    chain = repl.state.config.virtual_models["auto-test"]
+    # 两个都冻上喵
+    repl.state.freeze(chain[0], 600, "测试")
+    repl.state.freeze(chain[1], 600, "测试")
+    # 只解冻第一个喵
+    repl.dispatch("freeze rm auto-test gpt-4o")
+    # 第一个应该可用了喵
+    assert repl.state.is_frozen(chain[0]) == 0
+    # 第二个应该还冻着喵
+    assert repl.state.is_frozen(chain[1]) > 0
+
+
+def test_主动冻结的非法输入(tmp_path):
+    """秒数非法、序号越界、模型名不存在、虚拟模型不存在，都该被挡下且不冻结任何东西喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 秒数不是数字喵
+    repl.dispatch("freeze add auto-test gpt-4o 一百秒")
+    # 秒数为 0 喵
+    repl.dispatch("freeze add auto-test gpt-4o 0")
+    # 秒数为负喵
+    repl.dispatch("freeze add auto-test gpt-4o -50")
+    # 序号越界喵
+    repl.dispatch("freeze add auto-test 99 600")
+    # 模型名不存在喵
+    repl.dispatch("freeze add auto-test 不存在的模型 600")
+    # 虚拟模型不存在喵
+    repl.dispatch("freeze add 不存在 gpt-4o 600")
+    # 参数不全喵
+    repl.dispatch("freeze add auto-test gpt-4o")
+    repl.dispatch("freeze rm")
+    # 一个节点都不该被冻结喵
+    assert repl.state.list_freezes() == []
+
+
+def test_解冻本来没冻的节点不会出错(tmp_path):
+    """解冻一个本来就没冻结的节点应该给出提示而不是报错喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 解冻一个没冻过的节点，不该抛异常喵
+    repl.dispatch("freeze rm auto-test gpt-4o")
+    # 冻结表应该还是空的喵
+    assert repl.state.list_freezes() == []
+
+
+def test_日志颜色映射():
+    """WARNING 要黄色、ERROR 要红色，这是主人明确要求的喵~"""
+    # 引入颜色表和格式化器喵
+    from main import COLOR_RESET, LEVEL_COLORS, ColorFormatter
+    # WARNING 应该是黄色喵
+    assert LEVEL_COLORS["WARNING"] == "\033[33m"
+    # ERROR 应该是红色喵
+    assert LEVEL_COLORS["ERROR"] == "\033[31m"
+    # INFO 不上色，避免正常日志也花里胡哨喵
+    assert LEVEL_COLORS["INFO"] == ""
+    # 造一个格式化器喵
+    formatter = ColorFormatter("%(levelname)s %(message)s")
+    # 造一条 WARNING 日志记录喵
+    record = logging.LogRecord("test", logging.WARNING, "f.py", 1, "出问题了喵", None, None)
+    # 渲染出来应该被黄色包起来喵
+    text = formatter.format(record)
+    assert text.startswith("\033[33m")
+    # 结尾要有重置码，否则颜色会漏到后面的输出去喵
+    assert text.endswith(COLOR_RESET)
+    # 造一条 INFO 日志喵
+    info_record = logging.LogRecord("test", logging.INFO, "f.py", 1, "一切正常喵", None, None)
+    # INFO 不该被套任何颜色码喵
+    assert "\033[" not in formatter.format(info_record)
 
 
 def test_不认识的命令不会崩(tmp_path):

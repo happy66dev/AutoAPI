@@ -77,6 +77,11 @@ HELP_TEXT = """
                               port                   监听端口
 
   冻结类：
+    freeze add <虚拟模型> <模型名或序号> <秒数>
+                            主动冻结某个节点，到期自动恢复喵
+                            适合上游要维护、或想临时把流量挪走时用
+    freeze rm <虚拟模型> <模型名或序号>
+                            解冻某个指定节点，让它立刻可用喵
     freeze clear            立刻清空所有冻结，让所有候选马上可用喵
 
   其他：
@@ -749,6 +754,113 @@ class Repl:
 
     # ---------- 冻结与配置类命令喵 ----------
 
+    def cmd_freeze_add(self, vm_name: str, model_or_index: str, seconds_text: str) -> None:
+        """
+        主动把某个节点冻结指定秒数喵~
+
+        用途：主人已经知道某个上游要维护、或者想临时把流量从某个节点挪走时，
+             不用改配置删节点，冻一段时间就行，到期自动恢复喵。
+
+        节点可以用两种方式指定，因为两种都好用在不同场合喵：
+            按真实模型名（比如 gpt-4o）—— 从日志或横幅里直接抄过来最方便
+            按序号（比如 2）—— vm 命令里看到的那个序号，同名节点多时用它更准
+        """
+        # 喵~防御：秒数必须能转成数字喵
+        try:
+            seconds = float(seconds_text)
+        except ValueError:
+            print(f"秒数 {seconds_text!r} 不是数字喵~")
+            return
+        # 喵~防御：非正数冻结毫无意义，直接挡掉并提示喵
+        if seconds <= 0:
+            print("冻结秒数要大于 0 喵~")
+            return
+        # 取候选链，虚拟模型不存在会抛 ConfigError 由 dispatch 兜住喵
+        chain = self.state.get_chain(vm_name)
+        # 喵~防御：虚拟模型不存在时列出现有的帮主人核对喵
+        if chain is None:
+            available = "、".join(self.state.list_virtual_models()) or "（一个都没有）"
+            print(f"虚拟模型 {vm_name!r} 不存在喵，现有的是：{available}")
+            return
+        # 找出要冻结的那些节点喵
+        targets = []
+        # 先试着把参数当序号解析喵
+        if model_or_index.isdigit():
+            # 转成整数喵
+            index = int(model_or_index)
+            # 喵~防御：序号越界时明确提示范围喵
+            if not (1 <= index <= len(chain)):
+                print(f"序号要在 1~{len(chain)} 之间喵~")
+                return
+            # 按序号取那一个节点喵
+            targets = [chain[index - 1]]
+        # 不是纯数字就当成真实模型名来匹配喵
+        else:
+            # 收集所有 model 名匹配的节点。可能有多个，因为同一个模型名可能配了多个渠道喵
+            targets = [c for c in chain if c.model == model_or_index]
+            # 喵~防御：一个都没匹配上时把这个虚拟模型下所有可选的模型名列出来喵
+            if not targets:
+                names = "、".join(sorted({c.model for c in chain}))
+                print(f"虚拟模型 {vm_name} 下没有模型名为 {model_or_index!r} 的节点喵，可选的有：{names}")
+                return
+        # 逐个冻结匹配到的节点喵
+        for candidate in targets:
+            # 写入冻结表，原因里标明是手动冻结，好和自动避险、额度限制区分开喵
+            self.state.freeze(candidate, seconds, f"主人手动冻结 {seconds:.0f} 秒")
+            # 打印结果，带上倒计时的可读形式喵
+            print(f"已冻结 {candidate.label}，{format_countdown(seconds)}后自动恢复喵~")
+        # 匹配到多个时补一句说明，免得主人以为多冻了喵
+        if len(targets) > 1:
+            print(f"（模型名 {model_or_index} 在这个虚拟模型下有 {len(targets)} 个节点，都冻上了喵）")
+
+    def cmd_freeze_rm(self, vm_name: str, model_or_index: str) -> None:
+        """
+        解冻某个指定的节点喵~
+
+        和 freeze clear 的区别：clear 是一把清空所有冻结，这个只解冻主人点名的那一个。
+        节点被自动避险冻上、但主人确认它其实已经好了的时候，用这个最合适喵。
+        """
+        # 取候选链喵
+        chain = self.state.get_chain(vm_name)
+        # 喵~防御：虚拟模型不存在时列出现有的喵
+        if chain is None:
+            available = "、".join(self.state.list_virtual_models()) or "（一个都没有）"
+            print(f"虚拟模型 {vm_name!r} 不存在喵，现有的是：{available}")
+            return
+        # 找出要解冻的节点，逻辑和 freeze add 一致喵
+        if model_or_index.isdigit():
+            # 转成整数喵
+            index = int(model_or_index)
+            # 喵~防御：序号越界喵
+            if not (1 <= index <= len(chain)):
+                print(f"序号要在 1~{len(chain)} 之间喵~")
+                return
+            # 按序号取喵
+            targets = [chain[index - 1]]
+        else:
+            # 按模型名匹配喵
+            targets = [c for c in chain if c.model == model_or_index]
+            # 喵~防御：没匹配上时列出可选的模型名喵
+            if not targets:
+                names = "、".join(sorted({c.model for c in chain}))
+                print(f"虚拟模型 {vm_name} 下没有模型名为 {model_or_index!r} 的节点喵，可选的有：{names}")
+                return
+        # 记录实际解冻了几个（本来就没冻的不算）喵
+        unfrozen = 0
+        # 逐个解冻喵
+        for candidate in targets:
+            # 只有本来在冻结中的才算真的解冻了一个喵
+            if self.state.is_frozen(candidate) > 0:
+                # 解冻它喵
+                self.state.unfreeze(candidate)
+                # 计数加一喵
+                unfrozen += 1
+                # 打印结果喵
+                print(f"已解冻 {candidate.label}，现在立刻可用喵~")
+        # 喵~防御：一个都没解冻说明它们本来就没被冻结，明确告知而不是静默无反应喵
+        if unfrozen == 0:
+            print("这些节点本来就没被冻结喵~")
+
     def cmd_freeze_clear(self) -> None:
         """清空所有冻结记录喵~"""
         # 清空并拿到被清掉的条数喵
@@ -973,8 +1085,31 @@ class Repl:
             if sub == "clear":
                 self.cmd_freeze_clear()
                 return
+            # freeze add 主动冻结某个节点喵
+            if sub == "add":
+                # 喵~防御：需要虚拟模型、节点、秒数三样喵
+                if len(parts) < 5:
+                    print(
+                        "用法喵：freeze add <虚拟模型> <模型名或序号> <秒数>\n"
+                        "  例如：freeze add auto-free openai/gpt-5.6-terra 600\n"
+                        "        freeze add auto-free 2 600     （2 是 vm 里看到的序号）"
+                    )
+                    return
+                self.cmd_freeze_add(parts[2], parts[3], parts[4])
+                return
+            # freeze rm 解冻某个指定节点喵
+            if sub in ("rm", "remove", "del"):
+                # 喵~防御：需要虚拟模型和节点两样喵
+                if len(parts) < 4:
+                    print(
+                        "用法喵：freeze rm <虚拟模型> <模型名或序号>\n"
+                        "  例如：freeze rm auto-free openai/gpt-5.6-terra"
+                    )
+                    return
+                self.cmd_freeze_rm(parts[2], parts[3])
+                return
             # 喵~防御：不认识的子命令给出提示喵
-            print(f"不认识的 freeze 子命令 {sub!r} 喵，试试 freeze ls~")
+            print(f"不认识的 freeze 子命令 {sub!r} 喵，支持 ls / add / rm / clear~")
             return
         # reload 命令重载配置喵
         if head == "reload":
@@ -1007,18 +1142,22 @@ class Repl:
         from prompt_toolkit.history import InMemoryHistory
         from prompt_toolkit.styles import Style
 
-        # 定义横幅各部分的配色喵
+        # 定义横幅各部分的配色喵。
+        # 主人注意：这里刻意「只染文字颜色、不动背景」喵。
+        # prompt_toolkit 的 bottom_toolbar 默认样式是反显的（相当于给整条加灰底），
+        # 所以必须显式写 noreverse 并把背景设成 default 才能把那层底色摘掉，
+        # 只留下文字本身的颜色 —— 这样横幅会融进主人自己的终端配色里，不突兀喵。
         style = Style.from_dict({
-            # 底部工具栏的底色，用深灰让文字更清楚喵
-            "bottom-toolbar": "bg:#333333 #ffffff",
+            # 工具栏本体：取消反显、背景跟随终端默认，文字用不刺眼的浅灰喵
+            "bottom-toolbar": "noreverse bg:default #aaaaaa",
             # 警告标题用黄色加粗，最醒目喵
-            "bottom-toolbar.warn": "bg:#333333 #ffcc00 bold",
+            "bottom-toolbar.warn": "noreverse bg:default #ffcc00 bold",
             # 一切正常时用绿色喵
-            "bottom-toolbar.ok": "bg:#333333 #55ff55",
-            # 「虚拟模型/节点」用白色喵
-            "bottom-toolbar.node": "bg:#333333 #ffffff",
-            # 倒计时用青色，方便快速扫到还剩多久喵
-            "bottom-toolbar.countdown": "bg:#333333 #55ffff bold",
+            "bottom-toolbar.ok": "noreverse bg:default #55ff55",
+            # 「虚拟模型/节点」用亮白，比周围文字重一点好读喵
+            "bottom-toolbar.node": "noreverse bg:default #ffffff",
+            # 倒计时用青色加粗，方便快速扫到还剩多久喵
+            "bottom-toolbar.countdown": "noreverse bg:default #55ffff bold",
         })
         # 可以 Tab 补全的命令词，覆盖所有主命令和常用子命令喵
         completer = WordCompleter(

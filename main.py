@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 # logging 用来配置全局日志格式喵
 import logging
+# os 用来读 NO_COLOR 环境变量，判断主人是否明确要求不上色喵
+import os
 # sys 用来控制退出码喵
 import sys
 # pathlib 用来算脚本自己所在的目录，好让配置文件不依赖当前工作目录喵
@@ -42,17 +44,101 @@ from autoapi.server import create_app
 from autoapi.state import RuntimeState
 
 
+# 各日志级别对应的 ANSI 颜色码喵
+LEVEL_COLORS = {
+    # DEBUG 用暗灰，存在但不抢眼喵
+    "DEBUG": "\033[90m",
+    # INFO 用默认色，不上色以免正常日志也花里胡哨喵
+    "INFO": "",
+    # WARNING 用黄色，主人要求的喵
+    "WARNING": "\033[33m",
+    # ERROR 用红色，主人要求的喵
+    "ERROR": "\033[31m",
+    # CRITICAL 用红底白字，比 ERROR 还要跳一级喵
+    "CRITICAL": "\033[41;97m",
+}
+# 重置颜色的 ANSI 码，每行结尾都要补上它，否则颜色会漏到后面的输出去喵
+COLOR_RESET = "\033[0m"
+
+
+def supports_color() -> bool:
+    """
+    判断当前终端能不能显示颜色喵~
+
+    为什么必须判断：ANSI 转义码在不支持的地方会原样显示成一堆 ESC[33m 这样的乱码。
+    最典型的就是主人用 `python main.py > autoapi.log` 把日志重定向到文件时 ——
+    文件里混进转义码会让日志难读、也不好被别的工具解析喵。
+
+    Windows 上还要额外做一件事：老式的 console 默认不认 ANSI，需要主动开启
+    「虚拟终端处理」模式。开成功了才算支持颜色喵。
+    """
+    # 喵~防御：stdout 不是终端（被重定向到文件或管道）时一律不上色喵
+    if not sys.stdout.isatty():
+        return False
+    # 有些 CI 环境会设这个变量明确要求不上色，尊重它喵
+    if os.environ.get("NO_COLOR"):
+        return False
+    # 非 Windows 平台（Linux、macOS）的终端基本都认 ANSI，直接返回支持喵
+    if sys.platform != "win32":
+        return True
+    # Windows 上尝试开启虚拟终端处理模式喵
+    try:
+        # 引入 ctypes 调 Windows API 喵
+        import ctypes
+        # 拿到 kernel32 库喵
+        kernel32 = ctypes.windll.kernel32
+        # -11 是 STD_OUTPUT_HANDLE，也就是标准输出的句柄喵
+        handle = kernel32.GetStdHandle(-11)
+        # 用来接收当前控制台模式的变量喵
+        mode = ctypes.c_uint32()
+        # 先读出当前模式，读失败说明这不是个正常的控制台喵
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # 0x0004 是 ENABLE_VIRTUAL_TERMINAL_PROCESSING，开了才认 ANSI 转义码喵
+        # 用「或」的方式加上这个标志，保留原有的其他标志不动喵
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    # 喵~防御：任何一步失败都保守地认为不支持颜色，宁可没颜色也不要满屏乱码喵
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class ColorFormatter(logging.Formatter):
+    """给日志按级别上色的格式化器喵~"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        """
+        把一条日志渲染成带颜色的文本喵~
+
+        做法：先用父类渲染出正常的日志文本，再整行套上这个级别对应的颜色。
+        整行上色而不是只染级别名，是因为一条 WARNING 的重点往往在后面的消息里
+        （比如「自动避险 xxx：连续失败 3 次」），整行黄色扫一眼就能定位到喵。
+        """
+        # 先让父类按格式串渲染出朴素文本喵
+        text = super().format(record)
+        # 取这个级别对应的颜色码，没有对应色就用空串（也就是不上色）喵
+        color = LEVEL_COLORS.get(record.levelname, "")
+        # 没有颜色就原样返回，避免白白拼接两个空串喵
+        if not color:
+            return text
+        # 前面加颜色码、后面补重置码，防止颜色漏到后续输出喵
+        return f"{color}{text}{COLOR_RESET}"
+
+
 def setup_logging() -> None:
     """配置全局日志格式喵~"""
+    # 日志格式：时间 级别 来源 消息，时间精确到秒足够排查了喵
+    fmt = "%(asctime)s %(levelname)-7s %(name)-15s %(message)s"
+    # 时间格式，只留时分秒让日志行短一点喵
+    datefmt = "%H:%M:%S"
+    # 建一个输出到 stderr 的处理器喵
+    handler = logging.StreamHandler()
+    # 终端支持颜色就用彩色格式化器，否则用朴素的，避免日志文件里混进转义码喵
+    if supports_color():
+        handler.setFormatter(ColorFormatter(fmt, datefmt=datefmt))
+    else:
+        handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
     # 设成 INFO 级别，能看到每条请求走了哪个候选，又不会被 DEBUG 噪音淹没喵
-    logging.basicConfig(
-        # 日志级别喵
-        level=logging.INFO,
-        # 日志格式：时间 级别 来源 消息，时间精确到秒足够排查了喵
-        format="%(asctime)s %(levelname)-7s %(name)-15s %(message)s",
-        # 时间格式，只留时分秒让日志行短一点喵
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     # 把 httpx 自己的日志压到 WARNING，否则每条请求它都会打一行，太吵喵
     logging.getLogger("httpx").setLevel(logging.WARNING)
     # httpcore 是 httpx 的底层，日志更细碎，一并压掉喵
