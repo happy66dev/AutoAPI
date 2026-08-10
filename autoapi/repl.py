@@ -1201,6 +1201,54 @@ class Repl:
         # 喵~防御：完全不认识的命令，提示去看 help，而不是静默无反应喵
         print(f"不认识的命令 {head!r} 喵，敲 help 看看有哪些命令~")
 
+    def _build_completer(self):
+        """
+        创建 REPL 的 Tab 补全器喵~
+
+        单独拆成方法的原因：补全词表本身是纯逻辑，不该和 PromptSession 的终端初始化绑死。
+        Windows 下在非 TTY 的测试环境创建 PromptSession 会报 NoConsoleScreenBufferError，
+        但我们仍然要能直接测试「freeze add 是否在词表里」，所以把它独立出来喵。
+        """
+        # 在方法内导入，保持模块在没装 prompt_toolkit 时仍能被普通模式导入喵
+        from prompt_toolkit.completion import WordCompleter
+        # 可以 Tab 补全的命令词，覆盖所有主命令、子命令、别名和配置字段喵
+        completer_words = [
+            # 顶层查看与控制命令喵
+            "vm", "stats", "help", "reload", "save", "quit", "exit", "q",
+            # 虚拟模型管理及别名喵
+            "vm add", "vm rm", "vm remove", "vm del",
+            # 候选链管理及 candidate 别名喵
+            "cand", "candidate",
+            "cand add", "cand rm", "cand remove", "cand del",
+            "cand mv", "cand move", "cand set",
+            "candidate add", "candidate rm", "candidate remove", "candidate del",
+            "candidate mv", "candidate move", "candidate set",
+            # 规则管理及查看别名喵
+            "rule", "rule ls", "rule list", "rule add", "rule rm", "rule remove",
+            "rule del", "rule mv", "rule move",
+            # 冻结管理：这里必须包含 freeze add / freeze rm，主人反馈的就是漏了它们喵
+            "freeze", "freeze ls", "freeze list", "freeze add", "freeze rm",
+            "freeze remove", "freeze del", "freeze clear",
+            # 全局 server 配置字段喵
+            "set", "set stall_timeout", "set stream_timeout",
+            "set nonstream_timeout", "set connect_timeout", "set min_content_chars",
+            "set auto_hedge_threshold", "set auto_hedge_minutes",
+            "set reload_poll_interval", "set port",
+            # cand set 可修改的节点字段喵
+            "cand set base_url", "cand set api_key", "cand set model", "cand set name",
+            "cand set auth_style", "cand set stall_timeout", "cand set stream_timeout",
+            "cand set nonstream_timeout",
+        ]
+        # 创建补全器，并按大小写不敏感方式匹配命令前缀喵
+        return WordCompleter(
+            # 传入整理好的命令词表喵
+            completer_words,
+            # 允许完整命令短语按输入前缀匹配喵
+            sentence=True,
+            # 命令大小写不敏感，和 dispatch 的行为保持一致喵
+            ignore_case=True,
+        )
+
     def _build_session(self):
         """
         创建 prompt_toolkit 的输入会话喵~
@@ -1217,7 +1265,6 @@ class Repl:
         # 在方法内导入，这样即使 prompt_toolkit 没装，模块本身也能正常导入，
         # 单元测试和 --no-repl 模式都不受影响喵
         from prompt_toolkit import PromptSession
-        from prompt_toolkit.completion import WordCompleter
         from prompt_toolkit.history import InMemoryHistory
         from prompt_toolkit.styles import Style
 
@@ -1238,22 +1285,8 @@ class Repl:
             # 倒计时用青色加粗，方便快速扫到还剩多久喵
             "bottom-toolbar.countdown": "noreverse bg:default #55ffff bold",
         })
-        # 可以 Tab 补全的命令词，覆盖所有主命令和常用子命令喵
-        completer = WordCompleter(
-            [
-                # 查看类喵
-                "vm", "rule ls", "freeze ls", "stats", "help",
-                # 改规则类喵
-                "rule add", "rule rm", "rule mv",
-                # 改候选链类喵
-                "cand add", "cand rm", "cand mv", "cand set",
-                "vm add", "vm rm",
-                # 服务器配置与其他喵
-                "set", "freeze clear", "reload", "save", "quit",
-            ],
-            # 只在词的开头匹配，避免输入 set 时把 cand set 也列出来干扰喵
-            ignore_case=True,
-        )
+        # 创建 Tab 补全器喵
+        completer = self._build_completer()
 
         def bottom_toolbar():
             """每次刷新时被调用，返回当前的冻结横幅喵~"""

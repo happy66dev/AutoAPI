@@ -2030,6 +2030,67 @@ def make_repl(tmp_path):
     return Repl(state), path
 
 
+def test_REPL补全包含完整命令和新字段():
+    """
+    Tab 补全必须覆盖 dispatch 实际支持的命令，尤其是 freeze add / freeze rm 喵~
+
+    这里直接调用 prompt_toolkit 的补全器，不依赖真实 TTY，避免把终端渲染问题
+    和命令词表问题混在一起喵。
+    """
+    # 导入 prompt_toolkit 的文档对象，用来模拟主人当前已经输入的前缀喵
+    from prompt_toolkit.document import Document
+    # 导入 REPL 类喵
+    from autoapi.repl import Repl
+    # 造 REPL 实例喵
+    repl = Repl(make_state())
+    # 创建补全器喵
+    completer = repl._build_completer()
+    # 定义一个小工具，收集某个输入前缀的所有补全文本喵
+    def suggestions(prefix: str) -> list[str]:
+        # 向 prompt_toolkit 请求当前前缀的候选项喵
+        return [item.text for item in completer.get_completions(Document(prefix), None)]
+    # freeze 后面应该认识 add、rm、clear 三类操作喵
+    freeze_words = suggestions("freeze ")
+    assert "freeze add" in freeze_words
+    assert "freeze rm" in freeze_words
+    assert "freeze clear" in freeze_words
+    # set 后面应该能补全新的全局超时字段喵
+    set_words = suggestions("set ")
+    assert "set stall_timeout" in set_words
+    assert "set stream_timeout" in set_words
+    assert "set nonstream_timeout" in set_words
+    # cand set 后面应该能补全节点级三个超时覆盖字段喵
+    cand_set_words = suggestions("cand set ")
+    assert "cand set stall_timeout" in cand_set_words
+    assert "cand set stream_timeout" in cand_set_words
+    assert "cand set nonstream_timeout" in cand_set_words
+    # 新旧命令别名也应该可发现喵
+    assert "candidate add" in suggestions("candidate ")
+    assert "freeze remove" in freeze_words
+
+
+def test_config_example包含当前超时配置和规则():
+    """公开配置模板必须包含当前实现需要的新字段，不得残留退役字段喵~"""
+    # 读取公开模板，绝不读取含真 key 的 config.yaml 喵
+    from pathlib import Path
+    # 从测试文件所在目录向上找到项目根目录喵
+    example_path = Path(__file__).resolve().parents[1] / "config.example"
+    # 读取模板文本喵
+    text = example_path.read_text(encoding="utf-8")
+    # 新的全局超时字段必须存在喵
+    for field in ("stall_timeout", "stream_timeout", "nonstream_timeout"):
+        assert f"{field}:" in text
+    # 节点级覆盖示例也必须存在喵
+    assert "# 按节点单独配超时" in text or "慢速推理模型" in text
+    assert "nonstream_timeout: 1800" in text
+    # timeout 规则必须存在并设置为重试一次喵
+    assert "status: timeout" in text
+    assert "max_attempts: 2" in text
+    # 退役字段不应出现在可执行配置项中（注释迁移说明允许出现字段名喵）
+    assert "\n  request_timeout:" not in text
+    assert "\n  first_content_timeout:" not in text
+
+
 def test_交互式追加候选(tmp_path):
     """cand add 应该把新候选追加到链尾，并立即生效喵~"""
     # 造 REPL 喵
