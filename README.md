@@ -100,7 +100,57 @@ python main.py
 | `host` | `127.0.0.1` | 监听地址。**强烈建议保持回环地址**，理由见下面的安全提醒喵 |
 | `port` | `8787` | 监听端口。这一项改了要重启代理才生效，因为 socket 在启动时就绑好了喵 |
 
-<!-- TIMEOUTS -->
+#### 三个超时的分工
+
+这三项管的是三件完全不同的事，搞清楚了就不会配错喵：
+
+| 字段 | 默认值 | 衡量的是 | 说明 |
+| --- | --- | --- | --- |
+| `stall_timeout` | `60` | 上游还活着吗 | 允许上游连续**静默**多少秒。静默 = 一个字节都没发过来。**只要收到任何字节就归零重新数** —— 所以上游发心跳、吐思维链期间都不会触发它。触发了说明连接真的挂死了，判为 `stalled_stream` 喵 |
+| `stream_timeout` | `300` | 等太久了吗 | 流式请求的总预算，从发出请求算到「确认这条流健康、可以放行」为止，中途不归零。连接一直健康但正文迟迟不来时靠它兜住，判为 `timeout` 喵 |
+| `nonstream_timeout` | `600` | 同上 | 非流式请求的总预算，从发出请求算到整个响应体读完为止，判为 `timeout` 喵 |
+| `connect_timeout` | `15` | 连得上吗 | 建立连接的握手超时。连不上要快速失败好换下一个候选，判为 `network` 喵 |
+
+两个要点：
+
+- **`stream_timeout` 只管「放行之前」那一段。** 一旦确认流健康、字节开始流向客户端，代理就不再计时了 —— 模型愿意写多久就写多久，绝不会中途掐断一个正在正常输出的回答喵。
+- **`nonstream_timeout` 天生比 `stream_timeout` 大。** 流式是「一点点吐」，几秒内就能判断健不健康，剩下的交给客户端；非流式是「上游把整篇憋完再一次性返回」，在它返回之前什么都看不到，只能一直等喵。
+
+超时和卡流默认都会**原地重发 1 次**（`config.example` 里 `status: timeout` 和 `status: stalled_stream` 那两条规则），重发还不行才降级到下一个候选喵。
+
+#### 按节点单独配超时
+
+上面三项超时都可以在**单个候选节点**上覆盖，只写想改的那几项，没写的继续跟随全局值：
+
+```yaml
+- name: 慢速推理模型
+  base_url: https://relay-c.example.com
+  api_key: sk-xxx
+  model: o3-deep-research
+  stall_timeout: 240        # 这个模型可能安静想 4 分钟
+  stream_timeout: 900       # 流式总预算放到 15 分钟
+  nonstream_timeout: 1800   # 非流式给到 30 分钟
+```
+
+为什么需要这个：同一条链上常常混着快慢差很多的模型 —— 链首是会先想很久的推理模型、兜底是秒回的小模型。给它们配同一套超时，要么把推理模型冤枉成卡流，要么让小模型挂死太久才降级喵。
+
+在 REPL 里也能改，填 `default` 就恢复跟随全局值。配了专属超时的节点会在 `vm` 命令的输出里标出来：
+
+```
+cand set auto-strong 1 stream_timeout 900
+cand set auto-strong 1 stream_timeout default
+```
+
+#### 已退役的配置项
+
+| 老字段 | 现在改用 |
+| --- | --- |
+| `request_timeout` | 拆成了 `stream_timeout` 和 `nonstream_timeout` |
+| `first_content_timeout` | 由 `stall_timeout` 和 `stream_timeout` 接手 |
+
+`first_content_timeout` 是从「开始读流」那一刻起算的，只要迟迟等不到正文就判失败 —— 哪怕连接一直活着、上游正在发心跳或吐思维链。推理模型先想一两分钟再吐第一个字是很正常的事，于是就会出现「首字还没出就被自动重试」。现在改成了「静默才算卡」，正在干活的上游不会再被冤枉喵。
+
+配置里如果还留着这两个老字段，代理**照旧能正常启动**，但会在启动时和每次热重载时各打一条警告，提醒它们已经不生效了喵。
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -138,15 +188,20 @@ virtual_models:
 - `status`：单个整数 `429`、整数列表 `[500, 502]`，也可以混合别名 `[429, "network"]`
 - `body_regex`：对响应体做正则搜索，忽略大小写。上游一律回 200 或 429、真正的原因只写在 body 里时靠它区分喵
 
-除了真实 HTTP 状态码，`status` 还支持三个特殊别名：
+除了真实 HTTP 状态码，`status` 还支持四个特殊别名：
 
 | 别名 | 含义 |
 | --- | --- |
 | `network` | 连不上上游 / 握手超时 / 读取时断连 |
 | `bad_stream` | 200 但已确定这条流是坏的（明确收到 error 事件，或流结束了却一个字都没有；非流式的「200 里塞 error」也归这里） |
-| `stalled_stream` | 200 且流建立了，但迟迟吐不出足够内容，一直挂着到探测超时（卡流） |
+| `stalled_stream` | 上游静默太久，一个字节都不发了 —— 连接像是挂死了（卡流） |
+| `timeout` | 连接一直活着、上游也一直在发东西，但超过总预算还没拿到足够内容（太慢了） |
 
-`bad_stream` 和 `stalled_stream` 的区别值得记一下：`bad_stream` 是**已经确定坏了**，重发同一个上游大概率还是坏的，换候选更划算；`stalled_stream` 是**等不到结论**，不代表这个上游坏了，很可能只是这一次调度倒霉，原地重发一次经常就正常了喵。
+这几个的区别值得记一下，因为它们对应的处置策略不一样喵：
+
+- `bad_stream` 是**已经确定坏了**。重发同一个上游大概率还是坏的，换候选更划算。
+- `stalled_stream` 是**连接挂死了**。不代表这个上游整体不行，很可能只是这一次调度倒霉，原地重发一次经常就正常了。
+- `timeout` 是**连接健康但太慢**。也适合重发一次，但因为已经等了很久（默认流式 5 分钟、非流式 10 分钟），再等一整轮的代价很大，所以只重发 1 次就换候选喵。
 
 按动作可用的额外字段：
 
@@ -226,14 +281,17 @@ rules:
 
 ### 服务器配置
 
-`set <字段> <值>` 改 `server` 段的单个数值字段，能改的有各个超时项、`min_content_chars`、`auto_hedge_threshold`、`auto_hedge_minutes`、`reload_poll_interval`、`port`。字段名打错时会把当前允许的完整列表打出来，敲 `help` 也能看到喵。
+`set <字段> <值>` 改 `server` 段的单个数值字段，能改的有 `stall_timeout`、`stream_timeout`、`nonstream_timeout`、`connect_timeout`、`min_content_chars`、`auto_hedge_threshold`、`auto_hedge_minutes`、`reload_poll_interval`、`port`。字段名打错时会把当前允许的完整列表打出来，敲 `help` 也能看到喵。
 
 除了 `port` 要重启才生效（socket 启动时就绑好了），其余都立即生效喵。
 
 ```
 set auto_hedge_threshold 3
 set min_content_chars 20
+set stream_timeout 600
 ```
+
+敲已经退役的字段名（`request_timeout`、`first_content_timeout`）会告诉你现在该改哪一项，不会只回一句「不认识」喵。
 
 ### 其他
 

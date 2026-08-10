@@ -158,10 +158,12 @@ def write_temp_config(directory: Path) -> Path:
 server:
   host: 127.0.0.1
   port: {PORT_PROXY}
-  request_timeout: 30
   # 超时设得比较小，让卡流检测能在几秒内触发，冒烟测试才跑得快喵
-  first_content_timeout: 2
+  # 静默上限：那个假上游吐两个字就彻底不动了，所以 3 秒静默就足够判定卡流喵
   stall_timeout: 3
+  # 流式和非流式的总预算也压小，免得万一哪个检查卡住会等很久喵
+  stream_timeout: 30
+  nonstream_timeout: 30
   min_content_chars: 10
   connect_timeout: 5
   reload_poll_interval: 0

@@ -124,14 +124,52 @@ class ColorFormatter(logging.Formatter):
         return f"{color}{text}{COLOR_RESET}"
 
 
+class LiveStreamHandler(logging.StreamHandler):
+    """
+    每次写日志时都重新去取当前的 sys.stderr 的处理器喵~
+
+    为什么需要它（这修的是「日志滚动时下方状态监控上移并渲染错乱」那个 bug）：
+        内置的 StreamHandler 在创建的那一刻就把 sys.stderr 这个对象抓在手里了，
+        之后 sys.stderr 被换成别的东西，它也照旧往老的那个写。
+
+        而 REPL 那边为了让日志和底部冻结表和平共处，用了 prompt_toolkit 的
+        patch_stdout —— 它的做法正是「把 sys.stdout / sys.stderr 换成一个代理对象」，
+        让所有输出都先交给 prompt_toolkit，由它先把底部横幅擦掉、打完日志再重画。
+
+        两件事一撞：日志绕过代理直接怼进终端，prompt_toolkit 不知道屏幕上多了几行，
+        它记着的光标位置就全错了，于是横幅位置往上跑、内容糊在一起。
+
+        改成每次 emit 都现取 sys.stderr，日志就会走进 patch_stdout 的代理，
+        prompt_toolkit 能感知到每一行输出，横幅始终稳稳待在最下面喵。
+    """
+
+    @property
+    def stream(self):
+        """读的时候现取当前的 sys.stderr 喵~"""
+        # 不缓存、不记住，每次都取最新的那个对象喵
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, value) -> None:
+        """
+        父类的 __init__ 会往 self.stream 赋值，这里必须接住喵~
+
+        故意什么都不做：这个处理器的 stream 永远由上面的 getter 决定，
+        谁也别想把它固定成某个具体对象，否则就退回到 bug 之前的行为了喵。
+        """
+        # 喵~防御：静默忽略赋值。不抛异常是因为父类 __init__ 和 setStream 都会赋值，
+        # 抛出来会让处理器压根建不起来，日志全没了反而更糟喵
+        return
+
+
 def setup_logging() -> None:
     """配置全局日志格式喵~"""
     # 日志格式：时间 级别 来源 消息，时间精确到秒足够排查了喵
     fmt = "%(asctime)s %(levelname)-7s %(name)-15s %(message)s"
     # 时间格式，只留时分秒让日志行短一点喵
     datefmt = "%H:%M:%S"
-    # 建一个输出到 stderr 的处理器喵
-    handler = logging.StreamHandler()
+    # 建一个输出到「当前」stderr 的处理器，好和 REPL 的 patch_stdout 配合喵
+    handler = LiveStreamHandler()
     # 终端支持颜色就用彩色格式化器，否则用朴素的，避免日志文件里混进转义码喵
     if supports_color():
         handler.setFormatter(ColorFormatter(fmt, datefmt=datefmt))
@@ -248,6 +286,11 @@ def main() -> int:
                 print(f"  然后把里面的 api_key 换成主人自己的真 key 喵~", file=sys.stderr)
         # 用退出码 1 表示启动失败喵
         return 1
+    # 喵~防御：配置里用了已退役的配置项时，在最显眼的位置提醒一次。
+    # 这类问题不会让代理起不来，但会让主人以为某项超时配置生效了、实际压根没读，
+    # 所以必须在启动摘要之前就说清楚喵
+    for warning in config.warnings:
+        print(f"⚠ 配置提醒喵：{warning}", file=sys.stderr)
     # 用配置创建运行时状态喵
     state = RuntimeState(config)
     # 创建 FastAPI 应用喵
@@ -258,6 +301,9 @@ def main() -> int:
         f"  监听地址：http://{config.server.host}:{config.server.port}\n"
         f"  虚拟模型：{len(config.virtual_models)} 个 → {', '.join(config.virtual_models)}\n"
         f"  故障规则：{len(config.rules)} 条\n"
+        f"  超时预算：流式 {config.server.stream_timeout:.0f} 秒 / "
+        f"非流式 {config.server.nonstream_timeout:.0f} 秒 / "
+        f"静默上限 {config.server.stall_timeout:.0f} 秒\n"
         f"  配置热重载：{'每 ' + str(config.server.reload_poll_interval) + ' 秒检查一次' if config.server.reload_poll_interval > 0 else '已关闭'}\n"
     )
     # 喵~防御：绑定到非回环地址时大声警告，因为代理里存着所有上游的真 api key，

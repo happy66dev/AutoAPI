@@ -17,6 +17,8 @@ import asyncio
 import json
 # logging 用来测试日志上色喵
 import logging
+# sys 用来测试日志处理器是否会跟着 sys.stderr 的替换而变喵
+import sys
 # time 用来测试冻结过期喵
 import time
 
@@ -30,9 +32,11 @@ from autoapi.config import (
     STATUS_BAD_STREAM,
     STATUS_NETWORK_ERROR,
     STATUS_STALLED_STREAM,
+    STATUS_TIMEOUT,
     Candidate,
     ConfigError,
     parse_config,
+    resolve_timeouts,
 )
 # 引入被测的编排层喵
 from autoapi.proxy import detect_stream_flag, handle_request, parse_client_body
@@ -48,8 +52,8 @@ from autoapi.sse import (
 )
 # 引入被测的运行时状态喵
 from autoapi.state import RuntimeState
-# 引入被测的上游请求构造函数喵
-from autoapi.upstream import build_upstream_body, build_upstream_headers
+# 引入被测的上游请求构造函数和单次调用入口喵
+from autoapi.upstream import build_upstream_body, build_upstream_headers, try_candidate
 
 
 def make_config_dict(**overrides):
@@ -64,10 +68,11 @@ def make_config_dict(**overrides):
         "server": {
             "host": "127.0.0.1",
             "port": 8787,
-            "request_timeout": 5,
-            # 超时都设得很小，让卡流类的测试能快点跑完喵
-            "first_content_timeout": 0.6,
+            # 超时都设得很小，让卡流和超时类的测试能快点跑完喵
+            # 注意这些值会被 parse_config 压到 1.0 秒的下限，测试里按压后的值断言喵
             "stall_timeout": 0.9,
+            "stream_timeout": 5,
+            "nonstream_timeout": 5,
             # 门槛保持默认的 10，这样能测到「吐几个字不够门槛」的行为喵
             "min_content_chars": 10,
             "connect_timeout": 2,
@@ -104,12 +109,20 @@ def make_config_dict(**overrides):
             {"match": {"status": [500, 502, 503]}, "action": "retry", "max_attempts": 2, "backoff_base": 1.0},
             # 卡流：原地重发一次（含首次共 2 次），两次都卡才换候选喵
             {"match": {"status": "stalled_stream"}, "action": "retry", "max_attempts": 2, "backoff_base": 1.0},
+            # 超过总预算：也重发一次（含首次共 2 次）喵
+            {"match": {"status": "timeout"}, "action": "retry", "max_attempts": 2, "backoff_base": 1.0},
             {"match": {"status": "bad_stream"}, "action": "next"},
             {"match": {"status": [401, 403, 404]}, "action": "next"},
             {"match": {"status": 400}, "action": "passthrough"},
         ],
     }
-    # 应用测试传入的覆盖项喵
+    # 单独覆盖 server 段里的某几项，不用把整个 server 段重写一遍喵。
+    # 这么做是因为绝大多数测试只想改一两个超时值，整段重写既啰嗦又容易漏字段喵
+    server_overrides = overrides.pop("server_overrides", None)
+    # 有覆盖项就合并进 server 段喵
+    if server_overrides:
+        data["server"].update(server_overrides)
+    # 应用测试传入的其余覆盖项喵
     data.update(overrides)
     # 返回配置字典喵
     return data
@@ -126,8 +139,8 @@ def test_配置能正常加载():
     assert len(config.virtual_models) == 1
     # 那个虚拟模型应该有两个候选喵
     assert len(config.virtual_models["auto-test"]) == 2
-    # 应该有六条规则喵（freeze、5xx retry、卡流 retry、bad_stream、401 系、400）
-    assert len(config.rules) == 6
+    # 应该有七条规则喵（freeze、5xx retry、卡流 retry、超时 retry、bad_stream、401 系、400）
+    assert len(config.rules) == 7
     # 第一个候选的真实模型名应该被正确解析喵
     assert config.virtual_models["auto-test"][0].model == "gpt-4o"
 
@@ -355,6 +368,76 @@ def 卡流响应(prefix: bytes = b"") -> httpx.Response:
     return httpx.Response(
         200,
         stream=卡住的字节流(prefix),
+        headers={"content-type": "text/event-stream"},
+    )
+
+
+class 只发心跳的字节流(httpx.AsyncByteStream):
+    """
+    一个模拟「推理模型正在思考」的假上游流喵~
+
+    行为：持续吐 SSE 心跳注释行（`: ping`），一个内容字符都不给，但连接一直很活跃。
+         这正是主人报的那个 bug 的现场：上游明明在正常干活、连接健康得很，
+         旧逻辑却因为「迟迟等不到正文」在 45 秒时就把它斩了喵。
+
+    这个流永远不会自己结束，靠代理那边的总预算计时器来终止喵。
+    """
+
+    def __init__(self, interval: float = 0.05) -> None:
+        """记下心跳间隔喵~"""
+        # 两次心跳之间隔多久，单位：秒。设得很小让测试跑得快喵
+        self._interval = interval
+
+    async def __aiter__(self):
+        """一直发心跳，永不停止喵~"""
+        # 无限循环发心跳喵
+        while True:
+            # 先等一个间隔，模拟真实上游的心跳节奏喵
+            await asyncio.sleep(self._interval)
+            # 吐一个 SSE 注释行。冒号开头是 SSE 规范里的注释，客户端会忽略它，
+            # 上游常用它来保持连接活跃喵
+            yield b": ping\n\n"
+
+
+def 心跳响应(interval: float = 0.05) -> httpx.Response:
+    """造一个「只发心跳、不吐正文」的响应喵~"""
+    # 用只发心跳的流当响应体喵
+    return httpx.Response(
+        200,
+        stream=只发心跳的字节流(interval),
+        headers={"content-type": "text/event-stream"},
+    )
+
+
+class 先安静再吐字的字节流(httpx.AsyncByteStream):
+    """
+    一个模拟「推理模型先安静想一会儿，然后正常输出」的假上游流喵~
+
+    行为：先什么都不发地等一段时间，然后一次性吐出正常内容。
+         这是推理模型最典型的行为，必须能正常放行、不能被判成失败喵。
+    """
+
+    def __init__(self, quiet_seconds: float, payload: bytes) -> None:
+        """记下要安静多久、之后吐什么喵~"""
+        # 开头安静的秒数喵
+        self._quiet = quiet_seconds
+        # 安静结束后要吐的字节喵
+        self._payload = payload
+
+    async def __aiter__(self):
+        """先安静，再吐字喵~"""
+        # 先安静一段时间，期间一个字节都不发喵
+        await asyncio.sleep(self._quiet)
+        # 然后把内容一次吐出去喵
+        yield self._payload
+
+
+def 先安静再回答的响应(quiet_seconds: float, payload: bytes) -> httpx.Response:
+    """造一个「先安静想一会儿再正常回答」的响应喵~"""
+    # 用先安静再吐字的流当响应体喵
+    return httpx.Response(
+        200,
+        stream=先安静再吐字的字节流(quiet_seconds, payload),
         headers={"content-type": "text/event-stream"},
     )
 
@@ -1094,6 +1177,93 @@ async def test_一个字都不吐的卡流也会被识别():
 
 
 @pytest.mark.asyncio
+async def test_上游在发心跳时不算卡流():
+    """
+    这是主人报的那个 bug 的回归用例喵：「首字还没出就被我们自动重试了」。
+
+    场景：上游持续发 SSE 心跳（连接非常健康、明显在正常干活），只是正文还没出来。
+    旧逻辑用「首字符计时器」：从开始读流算起，等不到内容字符就判失败 —— 完全不看
+    连接上有没有动静，于是把一个正在好好干活的上游冤枉成了坏节点。
+    新逻辑用「静默计时器」：只要收到任何字节就归零重新数，所以发心跳期间永远不会触发。
+
+    这个用例断言的正是「不该被判成卡流」：静默上限只有 1 秒，心跳每 0.05 秒一次，
+    如果还按旧逻辑，1 秒后就会被斩；按新逻辑它会一直活到总预算用完，
+    然后被判成 timeout（太慢了）而不是 stalled_stream（挂死了）喵。
+    """
+    # 引入超时状态码喵
+    from autoapi.config import STATUS_TIMEOUT
+    # 把总预算压到很小，好让测试快速跑完；静默上限保持默认的 1 秒喵
+    config = parse_config(make_config_dict(server_overrides={"stream_timeout": 1.5}))
+    # 取第一个候选喵
+    candidate = config.virtual_models["auto-test"][0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：一直发心跳，永远不吐正文喵~"""
+        # 心跳间隔 0.05 秒，远小于 1 秒的静默上限喵
+        return 心跳响应(0.05)
+
+    # 打一次流式请求喵
+    result = await try_candidate(
+        make_client(handler),
+        candidate,
+        "POST",
+        "/v1/chat/completions",
+        "",
+        {},
+        {"model": "auto-test", "stream": True},
+        True,
+        config.server,
+    )
+    # 应该失败（正文确实一直没来）喵
+    assert result.ok is False
+    # 但原因必须是「太慢了」而不是「挂死了」—— 这是这个用例的核心断言喵
+    assert result.status == STATUS_TIMEOUT
+    # 说明文本里要写清楚连接是活的，方便主人从日志上区分两种故障喵
+    assert "总预算" in result.error_text
+
+
+@pytest.mark.asyncio
+async def test_先安静思考再回答的模型能正常放行():
+    """
+    推理模型最典型的行为：先安静想一会儿，然后正常输出。必须能放行喵~
+
+    这个用例守的是新逻辑的另一半 —— 修 bug 不能修过头。静默计时器是「上游还活着吗」
+    的探针，安静时间只要没超过 stall_timeout 就不该判失败，正文一来就要照常放行喵。
+    """
+    # 静默上限 1 秒（配置里的下限），安静 0.4 秒后再吐字，应该安全通过喵
+    config = parse_config(make_config_dict())
+    # 取第一个候选喵
+    candidate = config.virtual_models["auto-test"][0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：先安静 0.4 秒，然后吐出一段够长的正常内容喵~"""
+        # 造一段够过 10 字符门槛的正文喵
+        payload = sse(
+            json.dumps({"choices": [{"delta": {"content": "这是一段够长的正常回答内容"}}]}),
+            "[DONE]",
+        )
+        # 先安静再吐字喵
+        return 先安静再回答的响应(0.4, payload)
+
+    # 打一次流式请求喵
+    result = await try_candidate(
+        make_client(handler),
+        candidate,
+        "POST",
+        "/v1/chat/completions",
+        "",
+        {},
+        {"model": "auto-test", "stream": True},
+        True,
+        config.server,
+    )
+    # 应该成功放行喵
+    assert result.ok is True
+    # 状态码是 200 喵
+    assert result.status == 200
+
+
+@pytest.mark.asyncio
 async def test_卡流状态码能被规则单独匹配():
     """卡流和假成功要能被不同规则分别处置，这是新状态码存在的意义喵~"""
     # 取规则列表喵
@@ -1292,19 +1462,234 @@ def test_超时按当前配置现算():
     这个用例守的是一个很容易悄悄坏掉的行为：httpx 客户端是全程复用的，它身上的 timeout
     在启动时就定死了，所以超时必须显式按当前配置传给每条请求喵。
     """
-    # 引入现算超时的函数喵
+    # 引入现算超时的函数和超时解析函数喵
+    from autoapi.config import resolve_timeouts
     from autoapi.upstream import build_timeout
     # 取一份配置喵
     config = parse_config(make_config_dict())
-    # 现算一份超时喵
-    timeout = build_timeout(config.server)
+    # 先算出全局生效的超时值喵
+    timeouts = resolve_timeouts(config.server)
+    # 现算一份流式用的超时喵
+    stream_timeout = build_timeout(timeouts, is_stream=True)
     # 连接超时应该来自配置里的 connect_timeout 喵
-    assert timeout.connect == config.server.connect_timeout
-    # 读超时应该来自配置里的 request_timeout 喵
-    assert timeout.read == config.server.request_timeout
+    assert stream_timeout.connect == config.server.connect_timeout
+    # 流式的读超时衡量的是「允许静默多久」，所以应该等于 stall_timeout 喵
+    assert stream_timeout.read == config.server.stall_timeout
+    # 非流式的读超时衡量的是「总共等多久」，所以应该等于 nonstream_timeout 喵
+    nonstream_timeout = build_timeout(timeouts, is_stream=False)
+    assert nonstream_timeout.read == config.server.nonstream_timeout
     # 改掉配置里的超时之后，现算出来的应该跟着变喵
-    config.server.request_timeout = 777.0
-    assert build_timeout(config.server).read == 777.0
+    config.server.nonstream_timeout = 777.0
+    assert build_timeout(resolve_timeouts(config.server), is_stream=False).read == 777.0
+
+
+def test_节点专属超时会覆盖全局值():
+    """
+    节点上配了超时就用它，没配的项继续跟随全局值喵~
+
+    这个用例守的是「按节点覆盖」的核心语义：覆盖必须是逐项独立的。
+    只配了 stream_timeout 的节点，它的 stall_timeout 应该照旧跟随全局值，
+    绝不能因为「配过一项」就把整套超时都从全局值断开喵。
+    """
+    # 造一份配置：第一个节点只覆盖 stream_timeout，第二个节点什么都不覆盖喵
+    config = parse_config(
+        make_config_dict(
+            server_overrides={"stall_timeout": 30, "stream_timeout": 300, "nonstream_timeout": 600},
+            virtual_models={
+                "auto-test": [
+                    {
+                        "name": "慢速推理",
+                        "base_url": "https://slow.test",
+                        "api_key": "sk-slow-key-1234",
+                        "model": "o3-deep",
+                        # 只覆盖这一项喵
+                        "stream_timeout": 900,
+                    },
+                    {
+                        "name": "普通",
+                        "base_url": "https://normal.test",
+                        "api_key": "sk-normal-key-5678",
+                        "model": "gpt-4o",
+                    },
+                ]
+            },
+        )
+    )
+    # 取两个候选喵
+    slow, normal = config.virtual_models["auto-test"]
+    # 慢速节点的流式预算应该是它自己配的 900 喵
+    slow_timeouts = resolve_timeouts(config.server, slow)
+    assert slow_timeouts.stream == 900.0
+    # 但它没配的两项必须继续跟随全局值，这是逐项独立的关键断言喵
+    assert slow_timeouts.stall == 30.0
+    assert slow_timeouts.nonstream == 600.0
+    # 普通节点什么都没配，三项全都跟随全局值喵
+    normal_timeouts = resolve_timeouts(config.server, normal)
+    assert normal_timeouts.stream == 300.0
+    assert normal_timeouts.stall == 30.0
+    assert normal_timeouts.nonstream == 600.0
+
+
+def test_节点专属超时会体现在实际请求上():
+    """
+    光解析对了不算，得确认它真的被用到这次请求的超时里喵~
+
+    这个用例把 resolve_timeouts 和 build_timeout 串起来验证：
+    给节点配了很长的静默上限之后，实际发出去的请求的 read 超时必须跟着变长，
+    否则「按节点配超时」就只是配置文件里好看而已喵。
+    """
+    # 引入现算超时的函数喵
+    from autoapi.upstream import build_timeout
+    # 造一份配置：节点把静默上限放宽到 240 秒，全局只有 30 秒喵
+    config = parse_config(
+        make_config_dict(
+            server_overrides={"stall_timeout": 30},
+            virtual_models={
+                "auto-test": [
+                    {
+                        "name": "慢速推理",
+                        "base_url": "https://slow.test",
+                        "api_key": "sk-slow-key-1234",
+                        "model": "o3-deep",
+                        "stall_timeout": 240,
+                    }
+                ]
+            },
+        )
+    )
+    # 取那个节点喵
+    candidate = config.virtual_models["auto-test"][0]
+    # 算出这次请求生效的超时喵
+    timeouts = resolve_timeouts(config.server, candidate)
+    # 流式的 read 超时衡量静默时长，应该用节点自己的 240 而不是全局的 30 喵
+    assert build_timeout(timeouts, is_stream=True).read == 240.0
+
+
+def test_节点超时写成非数字要报错():
+    """
+    超时写错时必须在加载阶段就报错，不能静默忽略喵~
+
+    为什么不静默忽略：配置里明明写着一个值，实际却没生效，是最难查的一类问题。
+    宁可启动就失败让主人立刻改，也不要让它带着一个假配置跑下去喵。
+    """
+    # 造一个把超时写成字符串的候选喵
+    data = make_config_dict(
+        virtual_models={
+            "bad": [
+                {
+                    "base_url": "https://x.test",
+                    "api_key": "sk-x-key-12345678",
+                    "model": "gpt-4o",
+                    "stream_timeout": "很久",
+                }
+            ]
+        }
+    )
+    # 加载应该抛 ConfigError 喵
+    with pytest.raises(ConfigError) as exc:
+        parse_config(data)
+    # 报错信息里要点出是哪个字段喵
+    assert "stream_timeout" in str(exc.value)
+
+
+def test_节点超时写成零或负数要报错():
+    """超时设成 0 等于请求一发出就判超时，肯定不是主人想要的，必须挡掉喵~"""
+    # 造一个把超时写成 0 的候选喵
+    data = make_config_dict(
+        virtual_models={
+            "bad": [
+                {
+                    "base_url": "https://x.test",
+                    "api_key": "sk-x-key-12345678",
+                    "model": "gpt-4o",
+                    "stall_timeout": 0,
+                }
+            ]
+        }
+    )
+    # 加载应该抛 ConfigError 喵
+    with pytest.raises(ConfigError) as exc:
+        parse_config(data)
+    # 报错信息里要说明必须大于 0 喵
+    assert "大于 0" in str(exc.value)
+
+
+def test_用了已退役的配置项会攒下警告():
+    """
+    老配置项不该让加载失败，但必须留下明确的警告喵~
+
+    这是「改名之后」的兼容策略：旧配置照旧能起来（不打断服务），
+    但主人一定要看到「你配的这一项已经不生效了」，否则会以为超时配了却没效果喵。
+    """
+    # 造一份还带着老配置项的配置喵
+    config = parse_config(
+        make_config_dict(server_overrides={"request_timeout": 300, "first_content_timeout": 45})
+    )
+    # 应该攒下两条警告喵
+    assert len(config.warnings) == 2
+    # 把警告拼起来方便检查内容喵
+    joined = " ".join(config.warnings)
+    # 两个老名字都要被点出来喵
+    assert "request_timeout" in joined
+    assert "first_content_timeout" in joined
+    # 而且要指出该改用哪些新项喵
+    assert "stream_timeout" in joined
+    # 但配置本身要能正常加载，不能因为这个就失败喵
+    assert len(config.virtual_models) == 1
+
+
+def test_超时状态码能被规则单独匹配():
+    """
+    timeout 和 stalled_stream 要能被分别处置，这是新状态码存在的意义喵~
+
+    两者的故障性质完全不同：卡流是连接挂死了，超时是连接健康但太慢。
+    有些主人会想给「太慢」更少的重试次数（毕竟已经等了很久），所以必须能分开配喵。
+    """
+    # 取规则列表喵
+    rules = parse_config(make_config_dict()).rules
+    # 超时应该命中它自己那条 retry 规则喵
+    timeout_decision = decide(rules, STATUS_TIMEOUT, "流式请求超过总预算 300 秒")
+    assert timeout_decision.action == "retry"
+    # 含首次共 2 次，也就是最多重发 1 次喵
+    assert timeout_decision.max_attempts == 2
+    # 卡流走的是另一条规则，两者互不干扰喵
+    stalled_decision = decide(rules, STATUS_STALLED_STREAM, "上游静默太久")
+    assert stalled_decision.action == "retry"
+
+
+@pytest.mark.asyncio
+async def test_非流式超过总预算会被判超时():
+    """非流式请求等太久时要归为 timeout 而不是网络错误喵~"""
+    # 把非流式预算压到很小好让测试快速跑完喵
+    config = parse_config(make_config_dict(server_overrides={"nonstream_timeout": 1}))
+    # 取第一个候选喵
+    candidate = config.virtual_models["auto-test"][0]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：睡很久都不返回喵~"""
+        # 睡得比预算长很多，让预算先到喵
+        await asyncio.sleep(30)
+        # 这一行实际到不了，只是让函数签名完整喵
+        return httpx.Response(200, json={"ok": True})
+
+    # 打一次非流式请求喵
+    result = await try_candidate(
+        make_client(handler),
+        candidate,
+        "POST",
+        "/v1/chat/completions",
+        "",
+        {},
+        {"model": "auto-test"},
+        False,
+        config.server,
+    )
+    # 应该失败喵
+    assert result.ok is False
+    # 而且必须是超时状态，好让规则里的 status: timeout 命中喵
+    assert result.status == STATUS_TIMEOUT
+    # 说明里要写清楚是超过了总预算喵
+    assert "总预算" in result.error_text
 
 
 # ============ 7. 自动避险喵 ============
@@ -1795,12 +2180,113 @@ def test_交互式改超时配置(tmp_path):
     """set 应该能改 server 段的超时并立即生效喵~"""
     # 造 REPL 喵
     repl, path = make_repl(tmp_path)
-    # 改掉首内容超时喵
-    repl.dispatch("set first_content_timeout 99")
+    # 改掉流式请求的总预算喵
+    repl.dispatch("set stream_timeout 99")
     # 内存里的配置应该立刻变了喵
-    assert repl.state.config.server.first_content_timeout == 99.0
+    assert repl.state.config.server.stream_timeout == 99.0
     # 磁盘上也应该被更新喵
     assert "99" in path.read_text(encoding="utf-8")
+
+
+def test_交互式给单个节点配专属超时(tmp_path):
+    """
+    cand set 应该能给某一个节点单独配超时，且不影响同链上的别的节点喵~
+
+    这是主人要的「模型级别的超时配置」：链首那个会先想很久的推理模型需要放宽，
+    但兜底的快模型必须保持原样，否则它挂死时要等很久才降级喵。
+    """
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 给第一个节点单独放宽流式预算喵
+    repl.dispatch("cand set auto-test 1 stream_timeout 900")
+    # 取出两个候选喵
+    first, second = repl.state.config.virtual_models["auto-test"]
+    # 第一个节点应该有专属值喵
+    assert first.stream_timeout == 900.0
+    # 第二个节点必须没被波及，这是这个用例的关键断言喵
+    assert second.stream_timeout is None
+    # 实际生效的超时也要跟着变喵
+    assert resolve_timeouts(repl.state.config.server, first).stream == 900.0
+    # 第二个节点应该还是全局值喵
+    assert resolve_timeouts(repl.state.config.server, second).stream == repl.state.config.server.stream_timeout
+    # 磁盘上也要落下来喵
+    assert "900" in path.read_text(encoding="utf-8")
+
+
+def test_交互式清掉节点专属超时(tmp_path):
+    """填 default 应该把专属超时清掉，改回跟随全局值喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 先配一个专属值喵
+    repl.dispatch("cand set auto-test 1 stall_timeout 240")
+    # 确认配上了喵
+    assert repl.state.config.virtual_models["auto-test"][0].stall_timeout == 240.0
+    # 再用 default 清掉它喵
+    repl.dispatch("cand set auto-test 1 stall_timeout default")
+    # 应该回到 None，也就是跟随全局值喵
+    assert repl.state.config.virtual_models["auto-test"][0].stall_timeout is None
+    # 磁盘上那个键应该也被删掉了喵
+    assert "stall_timeout: 240" not in path.read_text(encoding="utf-8")
+
+
+def test_节点专属超时填非法值不会改坏配置(tmp_path, capsys):
+    """填了非数字或非正数时该拒绝，且配置一点都不能变喵~"""
+    # 造 REPL 喵
+    repl, _ = make_repl(tmp_path)
+    # 填一个转不成数字的值喵
+    repl.dispatch("cand set auto-test 1 stream_timeout 很久")
+    # 应该提示要填秒数喵
+    assert "秒数" in capsys.readouterr().out
+    # 配置不该被改动喵
+    assert repl.state.config.virtual_models["auto-test"][0].stream_timeout is None
+    # 再填一个负数喵
+    repl.dispatch("cand set auto-test 1 stream_timeout -5")
+    # 应该提示要大于 0 喵
+    assert "大于 0" in capsys.readouterr().out
+    # 配置依然不该被改动喵
+    assert repl.state.config.virtual_models["auto-test"][0].stream_timeout is None
+
+
+def test_vm命令会显示节点专属超时(tmp_path, capsys):
+    """
+    配了专属超时的节点要在 vm 里标出来喵~
+
+    不标的话主人改了全局超时会困惑「为什么这个节点没跟着变」，
+    这种「配置在别处被覆盖了」的问题不显式提示就很难发现喵。
+    """
+    # 造 REPL 喵
+    repl, _ = make_repl(tmp_path)
+    # 先给第一个节点配个专属值喵
+    repl.dispatch("cand set auto-test 1 stream_timeout 900")
+    # 清掉之前的输出喵
+    capsys.readouterr()
+    # 列出虚拟模型喵
+    repl.dispatch("vm")
+    # 取出输出喵
+    out = capsys.readouterr().out
+    # 应该有「专属超时」的标记喵
+    assert "专属超时" in out
+    # 而且要写出具体的值喵
+    assert "stream_timeout=900s" in out
+
+
+def test_set_已退役的配置项给出明确指引(tmp_path, capsys):
+    """
+    敲已经退役的配置项名时，不能只说「不能改」，得告诉主人现在该改哪一项喵~
+
+    这个用例守的是「改名之后的迁移体验」：老名字在文档、笔记、肌肉记忆里都还在，
+    如果只回一句「不认识这个字段」，主人根本不知道该往哪儿找喵。
+    """
+    # 造 REPL 喵
+    repl, _ = make_repl(tmp_path)
+    # 敲一个已经退役的名字喵
+    repl.dispatch("set first_content_timeout 45")
+    # 取出打印出来的内容喵
+    out = capsys.readouterr().out
+    # 应该说明它退役了喵
+    assert "退役" in out
+    # 而且要指出现在该用哪两项替代喵
+    assert "stall_timeout" in out and "stream_timeout" in out
 
 
 def test_改坏配置不会影响运行中的代理(tmp_path):
@@ -1955,6 +2441,70 @@ def test_日志颜色映射():
     info_record = logging.LogRecord("test", logging.INFO, "f.py", 1, "一切正常喵", None, None)
     # INFO 不该被套任何颜色码喵
     assert "\033[" not in formatter.format(info_record)
+
+
+def test_日志处理器每次都取当前的stderr():
+    """
+    这是「日志滚动时底部状态监控上移、渲染错乱」那个 bug 的回归用例喵~
+
+    根因：内置的 StreamHandler 在创建那一刻就把 sys.stderr 抓在手里了。而 REPL 那边用
+    prompt_toolkit 的 patch_stdout 把 sys.stderr 换成了代理对象 —— 换的目的正是让所有
+    输出都先过 prompt_toolkit 的手，由它负责「擦掉横幅 → 打这行 → 重画横幅」。
+    日志如果绕过代理直接怼终端，prompt_toolkit 就不知道屏幕上多了几行，
+    它记着的光标位置全错，横幅位置就跑了喵。
+
+    所以这里断言的是：处理器必须每次写日志都现取 sys.stderr，而不是记住某一个对象。
+    """
+    # 引入自定义处理器喵
+    from main import LiveStreamHandler
+    # 引入 StringIO 当假的输出目标喵
+    import io
+    # 造一个处理器喵
+    handler = LiveStreamHandler()
+    # 记下原始的 stderr，测完要还回去喵
+    original = sys.stderr
+    # 造两个不同的假输出目标喵
+    first, second = io.StringIO(), io.StringIO()
+    # 用 try/finally 保证一定还原 stderr，否则会影响后面的测试喵
+    try:
+        # 把 stderr 换成第一个目标喵
+        sys.stderr = first
+        # 此时处理器读到的 stream 应该就是第一个目标喵
+        assert handler.stream is first
+        # 再把 stderr 换成第二个目标，模拟 patch_stdout 生效的那一刻喵
+        sys.stderr = second
+        # 处理器必须跟着变，这正是修好这个 bug 的关键喵
+        assert handler.stream is second
+        # 实际写一条日志，应该落到当前的目标里喵
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.emit(logging.LogRecord("t", logging.WARNING, "f.py", 1, "测试喵", None, None))
+        # 第二个目标里应该有内容喵
+        assert "测试喵" in second.getvalue()
+        # 第一个目标里应该什么都没有，说明确实没写到老对象上喵
+        assert first.getvalue() == ""
+    # 无论断言是否通过都还原 stderr 喵
+    finally:
+        sys.stderr = original
+
+
+def test_REPL能构造输出重定向器():
+    """
+    REPL 必须能拿到 patch_stdout 上下文，这是日志和横幅不打架的另一半喵~
+
+    只验证「能拿到且是个上下文管理器」，因为真正的渲染效果需要真终端才能看出来，
+    这里能守住的是「这个机制没被误删或改坏」喵。
+    """
+    # 引入 REPL 类喵
+    from autoapi.repl import Repl
+    # 造一个 REPL（用内存状态，不碰磁盘）喵
+    repl = Repl(make_state())
+    # 拿重定向器喵
+    redirect = repl._build_stdout_patch()
+    # prompt_toolkit 装了就该拿到一个上下文管理器喵
+    if redirect is not None:
+        # 必须同时有 __enter__ 和 __exit__ 才能被 with 用喵
+        assert hasattr(redirect, "__enter__")
+        assert hasattr(redirect, "__exit__")
 
 
 def test_不认识的命令不会崩(tmp_path):

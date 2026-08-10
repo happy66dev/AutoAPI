@@ -35,7 +35,12 @@ from typing import Any
 import yaml
 
 # 引入配置校验相关喵
-from .config import ConfigError, parse_config
+from .config import (
+    CANDIDATE_TIMEOUT_FIELDS,
+    RETIRED_SERVER_KEYS,
+    ConfigError,
+    parse_config,
+)
 # 引入运行时状态喵
 from .state import RuntimeState
 
@@ -61,14 +66,19 @@ HELP_TEXT = """
     cand set <虚拟模型> <序号> <字段> <值>
                             改某个候选的单个字段，位置不变喵
                             字段可选：base_url、api_key、model、name、auth_style
+                            以及三个「只对这个节点生效」的专属超时喵：
+                              stall_timeout      这个节点允许上游静默多少秒
+                              stream_timeout     这个节点的流式请求总预算（秒）
+                              nonstream_timeout  这个节点的非流式请求总预算（秒）
+                            专属超时填 default 就改回跟随全局值喵
     vm add <虚拟模型名> <候选JSON>    新建虚拟模型并配上第一个候选喵
     vm rm <虚拟模型名>                删掉一整个虚拟模型喵
 
   改服务器配置类：
     set <字段> <值>         能改这些喵（port 要重启才生效，其余立即生效）：
-                              request_timeout        单次上游请求总超时（秒）
-                              first_content_timeout  一个字都没吐时的最长等待（秒）
-                              stall_timeout          探测阶段总时限，判定卡流（秒）
+                              stall_timeout          允许上游静默多少秒，超过算卡流
+                              stream_timeout         流式请求总预算（秒），默认 300
+                              nonstream_timeout      非流式请求总预算（秒），默认 600
                               min_content_chars      放行前要累积的内容字符数
                               auto_hedge_threshold   连续失败几次就自动避险，0=关闭
                               auto_hedge_minutes     自动避险冻结多少分钟
@@ -101,9 +111,24 @@ HELP_TEXT = """
     cand set auto-strong 2 base_url https://newrelay.com
     cand set auto-strong 2 model gpt-4o-2024-11-20
 
+  给慢模型单独放宽超时的例子喵（链首是会先想很久的推理模型时特别有用）：
+    cand set auto-strong 1 stream_timeout 900      这个节点的流式请求最多等 15 分钟
+    cand set auto-strong 1 stall_timeout 180       这个节点允许静默 3 分钟才算卡流
+    cand set auto-strong 1 stream_timeout default  改回跟随全局值
+
   候选的字段说明喵：
     必填：base_url、api_key、model（model 是发给上游的真实模型名）
     可选：name（显示用）、auth_style（bearer 或 x-api-key，默认 bearer）
+    可选的专属超时：stall_timeout、stream_timeout、nonstream_timeout
+                   不写就跟随 server 段的全局值，只有需要区别对待的节点才配喵
+
+  三个超时的分工喵（搞清楚这个就不会配错）：
+    stall_timeout      「上游还活着吗」。只要收到任何字节就重新计时，
+                        所以上游发心跳、吐思维链期间都不会触发。触发了说明连接挂死了。
+    stream_timeout     「等太久了吗」。从发请求算到确认流健康为止，中途不归零。
+                        连接一直健康但正文迟迟不来时靠它兜住。放行之后就不再计时，
+                        模型愿意写多久都不会被掐断喵。
+    nonstream_timeout   非流式请求的总预算。非流式要等上游憋完整篇，天生该等更久。
 """.strip()
 
 
@@ -321,6 +346,11 @@ class Repl:
                 mark = f"[冻结中 剩{remaining:.0f}秒]" if remaining > 0 else "[可用]"
                 # 打印一行候选信息喵
                 print(f"  {i}. {mark} {candidate.label}")
+                # 这个节点配了专属超时的话单独标一行喵。
+                # 不标的话主人改了全局超时会困惑「为什么这个节点没跟着变」喵
+                if candidate.timeout_note:
+                    # 缩进对齐到上一行的内容位置喵
+                    print(f"      {candidate.timeout_note}")
 
     def cmd_rule_ls(self) -> None:
         """列出所有规则及其序号喵~"""
@@ -551,13 +581,19 @@ class Repl:
             "name": "显示名字",
             # 鉴权头风格喵
             "auth_style": "鉴权风格（bearer 或 x-api-key）",
+            # 这个节点专属的静默上限，覆盖 server 段的全局值喵
+            "stall_timeout": "本节点专属：允许上游静默多少秒（留空恢复全局值）",
+            # 这个节点专属的流式总预算喵
+            "stream_timeout": "本节点专属：流式请求总预算秒数（留空恢复全局值）",
+            # 这个节点专属的非流式总预算喵
+            "nonstream_timeout": "本节点专属：非流式请求总预算秒数（留空恢复全局值）",
         }
         # 喵~防御：字段名不认识时列出所有能改的字段和它们的含义喵
         if field not in allowed_fields:
             print("能改的字段是喵：")
             # 逐个打印字段名和说明喵
             for key, desc in allowed_fields.items():
-                print(f"  {key:12} {desc}")
+                print(f"  {key:18} {desc}")
             return
         # 喵~防御：序号必须能转成整数喵
         try:
@@ -565,10 +601,26 @@ class Repl:
         except ValueError:
             print(f"序号 {index_text!r} 不是数字喵~")
             return
-        # 喵~防御：值不能是空字符串，空的 base_url 或 api_key 会让这个节点必然失败喵
-        if not value.strip():
+        # 这个字段是不是超时覆盖类的，它们的取值规则和别的字段不一样喵
+        is_timeout_field = field in CANDIDATE_TIMEOUT_FIELDS
+        # 超时覆盖允许被「清掉」，用 -、default 或 none 表示恢复跟随全局值喵
+        clearing = is_timeout_field and value.strip().lower() in ("-", "default", "none", "")
+        # 喵~防御：非超时字段的值不能是空字符串，空的 base_url 或 api_key 会让节点必然失败喵
+        if not value.strip() and not is_timeout_field:
             print(f"{field} 不能设成空的喵~")
             return
+        # 超时字段且不是在清值，那就必须是一个大于 0 的数字喵
+        if is_timeout_field and not clearing:
+            # 喵~防御：转不成数字就明确提示，并说明怎么清掉这个覆盖喵
+            try:
+                seconds = float(value.strip())
+            except ValueError:
+                print(f"{field} 要填秒数喵，{value.strip()!r} 转不成数字~（想恢复全局值就填 default）")
+                return
+            # 喵~防御：非正数会让请求一发出就判超时，肯定不是主人想要的喵
+            if seconds <= 0:
+                print(f"{field} 要大于 0 喵~（想恢复全局值就填 default）")
+                return
 
         def mutator(data: dict[str, Any]) -> str:
             """改指定候选的指定字段喵~"""
@@ -588,6 +640,24 @@ class Repl:
             if field == "api_key":
                 # 旧 key 太短就整体打码，否则只留头尾喵
                 old = "***" if len(str(old)) <= 11 else f"{str(old)[:6]}***{str(old)[-4:]}"
+            # 清掉超时覆盖：把这个键整个删掉，让它回到「跟随全局值」的状态喵
+            if clearing:
+                # 喵~防御：本来就没配过时不报错，只说明现状，保持命令幂等喵
+                if field not in candidate:
+                    return f"虚拟模型 {vm_name} 第 {index} 个候选本来就没配 {field}，现在依然跟随全局值"
+                # 删掉这个键喵
+                del candidate[field]
+                # 返回改动描述喵
+                return f"已清掉虚拟模型 {vm_name} 第 {index} 个候选的 {field}（改回跟随全局值）"
+            # 超时字段写成数字而不是字符串，这样 YAML 里是干净的数值喵
+            if is_timeout_field:
+                # 写入浮点秒数喵
+                candidate[field] = float(value.strip())
+                # 返回改动描述喵
+                return (
+                    f"已把虚拟模型 {vm_name} 第 {index} 个候选的 {field} "
+                    f"从 {old} 改成 {float(value.strip()):.0f} 秒（只对这个节点生效）"
+                )
             # 写入新值，去掉首尾空白防止复制粘贴带进空格喵
             candidate[field] = value.strip()
             # 返回改动描述，新值同样对 key 做脱敏喵
@@ -699,15 +769,15 @@ class Repl:
         """改 server 段的某个配置项喵~"""
         # 可以改的字段，以及各自的取值类型转换函数喵
         numeric_fields = {
-            # 单次上游请求的总超时，单位：秒喵
-            "request_timeout": float,
-            # 等首个内容字符的超时，单位：秒喵
-            "first_content_timeout": float,
+            # 流式请求放行之前的总预算，单位：秒喵
+            "stream_timeout": float,
+            # 非流式请求的总预算，单位：秒喵
+            "nonstream_timeout": float,
             # 连接握手超时，单位：秒喵
             "connect_timeout": float,
             # 配置热重载的轮询间隔，单位：秒喵
             "reload_poll_interval": float,
-            # 探测阶段总时限，用来判定流卡住，单位：秒喵
+            # 允许上游静默多少秒，超过算卡流，单位：秒喵
             "stall_timeout": float,
             # 放行给客户端前需要累积的内容字符数喵
             "min_content_chars": int,
@@ -718,6 +788,11 @@ class Repl:
             # 监听端口喵
             "port": int,
         }
+        # 喵~防御：主人如果敲了已经退役的配置项名，光说「不能改」会让人一头雾水，
+        # 所以专门认出这些老名字并告诉主人现在该改哪一项喵
+        if field in RETIRED_SERVER_KEYS:
+            print(f"{field} 已经退役了喵：{RETIRED_SERVER_KEYS[field]}")
+            return
         # 喵~防御：字段名不认识时列出所有能改的字段喵
         if field not in numeric_fields:
             allowed = "、".join(numeric_fields)
@@ -1008,7 +1083,11 @@ class Repl:
                         "用法喵：cand set <虚拟模型> <序号> <字段> <值>\n"
                         "  例如：cand set auto-strong 2 api_key sk-new-key-here\n"
                         "        cand set auto-strong 2 base_url https://newrelay.com\n"
-                        "        cand set auto-strong 2 model gpt-4o-2024-11-20"
+                        "        cand set auto-strong 2 model gpt-4o-2024-11-20\n"
+                        "  给单个节点配专属超时喵（只影响这一个节点）：\n"
+                        "        cand set auto-strong 1 stream_timeout 600\n"
+                        "        cand set auto-strong 1 stall_timeout 180\n"
+                        "        cand set auto-strong 1 stream_timeout default   （改回跟随全局值）"
                     )
                     return
                 # 只切前五段，第六段之后保留原样当值（值里可能有空格，比如显示名字）喵
@@ -1230,6 +1309,55 @@ class Repl:
             print(f"（常驻冻结表不可用，退回朴素模式喵：{type(exc).__name__}）")
         # 提示怎么看冻结表喵
         print("（底部会常驻显示冻结表，每秒自动更新喵~）\n" if session else "")
+        # 拿到「输出重定向」的上下文管理器喵。
+        #
+        # 这是修「有日志滚动时下方状态监控会上移然后渲染错误」那个 bug 的另一半喵：
+        #   代理的日志是在主线程（uvicorn 那边）打的，底部横幅是 REPL 线程画的。
+        #   两边都往同一个终端写，谁也不知道对方写了什么 —— 日志一滚，
+        #   prompt_toolkit 记着的「光标现在在第几行」就和实际情况脱节了，
+        #   于是横幅位置乱跑、字符叠在一起。
+        #
+        #   patch_stdout 的做法是把 sys.stdout / sys.stderr 换成代理对象，
+        #   所有输出都排队交给 prompt_toolkit，由它负责「先擦掉横幅 → 打这行输出 →
+        #   在新的位置重画横幅」。这样两边就不再抢终端了喵。
+        #
+        # raw=True 是必须的：日志里带着 ANSI 颜色码（WARNING 黄、ERROR 红），
+        # 非 raw 模式会把转义码当普通文本处理，颜色就没了喵。
+        redirect = self._build_stdout_patch() if session else None
+        # 喵~防御：拿不到重定向器也照常跑，只是日志和横幅可能互相干扰，
+        # 总比因为一个显示问题就没法用交互命令行要好喵
+        if redirect is None:
+            # 用一个什么都不做的上下文管理器占位，让下面的 with 写法保持统一喵
+            from contextlib import nullcontext
+            redirect = nullcontext()
+        # 在重定向生效的范围内跑主循环喵
+        with redirect:
+            # 真正的读命令循环喵
+            self._loop(session)
+
+    def _build_stdout_patch(self):
+        """
+        构造 prompt_toolkit 的输出重定向上下文喵~
+
+        输出：patch_stdout 上下文管理器；prompt_toolkit 不可用时返回 None，
+             由调用方退回到「不重定向」的模式喵。
+        """
+        # 喵~防御：在方法内导入，这样 prompt_toolkit 没装时不影响模块导入喵
+        try:
+            from prompt_toolkit.patch_stdout import patch_stdout
+        # 拿不到就返回 None，让调用方走无重定向的路喵
+        except Exception:  # noqa: BLE001
+            return None
+        # raw=True 让 ANSI 颜色码原样透传，日志的黄色红色才不会被吃掉喵
+        return patch_stdout(raw=True)
+
+    def _loop(self, session) -> None:
+        """
+        读命令并执行的主循环喵~
+
+        单独拆出来是为了让 run() 那边能干净地用 with 把它包在输出重定向里，
+        不用把整个循环缩进一层喵。
+        """
         # 一直循环读命令，直到收到退出信号喵
         while not self.should_exit.is_set():
             # 读一行输入，各种异常都要接住喵

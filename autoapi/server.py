@@ -125,6 +125,10 @@ async def _config_reload_loop(state: RuntimeState, path: Path) -> None:
             len(new_config.virtual_models),
             len(new_config.rules),
         )
+        # 喵~防御：新配置里如果用了已退役的配置项，重载时也要提醒一次。
+        # 只在启动时提醒是不够的 —— 主人很可能是在运行中编辑配置时才写进去的喵
+        for warning in new_config.warnings:
+            logger.warning("配置提醒喵：%s", warning)
 
 
 def create_app(state: RuntimeState) -> FastAPI:
@@ -142,10 +146,11 @@ def create_app(state: RuntimeState) -> FastAPI:
         config = state.config
         # 这里给客户端设的超时只是个兜底默认值喵。
         # 真正生效的超时是每条请求在 upstream.py 里现算现传的（见 build_timeout），
-        # 这样主人在运行中改了超时配置能当场生效，而不会被这个启动时定死的值压住喵。
+        # 这样主人在运行中改了超时配置、或者给某个节点配了专属超时，都能当场生效，
+        # 而不会被这个启动时定死的值压住喵。
         timeout = httpx.Timeout(
-            # 读超时给足，流式响应两个字之间可能隔很久喵
-            timeout=config.server.request_timeout,
+            # 兜底用两个总预算里更大的那个，免得这个默认值反而成了最紧的约束喵
+            timeout=max(config.server.stream_timeout, config.server.nonstream_timeout),
             # 建立连接的超时单独设置，连不上要快速失败好换下一个候选喵
             connect=config.server.connect_timeout,
         )

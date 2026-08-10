@@ -1,5 +1,11 @@
 # 真实配置文件里存着上游 api key，绝对不能提交到 git 喵~
 config.yaml
+# 连带把备份、临时副本一起挡掉喵。
+# 只写 config.yaml 是不够的：改配置前顺手 cp 一份 config.yaml.bak，
+# 那份备份里的 key 和正本一模一样，但不在忽略名单里，git add 就会把它收进去喵
+config.yaml.*
+config.*.yaml
+!config.example
 
 # Python 编译缓存喵
 __pycache__/

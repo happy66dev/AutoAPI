@@ -37,8 +37,11 @@ from .config import (
     STATUS_BAD_STREAM,
     STATUS_NETWORK_ERROR,
     STATUS_STALLED_STREAM,
+    STATUS_TIMEOUT,
     Candidate,
+    EffectiveTimeouts,
     ServerConfig,
+    resolve_timeouts,
 )
 # 引入流探测器和结论常量喵
 from .sse import VERDICT_CONTENT, VERDICT_PENDING, StreamProbe
@@ -123,22 +126,32 @@ class AttemptResult:
         return "application/json"
 
 
-def build_timeout(server_cfg: ServerConfig) -> httpx.Timeout:
+def build_timeout(timeouts: EffectiveTimeouts, is_stream: bool) -> httpx.Timeout:
     """
-    按当前配置现算一份 httpx 超时设置喵~
+    按这次请求实际生效的超时值现算一份 httpx 超时设置喵~
 
     为什么每条请求都现算而不是复用客户端上的默认值：
         httpx 客户端是在 lifespan 里建的、全程复用，它身上的 timeout 是启动那一刻定死的。
-        如果只依赖那个值，主人在运行中把 request_timeout 调大，客户端仍然按旧的小值掐断，
-        改动看起来「没生效」，而且很难看出为什么。所以这里每条请求都从当前配置现算一份
-        传给 httpx，让超时配置和别的配置一样能热更新喵。
+        如果只依赖那个值，主人在运行中把超时调大，客户端仍然按旧的小值掐断，
+        改动看起来「没生效」，而且很难看出为什么。所以这里每条请求都现算一份传给 httpx，
+        让超时配置（以及节点上的专属覆盖）都能立即生效喵。
+
+    流式和非流式的 read 超时含义完全不同，所以要分开设：
+        流式   read 超时 = 允许上游静默多久。SSE 是「一点点吐」，两个 chunk 之间的间隔
+               才是有意义的度量；用总预算当 read 超时的话，卡死的流要等满整个预算才被发现喵。
+        非流式 read 超时 = 总预算。非流式是「上游憋完整篇再一次性返回」，中间本来就没有
+               任何字节可收，用静默时长去掐它会把慢模型全部冤枉掉喵。
     """
+    # 流式看静默、非流式看总预算，选出这次该用的 read 超时喵
+    read_timeout = timeouts.stall if is_stream else timeouts.nonstream
     # 分项设置各类超时喵
     return httpx.Timeout(
-        # 读超时用总超时兜底，流式响应两个字之间可能隔很久，不能设太短喵
-        timeout=server_cfg.request_timeout,
+        # 兜底值给所有未显式指定的项（write、pool）用喵
+        timeout=read_timeout,
         # 建立连接的超时单独设置，连不上要快速失败好换下一个候选喵
-        connect=server_cfg.connect_timeout,
+        connect=timeouts.connect,
+        # 读超时按上面选好的值设置喵
+        read=read_timeout,
     )
 
 
@@ -222,33 +235,50 @@ MAX_PROBE_BUFFER_BYTES = 2 * 1024 * 1024
 
 # 探测阶段的额外结论：缓冲区被撑爆了喵
 PROBE_BUFFER_OVERFLOW = "buffer_overflow"
-# 探测阶段的额外结论：流卡住了（等不到结论）喵
+# 探测阶段的额外结论：上游静默太久，连一个字节都不发了（连接像是挂死了）喵
 PROBE_STALLED = "stalled"
+# 探测阶段的额外结论：连接一直活着、上游也一直在发东西，但用光了总预算还没拿到足够内容喵
+PROBE_TIMEOUT = "timeout"
 
 
 async def _probe_until_content(
     iterator: AsyncIterator[bytes],
     probe: StreamProbe,
     buffered: bytearray,
-    first_content_timeout: float,
     stall_timeout: float,
+    stream_timeout: float,
 ) -> tuple[str, str]:
     """
-    从上游流里持续读取，直到探测出明确结论或者判定它卡住了喵~
+    从上游流里持续读取，直到探测出明确结论、判定它静默太久、或者用光总预算喵~
 
     输入：
-        iterator              上游的字节迭代器
-        probe                 探测器（内部维护字数门槛）
-        buffered              用于暂存原始字节的可变缓冲区
-        first_content_timeout 一个字符都没吐时的最长等待，用来快速失败
-        stall_timeout         整个探测阶段的总时限，用来兜住「吐了几个字然后卡住」
-    输出：(结论, 说明文本)，结论是 VERDICT_* 或 PROBE_STALLED / PROBE_BUFFER_OVERFLOW
+        iterator       上游的字节迭代器
+        probe          探测器（内部维护字数门槛）
+        buffered       用于暂存原始字节的可变缓冲区
+        stall_timeout  允许上游连续静默多少秒（收到任何字节就重新计时）
+        stream_timeout 整个探测阶段的总预算秒数
+    输出：(结论, 说明文本)，结论是 VERDICT_* 或 PROBE_STALLED / PROBE_TIMEOUT /
+         PROBE_BUFFER_OVERFLOW
 
-    为什么每次读取都要单独套超时，而不是在外面套一个大的 wait_for：
-        上游卡住的时候，我们是阻塞在「等下一个字节块」这件事上的。如果只在最外面套
-        wait_for，语义上是对的，但拿不到「已经吐了几个字」这种细节来区分是「一个字都没吐」
-        还是「吐了几个字然后卡住」，日志会说不清楚。所以这里对每次读取算一个剩余预算，
-        预算取两个计时器里更紧的那个喵。
+    这里有两个语义完全不同的计时器，分清它们很重要喵：
+
+        静默计时器（stall_timeout）—— 衡量「上游还活着吗」
+            每收到任何一个字节就归零重新数。所以上游只要还在发东西（心跳注释行、
+            message_start 元信息包、空的 role 占位包、思维链增量……），它就一直不会触发。
+            触发了就说明连接真的挂死了，一个字节都不来了喵。
+
+        总预算计时器（stream_timeout）—— 衡量「等太久了吗」
+            从探测开始算起，一路数到底，中途绝不归零。上游可能一直在勤快地发心跳、
+            连接非常健康，但正文就是迟迟不来 —— 这种情况静默计时器永远不会响，
+            必须靠总预算兜住，否则会一直等下去喵。
+
+    为什么这么改（这一版修掉的 bug）：
+        上一版这里是「首字符计时器」：只要还没收到内容字符，就从探测开始计时，
+        45 秒到了直接判失败。问题是它压根不看连接上有没有动静 —— 上游正在发心跳、
+        正在吐思维链、正在正常地准备响应，全都不算，一律 45 秒斩。
+        推理模型先想一两分钟再吐第一个字是很正常的事，于是就出现了主人看到的现象：
+        「首字还没出就被我们自动重试了」。改成「静默才算卡」之后，正在干活的上游
+        不会再被冤枉，而真正挂死的上游照旧能被快速发现喵。
 
     副作用：读到的所有原始字节都会追加进 buffered，一个字节都不丢，
            这样确认健康后才能把它们原样 replay 给客户端喵。
@@ -257,44 +287,88 @@ async def _probe_until_content(
          同一个迭代器接着读。httpx 的流只能迭代一次，重新调 aiter_bytes() 会抛
          StreamConsumed，所以迭代器必须在两个阶段之间传递下去喵。
     """
-    # 记下探测开始的时刻，两个计时器都以它为基准喵
+    # 记下探测开始的时刻，总预算计时器以它为基准喵
     started_at = time.monotonic()
+    # 最近一次收到字节的时刻，静默计时器以它为基准；一开始就是探测开始的时刻喵
+    last_byte_at = started_at
+    # 到目前为止一共收到了多少字节，用于写出说得清楚的失败说明喵
+    total_bytes = 0
     # 一直读到得出结论为止喵
     while True:
-        # 算出已经花了多少秒喵
+        # 算出这次探测总共花了多少秒喵
         elapsed = time.monotonic() - started_at
-        # 探测阶段总时限的剩余预算喵
-        remaining = stall_timeout - elapsed
-        # 总时限用完了，判定这条流卡住了喵
-        if remaining <= 0:
-            # 说明文本里带上已经吐了几个字，方便从日志区分是「完全没动静」还是「吐了几个字卡住」喵
-            return PROBE_STALLED, (
-                f"上游建立了流但在 {stall_timeout:.0f} 秒内没能吐出足够内容"
-                f"（已收到 {probe.content_chars} 个字符）"
+        # 总预算的剩余量喵
+        remaining_total = stream_timeout - elapsed
+        # 总预算用完了，判定超时喵
+        if remaining_total <= 0:
+            # 说明里写清楚「连接一直有动静但正文没来」，这和挂死是两种完全不同的故障喵
+            return PROBE_TIMEOUT, (
+                f"流式请求超过总预算 {stream_timeout:.0f} 秒仍未拿到足够内容"
+                f"（期间共收到 {total_bytes} 字节、{probe.content_chars} 个内容字符，"
+                f"连接一直是活的，只是太慢了）"
             )
-        # 本次读取允许等待的预算，先取总时限的剩余量喵
-        budget = remaining
-        # 还一个字符都没收到时，额外受首字符计时器约束，好让完全没动静的上游快点失败喵
-        if probe.content_chars == 0:
-            # 首字符计时器的剩余预算喵
-            remaining_first = first_content_timeout - elapsed
-            # 首字符预算用完了，同样判定卡住（主人要求这种情况也重发一次）喵
-            if remaining_first <= 0:
+        # 算出距离上次收到字节过了多久喵
+        silent_for = time.monotonic() - last_byte_at
+        # 静默额度的剩余量喵
+        remaining_stall = stall_timeout - silent_for
+        # 静默太久了，判定卡流喵
+        if remaining_stall <= 0:
+            # 说明里区分「一个字节都没来过」和「来过字节后才挂死」，这俩排查方向不一样喵
+            if total_bytes == 0:
                 return PROBE_STALLED, (
-                    f"上游建立了流但 {first_content_timeout:.0f} 秒内一个内容字符都没吐"
+                    f"上游返回了 200 但连续 {stall_timeout:.0f} 秒一个字节都没发过来"
+                    f"（连响应头之后的第一个字节都没有，像是连接挂死了）"
                 )
-            # 取两个预算里更紧的那个喵
-            budget = min(budget, remaining_first)
+            # 之前有过字节，说明是发了一段之后才挂死的喵
+            return PROBE_STALLED, (
+                f"上游发过 {total_bytes} 字节（{probe.content_chars} 个内容字符）之后"
+                f"连续 {stall_timeout:.0f} 秒再没有任何动静，判定为卡流"
+            )
+        # 本次读取允许等待的预算，取两个计时器里更紧的那个喵
+        budget = min(remaining_total, remaining_stall)
         # 读下一个字节块，套上算好的预算喵
         try:
             chunk = await asyncio.wait_for(iterator.__anext__(), timeout=budget)
         # 迭代器正常结束，说明上游把流吐完了，交给 finish() 做最终判定喵
         except StopAsyncIteration:
             return probe.finish(), probe.detail
-        # 喵~防御：本次读取超时，说明上游挂着不动了，回到循环顶部由计时器判定该报什么喵
+        # 喵~防御：本次读取超时。这里必须当场给出结论、绝不能 continue 回到循环顶部喵。
+        #
+        # 为什么：asyncio.wait_for 超时时会取消它包着的那个协程，也就是把
+        # iterator.__anext__() 取消掉。异步生成器被取消之后就报废了 —— 再调一次
+        # __anext__() 不会继续读，而是直接抛 StopAsyncIteration，看起来就像「上游把流
+        # 正常吐完了」。于是上面那个 except StopAsyncIteration 分支会去调 probe.finish()，
+        # 把一个明明是超时的情况判成「流结束了但没内容」的空流（bad_stream）。
+        #
+        # 这个坑只在「超时那一刻两个计时器都还差一点点没到」时才踩中，所以表现为偶发 ——
+        # 同一个用例跑十次可能只错一次，特别难查。当场给结论就彻底避开了它喵。
         except asyncio.TimeoutError:
-            # 循环顶部会重新算 elapsed 并给出准确的卡流说明，所以这里只需继续喵
-            continue
+            # 哪个计时器先到就报哪一种故障。静默计时器更紧说明是上游挂死了喵
+            if remaining_stall <= remaining_total:
+                # 区分「一个字节都没来过」和「来过字节后才挂死」，排查方向不一样喵
+                if total_bytes == 0:
+                    return PROBE_STALLED, (
+                        f"上游返回了 200 但连续 {stall_timeout:.0f} 秒一个字节都没发过来"
+                        f"（连响应头之后的第一个字节都没有，像是连接挂死了）"
+                    )
+                # 之前有过字节，说明是发了一段之后才挂死的喵
+                return PROBE_STALLED, (
+                    f"上游发过 {total_bytes} 字节（{probe.content_chars} 个内容字符）之后"
+                    f"连续 {stall_timeout:.0f} 秒再没有任何动静，判定为卡流"
+                )
+            # 总预算先到，说明连接一直活着但就是太慢喵
+            return PROBE_TIMEOUT, (
+                f"流式请求超过总预算 {stream_timeout:.0f} 秒仍未拿到足够内容"
+                f"（期间共收到 {total_bytes} 字节、{probe.content_chars} 个内容字符，"
+                f"连接一直是活的，只是太慢了）"
+            )
+        # 喵~防御：空字节块不算「有动静」，不重置静默计时器。
+        # 否则一个疯狂吐空块的上游能让静默计时器永远不触发，白白耗掉整个总预算喵
+        if chunk:
+            # 收到了真字节，静默计时器归零重新数喵
+            last_byte_at = time.monotonic()
+            # 累加收到的字节数喵
+            total_bytes += len(chunk)
         # 先把原始字节存好，replay 时要用喵
         buffered.extend(chunk)
         # 再喂给探测器做判断喵
@@ -316,23 +390,46 @@ async def _attempt_stream(
     url: str,
     headers: dict[str, str],
     body: bytes,
-    server_cfg: ServerConfig,
+    timeouts: EffectiveTimeouts,
+    min_content_chars: int,
 ) -> AttemptResult:
     """
     走流式路径打一次上游喵~
 
-    成功的定义：HTTP 200 且在 first_content_timeout 内探测到至少一个有效内容字符。
+    成功的定义：HTTP 200，且在总预算 stream_timeout 之内探测到「这条流是健康的」，
+    期间上游的静默时长也没超过 stall_timeout。
     失败时会就地关掉响应连接，客户端完全感知不到这次尝试发生过喵。
+
+    注意总预算只管到「放行」为止。一旦确认健康、字节开始流向客户端，我们就不再计时了 ——
+    模型愿意写多久就写多久，中途掐断一个正在正常输出的回答是最糟糕的行为喵。
     """
+    # 记下发起请求的时刻。总预算是从这里开始算的，包含建连和等响应头的时间，
+    # 否则「连了 4 分钟才拿到响应头」这种情况会白白绕过预算喵
+    request_started_at = time.monotonic()
     # 构造请求对象，这里还没真正发出去喵
-    # 超时按当前配置现算并显式传进去，这样运行中改超时能当场生效喵
+    # 超时按这次生效的值现算并显式传进去，这样改全局超时或节点专属超时都能当场生效喵
     request = client.build_request(
-        method, url, headers=headers, content=body, timeout=build_timeout(server_cfg)
+        method, url, headers=headers, content=body, timeout=build_timeout(timeouts, is_stream=True)
     )
     # 发出请求并要求流式接收（不自动读完 body）喵
     try:
         response = await client.send(request, stream=True)
-    # 喵~防御：连接失败、DNS 失败、握手超时等网络层问题统一转成 network 状态喵
+    # 喵~防御：连接超时单独归为网络错误。连不上是「这个上游此刻不可达」，
+    # 和「上游可达但很慢」是两种故障，规则上通常也想区别对待喵
+    except httpx.ConnectTimeout as exc:
+        return AttemptResult(
+            ok=False,
+            status=STATUS_NETWORK_ERROR,
+            error_text=f"连接上游超时（{timeouts.connect:.0f} 秒内没握上手）：{exc}",
+        )
+    # 喵~防御：其余超时（读、写、连接池排队）说明上游可达但太慢，归为 timeout 状态喵
+    except httpx.TimeoutException as exc:
+        return AttemptResult(
+            ok=False,
+            status=STATUS_TIMEOUT,
+            error_text=f"等上游响应头超时：{type(exc).__name__}: {exc}",
+        )
+    # 喵~防御：连接失败、DNS 失败等网络层问题统一转成 network 状态喵
     except (httpx.HTTPError, OSError) as exc:
         return AttemptResult(
             # 这次尝试失败喵
@@ -369,11 +466,26 @@ async def _attempt_stream(
         )
     # 走到这里是 200，开始探测这条流到底是真健康、假成功、还是卡住了喵
     # 字数门槛从配置里取，这样主人改了 min_content_chars 能立即生效喵
-    probe = StreamProbe(min_content_chars=server_cfg.min_content_chars)
+    probe = StreamProbe(min_content_chars=min_content_chars)
     # 暂存探测阶段读到的所有原始字节，确认健康后要原样replay给客户端喵
     buffered = bytearray()
     # 拿到字节迭代器，整个请求全程只创建这一个，探测和转发共用它喵
     iterator = response.aiter_bytes()
+    # 算出探测阶段还剩多少总预算：总预算减掉建连和等响应头已经花掉的时间喵
+    probe_budget = timeouts.stream - (time.monotonic() - request_started_at)
+    # 喵~防御：建连和等响应头就把预算耗光了（比如上游 4 分钟才给响应头，预算只有 5 分钟），
+    # 此时不要用一个负数或 0 去调探测函数，直接判超时更清楚喵
+    if probe_budget <= 0:
+        # 关掉连接释放槽位喵
+        await response.aclose()
+        # 返回超时结果，说明里写清楚是「响应头就来得太晚」喵
+        return AttemptResult(
+            ok=False,
+            status=STATUS_TIMEOUT,
+            error_text=(
+                f"等上游响应头就用光了整个 {timeouts.stream:.0f} 秒总预算，来不及读流内容"
+            ),
+        )
     # 开始探测。两个计时器都在函数内部处理，所以这里不再额外套 wait_for 喵
     try:
         verdict, detail = await _probe_until_content(
@@ -383,10 +495,21 @@ async def _attempt_stream(
             probe,
             # 原始字节缓冲区喵
             buffered,
-            # 一个字符都没吐时的最长等待喵
-            server_cfg.first_content_timeout,
-            # 整个探测阶段的总时限喵
-            server_cfg.stall_timeout,
+            # 允许上游静默多少秒喵
+            timeouts.stall,
+            # 探测阶段还剩的总预算喵
+            probe_budget,
+        )
+    # 喵~防御：读流时超时（httpx 自己的 read 超时先响了），归为卡流。
+    # 因为 read 超时的语义正好就是「两次读取之间隔太久」，和我们的静默判定是一回事喵
+    except httpx.TimeoutException as exc:
+        # 关掉连接喵
+        await response.aclose()
+        # 返回卡流结果喵
+        return AttemptResult(
+            ok=False,
+            status=STATUS_STALLED_STREAM,
+            error_text=f"读流时上游静默超时：{type(exc).__name__}: {exc}",
         )
     # 喵~防御：探测过程中上游把连接掐断了，归为网络错误喵
     except (httpx.HTTPError, OSError) as exc:
@@ -425,6 +548,15 @@ async def _attempt_stream(
             ok=False,
             status=STATUS_STALLED_STREAM,
             error_text=detail or "上游的流卡住了",
+        )
+    # 用光总预算也单独用一个状态码。它和卡流的区别是「连接一直健康、只是太慢」，
+    # 所以规则上可能想给它更少的重试次数（毕竟已经等了很久了）喵
+    if verdict == PROBE_TIMEOUT:
+        # 返回超时状态，让规则里的 status: timeout 能命中喵
+        return AttemptResult(
+            ok=False,
+            status=STATUS_TIMEOUT,
+            error_text=detail or "流式请求用光了总预算",
         )
     # 其余情况（空流、流内 error、缓冲区溢出）都归为「200 假成功」喵
     return AttemptResult(
@@ -471,29 +603,52 @@ async def _attempt_nonstream(
     url: str,
     headers: dict[str, str],
     body: bytes,
-    server_cfg: ServerConfig,
+    timeouts: EffectiveTimeouts,
 ) -> AttemptResult:
     """
     走非流式路径打一次上游喵~
 
-    成功的定义：HTTP 200 且响应体里没有 error 字段。
+    成功的定义：在 nonstream_timeout 总预算之内拿到 HTTP 200，且响应体里没有 error 字段。
+
+    为什么非流式的预算天生要比流式大：
+        流式是「一点点吐」，所以我们能在几秒内就判断出这条流健不健康，剩下的时间交给客户端。
+        非流式是「上游把整篇憋完再一次性返回」，在它返回之前我们什么都看不到，
+        必须一直等。一个长回答加上思考时间，十几分钟都可能，所以默认给 600 秒喵。
     """
     # 发请求并一次性读完整个响应喵
     try:
         response = await asyncio.wait_for(
-            # 普通的非流式请求，超时同样按当前配置现算后显式传进去喵
+            # 普通的非流式请求，超时同样按这次生效的值现算后显式传进去喵
             client.request(
-                method, url, headers=headers, content=body, timeout=build_timeout(server_cfg)
+                method,
+                url,
+                headers=headers,
+                content=body,
+                timeout=build_timeout(timeouts, is_stream=False),
             ),
-            # 整个请求的总时限喵
-            timeout=server_cfg.request_timeout,
+            # 整个请求的总预算，作为 httpx 自身超时之外的第二道保险喵
+            timeout=timeouts.nonstream,
         )
-    # 喵~防御：总超时，转成网络失败状态喵
+    # 喵~防御：总预算用完了，归为 timeout 状态，让规则可以给它安排重发喵
     except asyncio.TimeoutError:
         return AttemptResult(
             ok=False,
+            status=STATUS_TIMEOUT,
+            error_text=f"非流式请求超过总预算 {timeouts.nonstream:.0f} 秒仍未拿到完整响应",
+        )
+    # 喵~防御：连接超时归为网络错误，含义是「这个上游此刻不可达」喵
+    except httpx.ConnectTimeout as exc:
+        return AttemptResult(
+            ok=False,
             status=STATUS_NETWORK_ERROR,
-            error_text=f"请求上游超过 {server_cfg.request_timeout} 秒仍未完成",
+            error_text=f"连接上游超时（{timeouts.connect:.0f} 秒内没握上手）：{exc}",
+        )
+    # 喵~防御：其余超时（读、写、连接池排队）说明上游可达但太慢，归为 timeout 状态喵
+    except httpx.TimeoutException as exc:
+        return AttemptResult(
+            ok=False,
+            status=STATUS_TIMEOUT,
+            error_text=f"非流式请求超时：{type(exc).__name__}: {exc}",
         )
     # 喵~防御：连接、DNS、读写等网络层异常统一转成 network 状态喵
     except (httpx.HTTPError, OSError) as exc:
@@ -568,12 +723,23 @@ async def try_candidate(
     headers = build_upstream_headers(client_headers, candidate)
     # 构造请求体：只把顶层 model 换成候选的真实模型名喵
     body = build_upstream_body(body_obj, candidate)
+    # 算出这次实际生效的超时值：节点上配了专属值就用它，没配就用 server 段的全局值喵
+    timeouts = resolve_timeouts(server_cfg, candidate)
     # 按是否流式分派到两条不同的路径喵
     if is_stream:
-        # 流式路径要做首内容探测喵
-        return await _attempt_stream(client, candidate, method, url, headers, body, server_cfg)
+        # 流式路径要先探测这条流健不健康才放行喵
+        return await _attempt_stream(
+            client,
+            candidate,
+            method,
+            url,
+            headers,
+            body,
+            timeouts,
+            server_cfg.min_content_chars,
+        )
     # 非流式路径一次读完喵
-    return await _attempt_nonstream(client, method, url, headers, body, server_cfg)
+    return await _attempt_nonstream(client, method, url, headers, body, timeouts)
 
 
 async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:

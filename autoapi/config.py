@@ -40,15 +40,48 @@ STATUS_BAD_STREAM = -2
 # 所以适合原地重发一次试试，而不是立刻换候选喵。
 STATUS_STALLED_STREAM = -3
 
+# 特殊状态码：表示这次请求耗时超过了「总预算」喵。
+# 和 stalled_stream 的区别是：stalled_stream 看的是「静默」（上游一个字节都不发了），
+# 而 timeout 看的是「总时长」—— 上游可能一直在发东西、连接也很健康，就是太慢了，
+# 慢到超过我们愿意等的上限。两者都适合重发一次，但原因完全不同，所以分开计喵。
+STATUS_TIMEOUT = -4
+
 # YAML 里能写的状态别名 → 内部特殊状态码的映射表喵
 STATUS_ALIASES = {
     # 写 network 就等于网络层失败喵
     "network": STATUS_NETWORK_ERROR,
     # 写 bad_stream 就等于 200 假成功（明确坏掉的流）喵
     "bad_stream": STATUS_BAD_STREAM,
-    # 写 stalled_stream 就等于流卡住了（吐了几个字或没吐，然后一直挂着）喵
+    # 写 stalled_stream 就等于流卡住了（上游静默太久，一个字节都不发）喵
     "stalled_stream": STATUS_STALLED_STREAM,
+    # 写 timeout 就等于这次请求超过了总预算（流式或非流式各有自己的预算）喵
+    "timeout": STATUS_TIMEOUT,
 }
+
+# 已经退役的 server 配置项 → 该怎么改的说明喵。
+# 为什么要专门留这张表而不是静默忽略：主人配置里写着的东西如果悄悄不生效，
+# 那是最难查的一类问题 —— 看起来配了，实际没用。所以加载时逐个报出来，
+# 但只是警告不报错，免得旧配置直接起不来喵。
+RETIRED_SERVER_KEYS = {
+    # 这一项被拆成了流式和非流式两个独立预算喵
+    "request_timeout": (
+        "已拆成 stream_timeout（流式请求总预算，默认 300 秒）和 "
+        "nonstream_timeout（非流式请求总预算，默认 600 秒）两项，请改用它们喵"
+    ),
+    # 这一项是「首字还没出就被重试」的元凶，已经退役喵
+    "first_content_timeout": (
+        "已废弃喵。它从「开始读流」那一刻起算，只要迟迟等不到正文就判失败，"
+        "哪怕连接一直活着、上游正在发心跳或思维链 —— 这正是「首字还没出就被重试」的原因。"
+        "现在改由 stall_timeout（上游静默多久算卡流，收到任何字节就重新计时）和 "
+        "stream_timeout（整个流式请求的总预算）接手喵"
+    ),
+}
+
+# 候选节点上可以单独覆盖的超时字段名喵。
+# 为什么要允许按节点覆盖：同一条链上常常混着快慢差很多的模型 —— 比如链首是个
+# 会先想很久的推理模型、兜底是个秒回的小模型。给它们配同一套超时，要么把推理模型
+# 冤枉成卡流，要么让小模型挂死太久才降级。所以按节点单独开口子喵。
+CANDIDATE_TIMEOUT_FIELDS = ("stall_timeout", "stream_timeout", "nonstream_timeout")
 
 # 规则引擎允许的四种动作名，拼错的话加载阶段直接报错喵
 VALID_ACTIONS = {"retry", "next", "freeze", "passthrough"}
@@ -77,6 +110,14 @@ class Candidate:
     model: str
     # 鉴权头风格，bearer 或 x-api-key 喵
     auth_style: str = "bearer"
+    # 下面三项是这个节点专属的超时覆盖，None 表示「跟随 server 段的全局值」喵。
+    # 只有真正需要区别对待的节点才配，绝大多数节点留空就好喵。
+    # 这个节点允许上游静默多少秒（超过就算卡流）喵
+    stall_timeout: float | None = None
+    # 这个节点的流式请求总预算秒数喵
+    stream_timeout: float | None = None
+    # 这个节点的非流式请求总预算秒数喵
+    nonstream_timeout: float | None = None
 
     @property
     def identity(self) -> str:
@@ -103,6 +144,27 @@ class Candidate:
         """一行式简介，日志里描述「当前正在用哪个候选」时用喵~"""
         # 拼成「名字(真实模型 @ 地址 key=脱敏)」这种紧凑格式喵
         return f"{self.name}({self.model} @ {self.base_url} key={self.masked_key})"
+
+    @property
+    def timeout_note(self) -> str:
+        """
+        把这个节点自己配的超时覆盖渲染成一行，没配任何覆盖时返回空串喵~
+
+        REPL 的 vm 命令会显示它，好让主人一眼看出「哪些节点被单独调过超时」，
+        免得改了全局值之后困惑为什么某个节点没跟着变喵。
+        """
+        # 收集所有配了值的覆盖项喵
+        parts = []
+        # 逐个检查三项覆盖，配了才显示喵
+        for field_name in CANDIDATE_TIMEOUT_FIELDS:
+            # 取出这一项的值，None 表示没配喵
+            value = getattr(self, field_name)
+            # 只把真正配了的加进来喵
+            if value is not None:
+                # 用「字段=秒数s」的紧凑写法喵
+                parts.append(f"{field_name}={value:.0f}s")
+        # 一项都没配就返回空串，调用方据此决定要不要显示这一段喵
+        return f"专属超时：{' '.join(parts)}" if parts else ""
 
 
 @dataclass
@@ -159,13 +221,19 @@ class ServerConfig:
     host: str = "127.0.0.1"
     # 监听端口喵
     port: int = 8787
-    # 单次上游请求的总超时秒数喵
-    request_timeout: float = 300.0
-    # 等第一个有效内容字符的超时秒数。上游一个字都不吐时靠这个快速失败喵
-    first_content_timeout: float = 45.0
-    # 整个探测阶段的总时限秒数。上游吐了几个字然后卡住不动时靠这个兜住，
-    # 超时就判定为 stalled_stream（流卡住了）喵
+    # 允许上游「静默」多少秒。静默 = 一个字节都没发过来（连心跳都没有）。
+    # 只要收到任何字节，这个计时器就重新从 0 开始数，所以它衡量的是「上游是不是还活着」，
+    # 而不是「正文出来了没有」—— 推理模型先想很久再吐字，只要期间连接上有动静就不会被误判。
+    # 超过这个时间没有任何字节，就判定为 stalled_stream（流卡住了）喵
     stall_timeout: float = 60.0
+    # 流式请求的总预算秒数：从发出请求算起，到「确认这条流健康、可以放行给客户端」为止。
+    # 超过就判定为 timeout，由规则决定重发还是换候选喵。
+    # 注意：这个预算只管「放行之前」那一段。一旦放行，客户端已经在收字节了，
+    # 后面模型愿意写多久就写多久，我们不会中途掐断它喵。
+    stream_timeout: float = 300.0
+    # 非流式请求的总预算秒数：从发出请求算起，到整个响应体读完为止。
+    # 比流式的预算大，因为非流式是「憋完整篇才一次性返回」，天然就该等更久喵
+    nonstream_timeout: float = 600.0
     # 放行给客户端之前，需要先累积够这么多个内容字符。
     # 设成 10 是为了避开「上游先吐一两个字符然后卡死」这种情况 —— 只等 1 个字符的话
     # 会被这种流骗过去，字节一出门就再也没法换候选了喵。
@@ -182,6 +250,60 @@ class ServerConfig:
     reload_poll_interval: float = 2.0
 
 
+@dataclass(frozen=True)
+class EffectiveTimeouts:
+    """
+    某个候选节点这一次请求实际生效的超时值喵~
+
+    为什么要单独有这么个东西：超时值有两个来源（server 段的全局值、节点自己的覆盖值），
+    每次用的时候都现算「有覆盖用覆盖、没覆盖用全局」很容易漏掉某一处，
+    于是把「算」这件事收拢到 resolve_timeouts 一个地方，用的时候只读这个结果喵。
+    """
+
+    # 允许上游静默多少秒，超过算卡流喵
+    stall: float
+    # 流式请求放行之前的总预算秒数喵
+    stream: float
+    # 非流式请求的总预算秒数喵
+    nonstream: float
+    # 连接握手超时秒数喵
+    connect: float
+
+
+def resolve_timeouts(server: ServerConfig, candidate: Candidate | None = None) -> EffectiveTimeouts:
+    """
+    算出这次请求实际该用的超时值喵~
+
+    输入：server 段配置，以及这次要用的候选节点（不传就表示只要全局值）
+    输出：EffectiveTimeouts
+    规则：节点上配了就用节点的，没配就用 server 段的全局值。
+         connect_timeout 不支持按节点覆盖 —— 握手快慢跟模型没关系，只跟网络有关喵。
+    """
+    # 喵~防御：没有候选时（比如只想看全局值）直接用全局值组装，不去访问 candidate 的字段喵
+    if candidate is None:
+        return EffectiveTimeouts(
+            stall=server.stall_timeout,
+            stream=server.stream_timeout,
+            nonstream=server.nonstream_timeout,
+            connect=server.connect_timeout,
+        )
+    # 有候选时逐项取「节点覆盖优先、否则全局」喵
+    return EffectiveTimeouts(
+        # 节点配了静默上限就用它喵
+        stall=candidate.stall_timeout if candidate.stall_timeout is not None else server.stall_timeout,
+        # 节点配了流式预算就用它喵
+        stream=candidate.stream_timeout if candidate.stream_timeout is not None else server.stream_timeout,
+        # 节点配了非流式预算就用它喵
+        nonstream=(
+            candidate.nonstream_timeout
+            if candidate.nonstream_timeout is not None
+            else server.nonstream_timeout
+        ),
+        # 握手超时始终用全局值喵
+        connect=server.connect_timeout,
+    )
+
+
 @dataclass
 class AppConfig:
     """整份配置的顶层容器喵~"""
@@ -194,6 +316,9 @@ class AppConfig:
     rules: list[Rule]
     # 配置文件所在路径，热重载和 REPL 保存时需要喵
     source_path: Path | None = None
+    # 加载过程中攒下的警告（比如用了已退役的配置项）。
+    # 这些都不足以让加载失败，但必须让主人看见，否则「配了却没生效」根本查不出来喵
+    warnings: list[str] = field(default_factory=list)
 
 
 def _status_to_text(code: int) -> str:
@@ -307,6 +432,36 @@ def _parse_rule(raw: Any, index: int) -> Rule:
     )
 
 
+def _parse_optional_timeout(raw: Any, where: str, field_name: str) -> float | None:
+    """
+    解析一个「可选的超时覆盖值」喵~
+
+    输入：YAML 里写的原始值、位置描述、字段名
+    输出：解析出的秒数；字段没写或显式写成 null 时返回 None（表示跟随全局值）
+    边界条件：
+        写了非数字（字符串、列表）→ 报错，因为这肯定是手误，静默忽略只会更难查
+        写了 0 或负数         → 报错，超时设成 0 等于请求一发出就判超时，肯定不是想要的
+        写了布尔值           → 报错，Python 里 True 是 int 的子类，不挡掉会被当成 1 秒喵
+    """
+    # 字段没写或显式为 null，表示跟随全局值喵
+    if raw is None:
+        return None
+    # 喵~防御：布尔值必须先挡掉，否则 True 会被 float() 变成 1.0 秒喵
+    if isinstance(raw, bool):
+        raise ConfigError(f"{where} 的 {field_name} 不能写布尔值：{raw!r} 喵")
+    # 尝试转成浮点秒数喵
+    try:
+        value = float(raw)
+    # 喵~防御：转不过去说明写的不是数字，明确报错而不是悄悄忽略喵
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{where} 的 {field_name}={raw!r} 不是数字喵") from exc
+    # 喵~防御：非正数会让请求刚发出就判超时，属于必然出错的配置，直接拒绝喵
+    if value <= 0:
+        raise ConfigError(f"{where} 的 {field_name}={value} 必须大于 0 喵")
+    # 返回解析好的秒数喵
+    return value
+
+
 def _parse_candidate(raw: Any, vm_name: str, index: int) -> Candidate:
     """把 YAML 里的一个候选字典解析成 Candidate 对象喵~"""
     # 描述位置，报错时能定位到哪个虚拟模型的第几个候选喵
@@ -337,6 +492,14 @@ def _parse_candidate(raw: Any, vm_name: str, index: int) -> Candidate:
         model=str(raw["model"]).strip(),
         # 鉴权风格喵
         auth_style=auth_style,
+        # 这个节点专属的静默上限，没写就是 None 表示跟随全局值喵
+        stall_timeout=_parse_optional_timeout(raw.get("stall_timeout"), where, "stall_timeout"),
+        # 这个节点专属的流式总预算喵
+        stream_timeout=_parse_optional_timeout(raw.get("stream_timeout"), where, "stream_timeout"),
+        # 这个节点专属的非流式总预算喵
+        nonstream_timeout=_parse_optional_timeout(
+            raw.get("nonstream_timeout"), where, "nonstream_timeout"
+        ),
     )
 
 
@@ -354,18 +517,27 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
     # 喵~防御：server 段必须是字典喵
     if not isinstance(server_raw, dict):
         raise ConfigError("server 段必须是字典喵")
+    # 收集加载过程中的警告，最后塞进 AppConfig 让启动和 reload 时打出来喵
+    warnings: list[str] = []
+    # 喵~防御：主人配置里如果还留着已退役的配置项，必须明确报出来。
+    # 静默忽略是最坑的做法 —— 配置里明明写着，实际却不生效，谁都查不出来喵
+    for retired_key, advice in RETIRED_SERVER_KEYS.items():
+        # 只有真的写了这一项才提醒喵
+        if retired_key in server_raw:
+            # 攒一条警告，说明这项已经不生效了以及该怎么改喵
+            warnings.append(f"server.{retired_key} 已不再生效喵：{advice}")
     # 构造服务器配置，各数值字段都做类型转换与安全下限处理喵
     server = ServerConfig(
         # 监听地址，默认只绑本地喵
         host=str(server_raw.get("host", "127.0.0.1")),
         # 监听端口喵
         port=int(server_raw.get("port", 8787)),
-        # 总超时至少 1 秒，防止配成 0 导致请求瞬间被掐断喵
-        request_timeout=max(1.0, float(server_raw.get("request_timeout", 300.0))),
-        # 首内容超时至少 1 秒，同理喵
-        first_content_timeout=max(1.0, float(server_raw.get("first_content_timeout", 45.0))),
-        # 探测阶段总时限至少 1 秒喵
+        # 允许上游静默的上限，至少 1 秒喵
         stall_timeout=max(1.0, float(server_raw.get("stall_timeout", 60.0))),
+        # 流式请求的总预算，至少 1 秒喵
+        stream_timeout=max(1.0, float(server_raw.get("stream_timeout", 300.0))),
+        # 非流式请求的总预算，至少 1 秒喵
+        nonstream_timeout=max(1.0, float(server_raw.get("nonstream_timeout", 600.0))),
         # 放行门槛至少 1 个字符。设成 0 或负数等于不设门槛，收到任何内容就放行，
         # 那样就完全失去了防「吐一两个字然后卡死」的能力，所以这里压到 1 喵
         min_content_chars=max(1, int(server_raw.get("min_content_chars", 10))),
@@ -405,7 +577,13 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
     # 逐条解析规则，顺序即匹配优先级喵
     rules = [_parse_rule(item, i) for i, item in enumerate(rules_raw)]
     # 组装并返回顶层配置对象喵
-    return AppConfig(server=server, virtual_models=virtual_models, rules=rules, source_path=source_path)
+    return AppConfig(
+        server=server,
+        virtual_models=virtual_models,
+        rules=rules,
+        source_path=source_path,
+        warnings=warnings,
+    )
 
 
 def load_config(path: str | Path) -> AppConfig:
