@@ -95,6 +95,11 @@ HELP_TEXT = """
                             解冻某个指定节点，让它立刻可用喵
     freeze clear            立刻清空所有冻结，让所有候选马上可用喵
 
+  目标模式（仅本次运行有效，重启后自动关闭）：
+    target on               链路全失效后每 5 秒从链首重试，最长坚持 5 分钟喵
+    target off              关闭目标模式，恢复链用尽即返回 502 的默认行为喵
+    target status           查看目标模式是否已开启喵
+
   其他：
     reload                  从磁盘重新加载 config.yaml 喵
     save                    校验当前配置并重新格式化写回 config.yaml 喵
@@ -170,8 +175,13 @@ def render_freeze_banner(state: RuntimeState) -> list[tuple[str, str]]:
     rows = state.list_frozen_nodes()
     # 先取每个虚拟模型近 60 秒的动态 RPM/TPM，放在冻结状态上方喵
     rate_rows = state.snapshot_virtual_model_rates()
+    # 目标模式开启时先显示醒目的运行期提示，避免主人忘记请求会尽量坚持 5 分钟喵
+    target_enabled = state.target_mode_enabled
     # 先渲染负载信息，RPM 统计成功请求，TPM 只来自上游 usage 喵
     fragments: list[tuple[str, str]] = []
+    # 目标模式提示放在横幅最顶端喵
+    if target_enabled:
+        fragments.append(("class:warn", "🎯 目标模式已开启：链路全失效时会每 5 秒重试，最长坚持 5 分钟"))
     # 按配置顺序逐个显示虚拟模型，避免横幅顺序每秒跳动喵
     for rate in rate_rows:
         # TPM 未完整上报时明确显示未知，不把未知伪装成 0 喵
@@ -1220,6 +1230,28 @@ class Repl:
             # 喵~防御：不认识的子命令给出提示喵
             print(f"不认识的 freeze 子命令 {sub!r} 喵，支持 ls / add / rm / clear~")
             return
+        # target 系列命令：只改运行期内存状态，绝不写 config.yaml 喵
+        if head == "target":
+            # 没带参数时视为查询当前状态喵
+            sub = parts[1].lower() if len(parts) >= 2 else "status"
+            # 开启目标模式喵
+            if sub in ("on", "enable"):
+                self.state.set_target_mode(True)
+                print("🎯 目标模式已开启喵：链路全失效后会每 5 秒从链首重试，最长坚持 5 分钟~")
+                return
+            # 关闭目标模式喵
+            if sub in ("off", "disable"):
+                self.state.set_target_mode(False)
+                print("目标模式已关闭喵：链路全失效时恢复立即返回 502 的默认行为~")
+                return
+            # 查看状态喵
+            if sub in ("status", "ls"):
+                status = "已开启" if self.state.target_mode_enabled else "未开启"
+                print(f"目标模式当前{status}喵（仅本次运行有效，重启后自动关闭）")
+                return
+            # 喵~防御：未知子命令给出明确用法喵
+            print(f"不认识的 target 子命令 {sub!r} 喵，支持 on / off / status~")
+            return
         # reload 命令重载配置喵
         if head == "reload":
             self.cmd_reload()
@@ -1259,6 +1291,8 @@ class Repl:
             # 冻结管理：这里必须包含 freeze add / freeze rm，主人反馈的就是漏了它们喵
             "freeze", "freeze ls", "freeze list", "freeze add", "freeze rm",
             "freeze remove", "freeze del", "freeze clear",
+            # 目标模式开关喵
+            "target", "target on", "target off", "target status",
             # 全局 server 配置字段喵
             "set", "set stall_timeout", "set stream_timeout",
             "set nonstream_timeout", "set connect_timeout", "set min_content_chars",

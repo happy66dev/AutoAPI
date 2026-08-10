@@ -108,6 +108,8 @@ class RuntimeState:
         self.total_requests = 0
         # 代理累计彻底失败（整条候选链都用尽）的请求数喵
         self.total_exhausted = 0
+        # 目标模式开关：只存在内存里，重启后默认关闭，绝不写入 config.yaml 喵
+        self._target_mode_enabled = False
 
     # ---------- 配置相关喵 ----------
 
@@ -135,6 +137,29 @@ class RuntimeState:
         # 加锁取出所有 key 并转成列表返回喵
         with self._lock:
             return list(self._config.virtual_models.keys())
+
+    # ---------- 目标模式相关喵 ----------
+
+    @property
+    def target_mode_enabled(self) -> bool:
+        """读取目标模式当前是否开启喵~"""
+        # 加锁读取运行期临时状态喵
+        with self._lock:
+            return self._target_mode_enabled
+
+    def set_target_mode(self, enabled: bool) -> bool:
+        """
+        开启或关闭目标模式，返回变更后的状态喵~
+
+        这是纯内存状态：不写入配置文件，也不随热重载变化。这样主人可以临时保住
+        正在跑的客户端请求，又不会因为重启后忘记关掉而意外占住 5 分钟长连接喵。
+        """
+        # 加锁更新开关喵
+        with self._lock:
+            # 写入标准布尔值喵
+            self._target_mode_enabled = bool(enabled)
+            # 返回现在的状态喵
+            return self._target_mode_enabled
 
     # ---------- 冻结相关喵 ----------
 

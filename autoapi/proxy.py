@@ -331,6 +331,12 @@ async def _run_one_candidate(
         return "next", result
 
 
+# 本次目标模式最多坚持多久，单位：秒喵
+TARGET_MODE_MAX_WAIT_SECONDS = 300.0
+# 目标模式一整轮链路失败后的固定等待，单位：秒喵
+TARGET_MODE_ROUND_INTERVAL_SECONDS = 5.0
+
+
 async def handle_request(
     client: httpx.AsyncClient,
     state: RuntimeState,
@@ -400,71 +406,88 @@ async def handle_request(
         )
     # 判断这是流式还是非流式请求喵
     is_stream = detect_stream_flag(body_obj)
-    # 挑出当前没被冻结的候选，以及被跳过的说明喵
-    usable, skipped = _pick_usable_candidates(state, chain)
-    # 记一条开始处理的日志，写明虚拟模型、是否流式、可用候选数喵
-    logger.info(
-        "[%s] 处理请求 虚拟模型=%s 流式=%s 可用候选=%d/%d 喵",
-        req_id,
-        virtual_model,
-        is_stream,
-        len(usable),
-        len(chain),
-    )
-    # 收集每个候选的失败原因，整条链都失败时要回给客户端喵
-    failures: list[str] = list(skipped)
-    # 按严格优先级依次尝试每个可用候选喵
-    for candidate in usable:
-        # 在这个候选上尝试到底（含内部退避重试）喵
-        verdict, result = await _run_one_candidate(
-            # 复用的客户端喵
-            client,
-            # 运行时状态喵
-            state,
-            # 当前候选喵
-            candidate,
-            # 以下都是原样转发的请求要素喵
-            method,
-            path,
-            query,
-            headers,
-            body_obj,
-            is_stream,
-            # 这条请求的 ID，让候选层的日志也带上它喵
-            req_id,
-            # 读取到虚拟模型后交给候选编排喵
-            virtual_model,
+    # 判断目标模式是否开启，开关只从内存读取，不接触 config.yaml 喵
+    target_mode = state.target_mode_enabled
+    # 目标模式请求的截止时刻，使用单调时钟避免系统时间跳变喵
+    target_deadline = time.monotonic() + TARGET_MODE_MAX_WAIT_SECONDS if target_mode else None
+    # 目标模式已经循环了多少轮喵
+    target_rounds = 0
+    # 目标模式开始时记录日志喵
+    if target_mode:
+        logger.warning(
+            "[%s] 目标模式已接管虚拟模型 %s：链路全失效后每 %.0f 秒重试，最长 %.0f 分钟喵",
+            req_id, virtual_model, TARGET_MODE_ROUND_INTERVAL_SECONDS, TARGET_MODE_MAX_WAIT_SECONDS / 60,
         )
-        # 成功了，直接返回，后面的候选不再尝试喵
-        if verdict == "ok":
-            return ProxyOutcome(success=True, attempt=result, is_stream=is_stream)
-        # 规则要求原样回传上游响应（比如 400，客户端自己请求写错了）喵
-        if verdict == "passthrough":
-            # 用 success=True 走「直接回传」的路径，但注意此时 result 里装的是上游的错误响应喵
-            return ProxyOutcome(
-                success=True,
-                attempt=result,
-                # passthrough 的响应体已经完整读出来了，所以按非流式回传喵
-                is_stream=False,
+    # 目标模式外层循环：正常模式只执行一轮，目标模式整轮失败后回到链首喵
+    while True:
+        # 每一轮重新读取候选链和冻结状态，允许冻结到期或热重载在下一轮生效喵
+        current_chain = state.get_chain(virtual_model) or chain
+        usable, skipped = _pick_usable_candidates(state, current_chain)
+        # 当前轮数加一喵
+        target_rounds += 1
+        # 记一条开始处理的日志，写明虚拟模型、是否流式、可用候选数和当前轮次喵
+        logger.info(
+            "[%s] 处理请求 虚拟模型=%s 流式=%s 可用候选=%d/%d 第%d轮喵",
+            req_id, virtual_model, is_stream, len(usable), len(current_chain), target_rounds,
+        )
+        # 收集这一轮失败原因喵
+        failures: list[str] = list(skipped)
+        # 按严格优先级依次尝试当前轮可用候选喵
+        for candidate in usable:
+            # 在这个候选上尝试到底（含内部退避重试）喵
+            verdict, result = await _run_one_candidate(
+                client, state, candidate, method, path, query, headers, body_obj,
+                is_stream, req_id, virtual_model,
             )
-        # 这个候选不行，记下原因然后试下一个喵
-        failures.append(f"{candidate.label} → 状态 {result.status}：{result.error_text[:150]}")
-    # 整条候选链都走完了还没成功喵
-    state.total_exhausted += 1
-    # 记一条错误日志，把所有失败原因都写进去喵
-    logger.error(
-        "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
-    )
-    # 回 502 并附上每个候选各自的失败原因，方便一眼看出是全挂了还是全在冻结喵
-    return ProxyOutcome(
-        success=False,
-        status=502,
-        error_body={
-            "error": {
-                "message": f"虚拟模型 {virtual_model} 的所有候选都不可用喵",
-                "type": "upstream_all_failed",
-                "virtual_model": virtual_model,
-                "attempts": failures,
-            }
-        },
-    )
+            # 成功了，直接返回，后面的候选不再尝试喵
+            if verdict == "ok":
+                return ProxyOutcome(success=True, attempt=result, is_stream=is_stream)
+            # 规则要求原样回传上游响应（比如 400），绝不能被目标模式重试喵
+            if verdict == "passthrough":
+                return ProxyOutcome(success=True, attempt=result, is_stream=False)
+            # 这个候选不行，记下原因然后试下一个喵
+            failures.append(f"{candidate.label} → 状态 {result.status}：{result.error_text[:150]}")
+        # 整条候选链都走完了还没成功喵
+        state.total_exhausted += 1
+        # 正常模式只跑一轮，保留原有 502 行为喵
+        if not target_mode:
+            logger.error(
+                "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
+            )
+            return ProxyOutcome(
+                success=False,
+                status=502,
+                error_body={"error": {
+                    "message": f"虚拟模型 {virtual_model} 的所有候选都不可用喵",
+                    "type": "upstream_all_failed",
+                    "virtual_model": virtual_model,
+                    "attempts": failures,
+                }},
+            )
+        # 目标模式下，截止时间到了也要让本轮完整结束后才返回 429 喵
+        now = time.monotonic()
+        if target_deadline is not None and now >= target_deadline:
+            waited_seconds = TARGET_MODE_MAX_WAIT_SECONDS
+            logger.error(
+                "[%s] 目标模式结束 虚拟模型=%s 已尝试%d轮、等待%.0f秒仍无成功响应喵：%s",
+                req_id, virtual_model, target_rounds, waited_seconds, " | ".join(failures),
+            )
+            return ProxyOutcome(
+                success=False,
+                status=429,
+                error_body={"error": {
+                    "message": "所有链路全部不可用喵",
+                    "type": "target_mode_all_unavailable",
+                    "virtual_model": virtual_model,
+                    "target_mode": True,
+                    "rounds": target_rounds,
+                    "waited_seconds": waited_seconds,
+                    "attempts": failures,
+                }},
+            )
+        # 还没到截止时间，固定等待 5 秒后从链首开始下一轮喵
+        logger.warning(
+            "[%s] 目标模式第%d轮链路全部不可用，%.0f秒后从链首重试喵：%s",
+            req_id, target_rounds, TARGET_MODE_ROUND_INTERVAL_SECONDS, " | ".join(failures),
+        )
+        await asyncio.sleep(TARGET_MODE_ROUND_INTERVAL_SECONDS)
