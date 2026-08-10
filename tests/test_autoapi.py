@@ -2207,6 +2207,7 @@ def test_REPL补全包含完整命令和新字段():
     assert "set stall_timeout" in set_words
     assert "set stream_timeout" in set_words
     assert "set nonstream_timeout" in set_words
+    assert "set metrics_window_minutes" in set_words
     # cand set 后面应该能补全节点级三个超时覆盖字段喵
     cand_set_words = suggestions("cand set ")
     assert "cand set stall_timeout" in cand_set_words
@@ -2395,6 +2396,18 @@ def test_交互式改超时配置(tmp_path):
     assert repl.state.config.server.stream_timeout == 99.0
     # 磁盘上也应该被更新喵
     assert "99" in path.read_text(encoding="utf-8")
+
+
+def test_交互式改性能统计窗口(tmp_path):
+    """set 应该能改性能统计窗口，并立即刷新内存配置和临时配置文件喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 用 dispatch 走真实命令解析路径修改窗口，单位：分钟喵
+    repl.dispatch("set metrics_window_minutes 15")
+    # 内存中的新窗口应立即用于后续 RPM/TPM 统计喵
+    assert repl.state.config.server.metrics_window_minutes == 15.0
+    # 临时配置文件应同步写入，供下次启动和热重载使用喵
+    assert "metrics_window_minutes: 15.0" in path.read_text(encoding="utf-8")
 
 
 def test_交互式给单个节点配专属超时(tmp_path):
