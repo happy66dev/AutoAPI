@@ -1305,7 +1305,123 @@ def test_超时按当前配置现算():
     assert build_timeout(config.server).read == 777.0
 
 
-# ============ 7. 交互式改配置喵 ============
+# ============ 7. 交互区的冻结表横幅喵 ============
+
+
+def test_倒计时格式():
+    """倒计时应该按「xx 分 xx 秒」补零显示喵~"""
+    # 引入格式化函数喵
+    from autoapi.repl import format_countdown
+    # 常规情况：5 分 42 秒喵
+    assert format_countdown(342) == "05 分 42 秒"
+    # 不足一分钟喵
+    assert format_countdown(8) == "00 分 08 秒"
+    # 正好一分钟喵
+    assert format_countdown(60) == "01 分 00 秒"
+    # 超过一小时要带上「时」喵
+    assert format_countdown(3942) == "01 时 05 分 42 秒"
+    # 喵~防御：负数和 0 都按 0 秒显示，不能出现「-1 分」这种怪东西喵
+    assert format_countdown(0) == "00 分 00 秒"
+    assert format_countdown(-5) == "00 分 00 秒"
+
+
+def test_没有冻结时横幅显示全部可用():
+    """一个节点都没冻结时应该显示绿色的「全部可用」那一行喵~"""
+    # 引入渲染函数喵
+    from autoapi.repl import render_freeze_banner
+    # 造一个全新的状态，此时没有任何冻结喵
+    state = make_state()
+    # 渲染横幅喵
+    fragments = render_freeze_banner(state)
+    # 把所有文字拼起来方便断言喵
+    text = "".join(t for _, t in fragments)
+    # 应该显示全部可用喵
+    assert "所有节点可用" in text
+    # 不该出现配额警告喵
+    assert "配额限制" not in text
+
+
+def test_有冻结时横幅列出虚拟模型和节点():
+    """
+    横幅要按主人要求的「虚拟模型id/节点model 将在 xx 分 xx 秒 后再次可用」格式显示喵~
+    """
+    # 引入渲染函数喵
+    from autoapi.repl import render_freeze_banner
+    # 造状态喵
+    state = make_state()
+    # 把链首那个节点冻结 342 秒（也就是 5 分 42 秒）喵
+    state.freeze(state.config.virtual_models["auto-test"][0], 342, "额度用尽")
+    # 渲染横幅喵
+    fragments = render_freeze_banner(state)
+    # 把所有文字拼起来喵
+    text = "".join(t for _, t in fragments)
+    # 应该有配额警告标题喵
+    assert "配额限制" in text
+    # 应该带上虚拟模型名喵
+    assert "auto-test" in text
+    # 应该带上节点的真实模型名喵
+    assert "gpt-4o" in text
+    # 应该有倒计时，5 分 42 秒或因为耗时少 1 秒都算对喵
+    assert ("05 分 42 秒" in text) or ("05 分 41 秒" in text)
+    # 应该有「后再次可用」的措辞喵
+    assert "后再次可用" in text
+
+
+def test_横幅按剩余时间排序():
+    """快恢复的节点应该排在前面，方便主人一眼看到哪个先回来喵~"""
+    # 引入渲染函数喵
+    from autoapi.repl import render_freeze_banner
+    # 造状态喵
+    state = make_state()
+    # 取出两个节点喵
+    chain = state.config.virtual_models["auto-test"]
+    # 第一个冻很久喵
+    state.freeze(chain[0], 600, "额度用尽")
+    # 第二个冻较短喵
+    state.freeze(chain[1], 100, "额度用尽")
+    # 渲染横幅喵
+    text = "".join(t for _, t in render_freeze_banner(state))
+    # 剩余时间短的那个（claude-sonnet）应该出现在前面喵
+    assert text.index("claude-sonnet") < text.index("gpt-4o")
+
+
+def test_冻结表明细带虚拟模型名():
+    """
+    list_frozen_nodes 要能把「节点属于哪个虚拟模型」带出来喵~
+    这是横幅能按 虚拟模型/节点 格式显示的前提，而 list_freezes 拿不到这个信息喵。
+    """
+    # 造状态喵
+    state = make_state()
+    # 冻结链首节点喵
+    state.freeze(state.config.virtual_models["auto-test"][0], 300, "额度用尽")
+    # 取冻结明细喵
+    rows = state.list_frozen_nodes()
+    # 应该只有一条喵
+    assert len(rows) == 1
+    # 虚拟模型名、节点模型名、剩余秒数都要对喵
+    vm_name, model, remaining = rows[0]
+    assert vm_name == "auto-test"
+    assert model == "gpt-4o"
+    assert 295 < remaining <= 300
+
+
+def test_冻结过期后横幅自动消失():
+    """冻结到期后横幅应该自动变回「全部可用」，不需要任何手动清理喵~"""
+    # 引入渲染函数喵
+    from autoapi.repl import render_freeze_banner
+    # 造状态喵
+    state = make_state()
+    # 冻结一个极短的时间喵
+    state.freeze(state.config.virtual_models["auto-test"][0], 0.05, "短暂冻结")
+    # 立刻渲染，应该能看到警告喵
+    assert "配额限制" in "".join(t for _, t in render_freeze_banner(state))
+    # 等它过期喵
+    time.sleep(0.1)
+    # 再渲染，应该变回全部可用喵
+    assert "所有节点可用" in "".join(t for _, t in render_freeze_banner(state))
+
+
+# ============ 8. 交互式改配置喵 ============
 
 
 def make_repl(tmp_path):

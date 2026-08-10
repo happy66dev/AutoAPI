@@ -193,6 +193,40 @@ class RuntimeState:
         # 返回结果喵
         return result
 
+    def list_frozen_nodes(self) -> list[tuple[str, str, float]]:
+        """
+        列出当前所有被冻结的节点，带上它属于哪个虚拟模型喵~
+
+        输出：[(虚拟模型名, 节点的真实 model 名, 剩余秒数), ...]，按剩余时间从短到长排序
+
+        和 list_freezes 的区别：list_freezes 只认识「候选身份串」，拿不到虚拟模型名，
+        因为冻结表是全局的、不记录候选属于谁。这个方法反过来做 —— 遍历当前配置里的
+        所有虚拟模型和它们的节点，逐个查冻结状态。这样交互区的横幅才能按
+        「虚拟模型id/节点model」的格式显示出来喵。
+
+        为什么同一个节点可能出现多次：冻结是按 (地址, key, 模型) 三元组算的，
+        如果两个虚拟模型共用同一个节点，那它在两个虚拟模型下都会被列出来 ——
+        这是对的，因为主人关心的是「哪个虚拟模型受影响了」喵。
+        """
+        # 结果列表喵
+        rows: list[tuple[str, str, float]] = []
+        # 先取一份配置快照，避免遍历过程中被热重载换掉喵
+        config = self.config
+        # 遍历每个虚拟模型喵
+        for vm_name, chain in config.virtual_models.items():
+            # 遍历这个虚拟模型的每个节点喵
+            for candidate in chain:
+                # 查这个节点还剩多少秒冻结，0 表示可用喵
+                remaining = self.is_frozen(candidate)
+                # 只收集还在冻结中的喵
+                if remaining > 0:
+                    # 记下虚拟模型名、节点的真实模型名、剩余秒数喵
+                    rows.append((vm_name, candidate.model, remaining))
+        # 按剩余时间从短到长排序，快恢复的排前面喵
+        rows.sort(key=lambda row: row[2])
+        # 返回结果喵
+        return rows
+
     # ---------- 统计相关喵 ----------
 
     def record_success(self, candidate: Candidate) -> None:

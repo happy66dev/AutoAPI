@@ -95,6 +95,70 @@ HELP_TEXT = """
 """.strip()
 
 
+def format_countdown(seconds: float) -> str:
+    """
+    把剩余秒数格式化成「xx 分 xx 秒」喵~
+
+    输入：剩余秒数
+    输出：形如 "05 分 42 秒" 的文本；超过一小时会带上小时，写成 "01 时 05 分 42 秒"
+    边界条件：负数或 0 一律当成 0 秒处理（理论上不会传进来，但防一手更稳）喵。
+    """
+    # 喵~防御：负数按 0 处理，避免出现「-1 分」这种怪东西喵
+    total = max(0, int(seconds))
+    # 算出分钟和秒喵
+    minutes, secs = divmod(total, 60)
+    # 超过一小时就多显示一个「时」，否则只显示分和秒喵
+    if minutes >= 60:
+        # 把分钟再拆成小时和分钟喵
+        hours, minutes = divmod(minutes, 60)
+        # 三段都补零到两位，对齐好看喵
+        return f"{hours:02d} 时 {minutes:02d} 分 {secs:02d} 秒"
+    # 常规情况：分和秒都补零到两位喵
+    return f"{minutes:02d} 分 {secs:02d} 秒"
+
+
+def render_freeze_banner(state: RuntimeState) -> list[tuple[str, str]]:
+    """
+    渲染冻结横幅，输出 prompt_toolkit 认的「样式片段」列表喵~
+
+    输出格式是 [(样式字符串, 文本), ...]，prompt_toolkit 的 bottom_toolbar 直接吃这个。
+    返回列表而不是纯字符串是为了能给不同部分上不同的颜色 —— 警告用黄色、倒计时用青色，
+    一眼就能扫到重点喵。
+
+    没有任何节点被冻结时显示一行「所有节点可用」，这样横幅位置固定、
+    内容不会因为横幅忽然出现或消失而上下跳动喵。
+    """
+    # 取当前所有被冻结的节点喵
+    rows = state.list_frozen_nodes()
+    # 一个都没有就显示「全部可用」那一行喵
+    if not rows:
+        # 用绿色表示一切正常喵
+        return [("class:ok", "✓ 所有节点可用，没有节点被冻结喵~")]
+    # 有冻结的话，先放警告标题喵
+    fragments: list[tuple[str, str]] = [
+        # 黄色加粗的警告标题，把数量也写上喵
+        ("class:warn", f"⚠ 下列模型达到了配额限制!（{len(rows)} 个）"),
+    ]
+    # 为了让倒计时对齐，先算出「虚拟模型/节点」这一段最长有多宽喵
+    labels = [f"{vm}/{model}" for vm, model, _ in rows]
+    # 取最长的宽度，用于后面补空格对齐喵
+    width = max(len(label) for label in labels)
+    # 逐行渲染每个被冻结的节点喵
+    for label, (_, _, remaining) in zip(labels, rows):
+        # 每行前面换行并缩进两格喵
+        fragments.append(("", "\n  "))
+        # 「虚拟模型/节点model」这一段，补空格到统一宽度好让倒计时对齐喵
+        fragments.append(("class:node", label.ljust(width)))
+        # 中间的连接词喵
+        fragments.append(("", "  将在 "))
+        # 倒计时用青色突出显示喵
+        fragments.append(("class:countdown", format_countdown(remaining)))
+        # 结尾喵
+        fragments.append(("", " 后再次可用"))
+    # 返回渲染好的片段列表喵
+    return fragments
+
+
 class Repl:
     """交互式命令行喵~"""
 
@@ -896,6 +960,86 @@ class Repl:
         # 喵~防御：完全不认识的命令，提示去看 help，而不是静默无反应喵
         print(f"不认识的命令 {head!r} 喵，敲 help 看看有哪些命令~")
 
+    def _build_session(self):
+        """
+        创建 prompt_toolkit 的输入会话喵~
+
+        为什么用 prompt_toolkit 而不是内置的 input()：
+            主人想要一个常驻在提示符上方、每秒自动刷新的冻结表。用 input() 的话，
+            刷新那一刻如果主人正在敲命令，输入的字会被重绘冲掉、光标也会错位。
+            prompt_toolkit 把「输入行」和「工具栏」分开管理，刷新工具栏时输入行
+            完全不受影响，还白拿命令历史（上下键）和 Tab 补全喵。
+
+        返回值：配置好的 PromptSession；拿不到（比如 stdin 不是终端）时返回 None，
+               由调用方退回到朴素的 input() 模式喵。
+        """
+        # 在方法内导入，这样即使 prompt_toolkit 没装，模块本身也能正常导入，
+        # 单元测试和 --no-repl 模式都不受影响喵
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import WordCompleter
+        from prompt_toolkit.history import InMemoryHistory
+        from prompt_toolkit.styles import Style
+
+        # 定义横幅各部分的配色喵
+        style = Style.from_dict({
+            # 底部工具栏的底色，用深灰让文字更清楚喵
+            "bottom-toolbar": "bg:#333333 #ffffff",
+            # 警告标题用黄色加粗，最醒目喵
+            "bottom-toolbar.warn": "bg:#333333 #ffcc00 bold",
+            # 一切正常时用绿色喵
+            "bottom-toolbar.ok": "bg:#333333 #55ff55",
+            # 「虚拟模型/节点」用白色喵
+            "bottom-toolbar.node": "bg:#333333 #ffffff",
+            # 倒计时用青色，方便快速扫到还剩多久喵
+            "bottom-toolbar.countdown": "bg:#333333 #55ffff bold",
+        })
+        # 可以 Tab 补全的命令词，覆盖所有主命令和常用子命令喵
+        completer = WordCompleter(
+            [
+                # 查看类喵
+                "vm", "rule ls", "freeze ls", "stats", "help",
+                # 改规则类喵
+                "rule add", "rule rm", "rule mv",
+                # 改候选链类喵
+                "cand add", "cand rm", "cand mv", "cand set",
+                "vm add", "vm rm",
+                # 服务器配置与其他喵
+                "set", "freeze clear", "reload", "save", "quit",
+            ],
+            # 只在词的开头匹配，避免输入 set 时把 cand set 也列出来干扰喵
+            ignore_case=True,
+        )
+
+        def bottom_toolbar():
+            """每次刷新时被调用，返回当前的冻结横幅喵~"""
+            # 喵~防御：渲染横幅时万一出错，绝不能让整个 REPL 崩掉，
+            # 所以兜住异常并显示一行提示，主人还能继续敲命令喵
+            try:
+                # 把样式片段里的 class 前缀补全成工具栏专用的，prompt_toolkit 才认喵
+                return [
+                    # 空样式保持原样，带 class: 的补成 class:bottom-toolbar.xxx 喵
+                    (style_str.replace("class:", "class:bottom-toolbar.") if style_str else "", text)
+                    # 遍历渲染出来的每个片段喵
+                    for style_str, text in render_freeze_banner(self.state)
+                ]
+            # 喵~防御：出错时降级成一行纯文本提示，不影响输入喵
+            except Exception as exc:  # noqa: BLE001
+                return [("", f"冻结表渲染出错喵：{type(exc).__name__}")]
+
+        # 组装会话喵
+        return PromptSession(
+            # 命令历史，上下键可以翻之前敲过的命令喵
+            history=InMemoryHistory(),
+            # Tab 补全喵
+            completer=completer,
+            # 底部常驻横幅喵
+            bottom_toolbar=bottom_toolbar,
+            # 配色喵
+            style=style,
+            # 每秒重绘一次，这是倒计时能自己走动的关键喵
+            refresh_interval=1.0,
+        )
+
     def run(self) -> None:
         """
         REPL 主循环，在独立线程里跑喵~
@@ -908,12 +1052,24 @@ class Repl:
             其他异常  打印出来但不让 REPL 线程死掉，免得一个手滑的命令就没法交互了喵
         """
         # 打印欢迎语和提示喵
-        print("\nautoapi 交互式命令行就绪喵~ 敲 help 看命令，敲 quit 退出~\n")
+        print("\nautoapi 交互式命令行就绪喵~ 敲 help 看命令，敲 quit 退出~")
+        # 会话对象，拿不到就退回朴素模式喵
+        session = None
+        # 尝试创建 prompt_toolkit 会话喵
+        try:
+            session = self._build_session()
+        # 喵~防御：prompt_toolkit 没装、或者 stdin 不是终端（管道、nohup）时都会失败。
+        # 这时候退回内置 input()，功能照常只是没有常驻横幅，绝不能因此让 REPL 用不了喵
+        except Exception as exc:  # noqa: BLE001
+            print(f"（常驻冻结表不可用，退回朴素模式喵：{type(exc).__name__}）")
+        # 提示怎么看冻结表喵
+        print("（底部会常驻显示冻结表，每秒自动更新喵~）\n" if session else "")
         # 一直循环读命令，直到收到退出信号喵
         while not self.should_exit.is_set():
             # 读一行输入，各种异常都要接住喵
             try:
-                line = input("autoapi> ")
+                # 有会话就用带横幅的输入，否则退回内置 input 喵
+                line = session.prompt("autoapi> ") if session else input("autoapi> ")
             # 喵~防御：stdin 关闭（Ctrl+D 或后台运行）时退出 REPL 但保留代理服务喵
             except EOFError:
                 print("\n检测到 stdin 已关闭，交互式命令行退出，代理继续在后台服务喵~")
@@ -921,6 +1077,12 @@ class Repl:
             # 喵~防御：Ctrl+C 时不直接杀进程，提示用 quit 优雅退出喵
             except KeyboardInterrupt:
                 print("\n想退出的话敲 quit 喵~")
+                continue
+            # 喵~防御：prompt_toolkit 在某些终端下可能抛别的异常，
+            # 这时候降级成朴素模式继续服务，而不是让 REPL 线程死掉喵
+            except Exception as exc:  # noqa: BLE001
+                print(f"（输入出错，切回朴素模式喵：{type(exc).__name__}）")
+                session = None
                 continue
             # 执行这条命令，异常已经由 dispatch 自己兜住，这里不用再包 try 喵
             self.dispatch(line)

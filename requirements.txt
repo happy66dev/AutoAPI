@@ -6,6 +6,9 @@ uvicorn[standard]==0.34.0
 httpx==0.28.1
 # PyYAML 用来读写 config.yaml 配置文件喵
 PyYAML==6.0.2
+# prompt_toolkit 提供交互区的常驻冻结表（底部横幅每秒刷新且不打乱正在敲的命令），
+# 顺带白拿命令历史和 Tab 补全。纯 Python 无 C 扩展，Windows 上装得很干净喵
+prompt_toolkit==3.0.50
 # pytest 跑单元测试用喵
 pytest==8.3.4
 # pytest-asyncio 让 pytest 能测试 async 函数喵
