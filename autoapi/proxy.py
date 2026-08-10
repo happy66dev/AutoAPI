@@ -218,8 +218,10 @@ async def _run_one_candidate(
         if result.ok:
             # 更新统计并解冻喵
             state.record_success(candidate)
-            # 记录这条虚拟模型成功请求的 RPM/TPM 事件。usage 只来自上游，None 绝不估算喵
-            result.rate_event = state.record_rate_event(virtual_model, result.usage_tokens)
+            # 记录 RPM/TPM 事件：非流式完整响应已经结束，立即统一上报喵
+            # 流式必须等整条流结束后再由 server 统一上报，放行时不能提前增加 RPM 喵
+            if not is_stream:
+                result.rate_event = state.record_rate_event(virtual_model, result.usage_tokens)
             # 保存虚拟模型名，流结束时 server 需要用它补写尾包 usage 喵
             result.virtual_model = virtual_model
             # 非流式请求此刻已经完整结束，立即补上完整耗时；流式要等生成器结束后再补喵

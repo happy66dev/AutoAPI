@@ -320,7 +320,13 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                 finally:
                     # 流结束或客户端断开时记录总时长，避免把放行时长误叫完整总时长喵
                     total_ms = (time.monotonic() - stream_started_at) * 1000
-                    # 把完整流耗时补进平均耗时统计，只有走到这里才算请求完整结束喵
+                    # 流式只有在生成器结束后才统一创建 RPM/TPM 事件喵
+                    if attempt.virtual_model is not None:
+                        attempt.rate_event = state.record_rate_event(
+                            attempt.virtual_model,
+                            attempt.usage_tokens,
+                        )
+                    # 把完整流耗时补进刚刚创建的统计事件喵
                     if attempt.rate_event is not None:
                         state.attach_elapsed_ms(attempt.rate_event, total_ms)
                     logger.info(
@@ -329,9 +335,8 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                         total_ms,
                         attempt.usage_tokens if attempt.usage_tokens is not None else "未上报",
                     )
-                    # 尾包 usage 只能在这里拿到，补写之前已计入 RPM 的事件喵
-                    if attempt.rate_event is not None:
-                        state.attach_usage_tokens(attempt.rate_event, attempt.usage_tokens)
+                    # 尾包 usage 已在 iterator 结束时观察完成，统计事件直接使用最终值喵
+                    # 没有 usage 时保持 None，RPM 已记录但 TPM 仍显示未完整上报喵
             # 禁止缓存，否则中间层可能把 SSE 缓存起来导致客户端收不到增量喵
             stream_headers["Cache-Control"] = "no-cache"
             # 关掉 nginx 一类反向代理的缓冲，不加这个头会导致流被攒成一大坨才下发喵

@@ -798,7 +798,16 @@ def test_窗口外耗时事件不会进入平均值():
     assert row.average_elapsed_ms == 300.0
 
 
-
+def test_流式请求结束后才增加RPM():
+    """流式放行时不能提前计入 RPM，必须等生成器完整结束后统一上报喵~"""
+    # 造状态喵
+    state = make_state()
+    # 没有流结束上报前，虚拟模型应保持零 RPM 喵
+    assert state.snapshot_virtual_model_rates()[0].rpm == 0
+    # 模拟流完整结束后的统一上报喵
+    state.record_rate_event("auto-test", 42)
+    # 结束后才应该看到 RPM=1 喵
+    assert state.snapshot_virtual_model_rates()[0].rpm == 1
 
 
 def make_state() -> RuntimeState:
