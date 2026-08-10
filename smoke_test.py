@@ -497,8 +497,22 @@ async def run_smoke() -> bool:
             # 打印耗时供参考喵
             print(f"       耗时 {stall_elapsed:.1f} 秒（两次卡流探测各 3 秒 + 1 秒退避 + 好上游生成时间）喵~")
 
-            # ---- 检查 9：并发压测喵 ----
-            print("\n检查 9：并发压测（60 条请求同时打进来，对应 60rpm 全挤在一秒）喵")
+            # ---- 检查 10：目标模式开关的冒烟检查喵 ----
+            print("\n检查 10：目标模式开关与状态横幅喵")
+            # 目标模式默认关闭喵
+            results.append(check("目标模式默认关闭", state.target_mode_enabled is False))
+            # 开启目标模式，验证它只改内存状态喵
+            state.set_target_mode(True)
+            results.append(check("目标模式可以开启", state.target_mode_enabled is True))
+            # 关闭目标模式，避免影响冒烟进程后续行为喵
+            state.set_target_mode(False)
+            results.append(check("目标模式可以关闭", state.target_mode_enabled is False))
+            # 临时配置文本中不应出现 target_mode 持久化字段喵
+            config_text = config_path.read_text(encoding="utf-8")
+            results.append(check("目标模式没有写入配置", "target_mode:" not in config_text))
+
+            # ---- 检查 11：并发压测喵 ----
+            print("\n检查 11：并发压测（60 条请求同时打进来，对应 60rpm 全挤在一秒）喵")
             # 记下开始时间喵
             start = asyncio.get_event_loop().time()
             # 同时发 60 条请求喵
