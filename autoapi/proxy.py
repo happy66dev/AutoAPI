@@ -236,13 +236,13 @@ async def _run_one_candidate(
                 )
                 logger.info(
                     "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 放行时长=%.0fms",
-                    req_id, candidate.label, attempt_no, first_byte_ms, elapsed_ms,
+                    req_id, candidate.name, attempt_no, first_byte_ms, elapsed_ms,
                 )
             # 非流式此时完整响应已读完，elapsed 就是真实总时长喵
             else:
                 logger.info(
                     "[%s] 成功 %s（第 %d 次尝试）喵 非流 总时长=%.0fms",
-                    req_id, candidate.label, attempt_no, elapsed_ms,
+                    req_id, candidate.name, attempt_no, elapsed_ms,
                 )
             # 返回成功结论喵
             return "ok", result
