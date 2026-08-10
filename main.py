@@ -22,6 +22,8 @@ import argparse
 import logging
 # sys 用来控制退出码喵
 import sys
+# pathlib 用来算脚本自己所在的目录，好让配置文件不依赖当前工作目录喵
+from pathlib import Path
 # threading 用来在 REPL 敲 quit 后停掉 uvicorn 喵
 import threading
 # time 用来等 uvicorn 真正启动完成，避免跳过它的停机流程喵
@@ -57,6 +59,43 @@ def setup_logging() -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+# 这个脚本所在的目录喵。配置文件默认就放在它旁边，而不是「当前工作目录」里
+# 主人注意：这一行是为了解决「从别的目录或 IDE 里启动就说 config.yaml 不存在」的问题喵。
+# 相对路径 "config.yaml" 是相对当前工作目录解析的，所以 cd 到别处再跑就找不到了；
+# 用脚本自己的目录当基准，无论从哪儿启动都能找到同一份配置喵。
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def resolve_config_path(raw: str) -> Path:
+    """
+    把命令行给的配置路径解析成一个确定的绝对路径喵~
+
+    查找顺序：
+        1. 如果给的是绝对路径，就直接用它
+        2. 否则先在「当前工作目录」下找 —— 这样主人在项目目录里跑时行为和以前完全一致
+        3. 再在「脚本所在目录」下找 —— 这样从任何地方启动都能找到项目里那份配置
+    输出：找到的话返回那个存在的路径；都没找到就返回脚本目录下的候选路径，
+         好让后面的报错信息指向最可能正确的位置喵。
+    """
+    # 转成 Path 对象喵
+    given = Path(raw)
+    # 绝对路径就按主人指定的来，不做任何猜测喵
+    if given.is_absolute():
+        return given
+    # 先看当前工作目录下有没有喵
+    cwd_candidate = Path.cwd() / given
+    # 有就用它，保持和以前一致的行为喵
+    if cwd_candidate.is_file():
+        return cwd_candidate
+    # 再看脚本旁边有没有喵
+    script_candidate = SCRIPT_DIR / given
+    # 有就用它，这是从别的目录启动时的救星喵
+    if script_candidate.is_file():
+        return script_candidate
+    # 两处都没有，返回脚本目录下的候选路径，让报错指向最可能正确的位置喵
+    return script_candidate
+
+
 def parse_args() -> argparse.Namespace:
     """解析命令行参数喵~"""
     # 创建解析器，描述文本会出现在 -h 的输出里喵
@@ -66,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         "-c",
         "--config",
         default="config.yaml",
-        help="配置文件路径，默认 config.yaml 喵",
+        help="配置文件路径，默认 config.yaml（相对路径会先在当前目录找、再在脚本旁边找）喵",
     )
     # --no-repl 关掉交互式命令行，后台跑时用得上喵
     parser.add_argument(
@@ -88,12 +127,40 @@ def main() -> int:
     setup_logging()
     # 解析命令行参数喵
     args = parse_args()
+    # 把配置路径解析成确定的绝对路径，这样从任何目录启动都能找到喵
+    config_path = resolve_config_path(args.config)
     # 加载配置喵
     try:
-        config = load_config(args.config)
+        config = load_config(config_path)
     # 喵~防御：配置有问题时打印明确的中文原因并以退出码 1 结束，不带一堆 traceback 吓人喵
     except ConfigError as exc:
+        # 先说清楚是哪个文件出了问题喵
         print(f"启动失败喵：{exc}", file=sys.stderr)
+        # 喵~防御：如果是「文件不存在」，额外给出可以直接照抄的修复命令，
+        # 并且用真实存在的模板文件名（模板已改名为 config.example）喵
+        if not config_path.is_file():
+            # 找出脚本目录下实际存在的模板文件名喵
+            template = next(
+                (name for name in ("config.example", "config.example.yaml") if (SCRIPT_DIR / name).is_file()),
+                None,
+            )
+            # 只有相对路径才会去两个地方找，绝对路径是主人明确指定的、没有猜测空间喵
+            if not Path(args.config).is_absolute():
+                # 算出两个候选位置喵
+                cwd_candidate = (Path.cwd() / args.config).resolve()
+                script_candidate = (SCRIPT_DIR / args.config).resolve()
+                # 两个位置不同才有必要都列出来，相同时列两遍只会让人困惑喵
+                if cwd_candidate != script_candidate:
+                    print("  这两个位置都找过了喵：", file=sys.stderr)
+                    print(f"    当前工作目录：{cwd_candidate}", file=sys.stderr)
+                    print(f"    脚本所在目录：{script_candidate}", file=sys.stderr)
+            # 有模板就给出照抄即可的命令喵
+            if template:
+                print(f"  可以这样创建喵：", file=sys.stderr)
+                print(f"    cd {SCRIPT_DIR}", file=sys.stderr)
+                print(f"    cp {template} config.yaml", file=sys.stderr)
+                print(f"  然后把里面的 api_key 换成主人自己的真 key 喵~", file=sys.stderr)
+        # 用退出码 1 表示启动失败喵
         return 1
     # 用配置创建运行时状态喵
     state = RuntimeState(config)

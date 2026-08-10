@@ -403,9 +403,10 @@ def load_config(path: str | Path) -> AppConfig:
     """从磁盘读取并解析配置文件喵~"""
     # 统一转成 Path 对象，后面调用更方便喵
     config_path = Path(path)
-    # 喵~防御：文件不存在时给出明确提示，并告诉用户可以从模板复制喵
+    # 喵~防御：文件不存在时给出明确提示，把解析后的绝对路径打出来，
+    # 这样主人一眼就能看出代理到底去哪儿找了，不会出现「文件明明就在项目里」的困惑喵
     if not config_path.is_file():
-        raise ConfigError(f"配置文件 {config_path} 不存在，可以先复制 config.example.yaml 喵")
+        raise ConfigError(f"配置文件 {config_path.resolve()} 不存在喵")
     # 读取文件文本，显式指定 utf-8 避免 Windows 下按 GBK 解码中文注释报错喵
     try:
         text = config_path.read_text(encoding="utf-8")
