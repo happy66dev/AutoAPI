@@ -23,6 +23,8 @@ from __future__ import annotations
 
 # asyncio 用来做退避等待喵
 import asyncio
+# time 用来记录请求性能耗时，使用单调时钟避免系统时间变化影响结果喵
+import time
 # json 用来解析客户端请求体喵
 import json
 # logging 用来输出转发过程的日志喵
@@ -173,6 +175,7 @@ async def _run_one_candidate(
     body_obj: dict[str, Any],
     is_stream: bool,
     req_id: str,
+    virtual_model: str,
 ) -> tuple[str, AttemptResult]:
     """
     在一个候选上尝试到底（含该候选内部的退避重试）喵~
@@ -215,8 +218,29 @@ async def _run_one_candidate(
         if result.ok:
             # 更新统计并解冻喵
             state.record_success(candidate)
-            # 记一条成功日志，第几次尝试也记上，方便观察上游稳定性喵
-            logger.info("[%s] 成功 %s（第 %d 次尝试）喵", req_id, candidate.label, attempt_no)
+            # 记录这条虚拟模型成功请求的 RPM/TPM 事件。usage 只来自上游，None 绝不估算喵
+            result.rate_event = state.record_rate_event(virtual_model, result.usage_tokens)
+            # 保存虚拟模型名，流结束时 server 需要用它补写尾包 usage 喵
+            result.virtual_model = virtual_model
+            # 计算从向上游发请求到当前成功点的耗时喵
+            elapsed_ms = (time.monotonic() - result.started_at) * 1000 if result.started_at else 0.0
+            # 流式在此刻只是确认健康并放行，完整总时长要等流结束后才知道喵
+            if is_stream:
+                first_byte_ms = (
+                    (result.first_byte_at - result.started_at) * 1000
+                    if result.first_byte_at is not None and result.started_at is not None
+                    else 0.0
+                )
+                logger.info(
+                    "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 放行时长=%.0fms",
+                    req_id, candidate.label, attempt_no, first_byte_ms, elapsed_ms,
+                )
+            # 非流式此时完整响应已读完，elapsed 就是真实总时长喵
+            else:
+                logger.info(
+                    "[%s] 成功 %s（第 %d 次尝试）喵 非流 总时长=%.0fms",
+                    req_id, candidate.label, attempt_no, elapsed_ms,
+                )
             # 返回成功结论喵
             return "ok", result
         # 失败了，记一笔失败，同时让它判断是否该触发自动避险喵。
@@ -403,6 +427,8 @@ async def handle_request(
             is_stream,
             # 这条请求的 ID，让候选层的日志也带上它喵
             req_id,
+            # 读取到虚拟模型后交给候选编排喵
+            virtual_model,
         )
         # 成功了，直接返回，后面的候选不再尝试喵
         if verdict == "ok":

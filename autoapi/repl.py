@@ -167,15 +167,33 @@ def render_freeze_banner(state: RuntimeState) -> list[tuple[str, str]]:
     """
     # 取当前所有被冻结的节点喵
     rows = state.list_frozen_nodes()
+    # 先取每个虚拟模型近 60 秒的动态 RPM/TPM，放在冻结状态上方喵
+    rate_rows = state.snapshot_virtual_model_rates()
+    # 先渲染负载信息，RPM 统计成功请求，TPM 只来自上游 usage 喵
+    fragments: list[tuple[str, str]] = []
+    # 按配置顺序逐个显示虚拟模型，避免横幅顺序每秒跳动喵
+    for rate in rate_rows:
+        # TPM 未完整上报时明确显示未知，不把未知伪装成 0 喵
+        tpm_text = f"{rate.tpm}" if rate.tpm is not None else "未完整上报"
+        # 每个虚拟模型一行，动态值会随 60 秒滚动窗口刷新喵
+        if fragments:
+            fragments.append(("", "\n"))
+        fragments.extend([
+            ("class:node", f"{rate.virtual_model}"),
+            ("", f"  RPM={rate.rpm}  TPM={tpm_text}"),
+        ])
     # 一个都没有就显示「全部可用」那一行喵
     if not rows:
         # 用绿色表示一切正常喵
-        return [("class:ok", "✓ 所有节点可用，没有节点被冻结喵~")]
+        fragments.append(("class:ok", "\n✓ 所有节点可用，没有节点被冻结喵~"))
+        return fragments
     # 有冻结的话，先放警告标题喵
-    fragments: list[tuple[str, str]] = [
+    fragments.extend([
+        # 标题前换行，和上面的负载表隔开喵
+        ("", "\n"),
         # 黄色加粗的警告标题，把数量也写上喵
         ("class:warn", f"⚠ 下列模型达到了配额限制或异常自动避险!（{len(rows)} 个）"),
-    ]
+    ])
     # 为了让倒计时对齐，先算出「虚拟模型/节点」这一段最长有多宽喵
     labels = [f"{vm}/{model}" for vm, model, _ in rows]
     # 取最长的宽度，用于后面补空格对齐喵

@@ -48,6 +48,30 @@ class CandidateStats:
 
 
 @dataclass
+class RequestMetric:
+    """一条已成功请求在滚动 RPM/TPM 窗口内的记录喵~"""
+
+    # 成功被确认的单调时钟时刻，单位：秒喵
+    at: float
+    # 上游明确上报的 token 总数；None 表示上游没给 usage，绝不本地估算喵
+    usage_tokens: int | None = None
+
+
+@dataclass
+class VirtualModelRate:
+    """某个虚拟模型近 60 秒的 RPM/TPM 快照喵~"""
+
+    # 虚拟模型名喵
+    virtual_model: str
+    # 滚动窗口内的成功请求数，也就是 RPM 喵
+    rpm: int
+    # 有明确 usage 的请求数喵
+    usage_reported_requests: int
+    # 只累计上游明确给出的 token，总数未知时为 None 喵
+    tpm: int | None
+
+
+@dataclass
 class FreezeInfo:
     """一条冻结记录喵~"""
 
@@ -72,6 +96,10 @@ class RuntimeState:
         self._freezes: dict[str, FreezeInfo] = {}
         # 统计表：候选身份串 → 统计数据喵
         self._stats: dict[str, CandidateStats] = {}
+        # 虚拟模型动态负载：虚拟模型名 → 最近 60 秒的成功请求记录喵
+        self._rate_events: dict[str, list[RequestMetric]] = {}
+        # 代理动态 RPM/TPM 的滚动窗口，单位：秒喵
+        self.rate_window_seconds = 60.0
         # 代理累计处理的客户端请求数喵
         self.total_requests = 0
         # 代理累计彻底失败（整条候选链都用尽）的请求数喵
@@ -229,6 +257,94 @@ class RuntimeState:
         # 按剩余时间从短到长排序，快恢复的排前面喵
         rows.sort(key=lambda row: row[2])
         # 返回结果喵
+        return rows
+
+    # ---------- 动态 RPM / TPM 相关喵 ----------
+
+    def record_rate_event(self, virtual_model: str, usage_tokens: int | None = None) -> RequestMetric:
+        """
+        记录一条成功请求，供滚动 60 秒 RPM/TPM 使用喵~
+
+        token 只能传上游明确上报的 usage；没有就传 None。RPM 仍然照常加一，
+        TPM 则保持「未知覆盖」状态，绝不能用字符数或本地 tokenizer 猜一个数喵。
+        """
+        # 创建这条事件，时间用单调时钟避免系统时间调整影响滚动窗口喵
+        event = RequestMetric(at=time.monotonic(), usage_tokens=usage_tokens)
+        # 加锁写入该虚拟模型的事件列表喵
+        with self._lock:
+            # 取出列表，不存在就新建喵
+            events = self._rate_events.setdefault(virtual_model, [])
+            # 追加成功事件喵
+            events.append(event)
+            # 顺手清理过期记录，避免高流量时列表无限长喵
+            self._prune_rate_events_locked(time.monotonic())
+        # 把事件对象返回，流式在结束后可以补写 usage 喵
+        return event
+
+    def attach_usage_tokens(self, event: RequestMetric, usage_tokens: int | None) -> None:
+        """
+        给已经记进 RPM 的流式请求补上最终的上游 usage token 数喵~
+
+        流式 usage 常出现在尾包，放行时还不知道，必须等流真正结束后才补写。
+        usage 缺失时保持 None，不做任何本地估算喵。
+        """
+        # 没有上游 usage 时不动原记录喵
+        if usage_tokens is None:
+            return
+        # 加锁更新事件，保证 REPL 同时读窗口时不会看到半写状态喵
+        with self._lock:
+            # 写入上游明确给出的 token 总数喵
+            event.usage_tokens = usage_tokens
+
+    def _prune_rate_events_locked(self, now: float) -> None:
+        """在已持锁状态下删掉滚动窗口外的请求记录喵~"""
+        # 算出还应该保留到什么时刻之后的事件喵
+        cutoff = now - self.rate_window_seconds
+        # 逐个虚拟模型清理喵
+        for virtual_model, events in list(self._rate_events.items()):
+            # 保留边界之后的记录，保持原始时间顺序喵
+            kept = [event for event in events if event.at >= cutoff]
+            # 还有记录就替换回去喵
+            if kept:
+                self._rate_events[virtual_model] = kept
+            # 一条都没有就删掉这个 key，保持状态表干净喵
+            else:
+                del self._rate_events[virtual_model]
+
+    def snapshot_virtual_model_rates(self) -> list[VirtualModelRate]:
+        """
+        返回所有当前虚拟模型近 60 秒的 RPM/TPM 快照喵~
+
+        TPM 只在窗口内每一条成功请求都收到上游 usage 时才显示数值；只要有一条没有，
+        就返回 None，让横幅明确写「TPM 未完整上报」，避免总数看起来像是准确的喵。
+        """
+        # 加锁做清理和汇总喵
+        with self._lock:
+            # 取一次现在，整次快照统一用它做窗口边界喵
+            now = time.monotonic()
+            # 先清掉过期记录喵
+            self._prune_rate_events_locked(now)
+            # 按当前配置顺序遍历，这样横幅顺序稳定喵
+            rows: list[VirtualModelRate] = []
+            for virtual_model in self._config.virtual_models:
+                # 没有记录时用空列表喵
+                events = self._rate_events.get(virtual_model, [])
+                # 统计总请求数喵
+                rpm = len(events)
+                # 只收集上游明确上报 usage 的记录喵
+                known = [event.usage_tokens for event in events if event.usage_tokens is not None]
+                # 只有全窗口的请求都上报 usage 时，TPM 才可作为完整数字展示喵
+                tpm = sum(known) if rpm > 0 and len(known) == rpm else None
+                # 组装这一行快照喵
+                rows.append(
+                    VirtualModelRate(
+                        virtual_model=virtual_model,
+                        rpm=rpm,
+                        usage_reported_requests=len(known),
+                        tpm=tpm,
+                    )
+                )
+        # 返回拷贝出来的快照，REPL 在锁外慢慢渲染喵
         return rows
 
     # ---------- 统计相关喵 ----------

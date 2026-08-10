@@ -698,6 +698,60 @@ def test_非JSON的心跳行不会误判():
     assert probe.feed(b": keep-alive\n\ndata: ping\n\n") == VERDICT_PENDING
 
 
+def test_滚动RPM和TPM只统计上游明确usage():
+    """
+    RPM 统计每条成功请求，TPM 只能统计上游明确报的 usage，绝不本地猜喵~
+
+    缺 usage 的成功请求仍然是成功，所以 RPM 要包含它；但 TPM 不能因此加 0 或估算，
+    否则横幅看起来像精确数值、实际上少了一整条请求的消耗，误导主人喵。
+    """
+    # 造状态喵
+    state = make_state()
+    # 记一条上游明确报了 120 token 的成功请求喵
+    state.record_rate_event("auto-test", 120)
+    # 再记一条上游没报 usage 的成功请求喵
+    state.record_rate_event("auto-test", None)
+    # 取快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # 两条成功都要算进 RPM 喵
+    assert row.rpm == 2
+    # 只有一条明确上报 usage 喵
+    assert row.usage_reported_requests == 1
+    # TPM 必须保持未知，绝不显示 120 或本地估算值喵
+    assert row.tpm is None
+
+
+def test_滚动RPM和TPM在全量上报时求和():
+    """窗口内每一条都带上游 usage 时，TPM 才应显示精确加总值喵~"""
+    # 造状态喵
+    state = make_state()
+    # 记录两条完整 usage 喵
+    state.record_rate_event("auto-test", 120)
+    state.record_rate_event("auto-test", 80)
+    # 取快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # RPM 是两条成功请求喵
+    assert row.rpm == 2
+    # TPM 只来自上游给出的 120 + 80 喵
+    assert row.tpm == 200
+
+
+def test_超过60秒的负载事件会自动清理(monkeypatch):
+    """RPM/TPM 必须是滚动 60 秒窗口，窗口外的请求不该继续占统计喵~"""
+    # 造状态喵
+    state = make_state()
+    # 先记录一条事件喵
+    event = state.record_rate_event("auto-test", 50)
+    # 人为把它挪到窗口外，避免真实等一分钟让测试变慢喵
+    event.at -= 61
+    # 读取快照会顺手清掉过期事件喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # 窗口内应该已无请求喵
+    assert row.rpm == 0
+    # 没有请求时 TPM 也应保持未知喵
+    assert row.tpm is None
+
+
 # ============ 4. 运行时状态：冻结机制喵 ============
 
 
@@ -2003,7 +2057,39 @@ def test_冻结过期后横幅自动消失():
     assert "所有节点可用" in "".join(t for _, t in render_freeze_banner(state))
 
 
-# ============ 8. 交互式改配置喵 ============
+def test_横幅顶部显示每个虚拟模型的动态RPM和TPM():
+    """冻结状态上方应该显示当前每个虚拟模型的滚动负载喵~"""
+    # 导入横幅渲染函数喵
+    from autoapi.repl import render_freeze_banner
+    # 造状态喵
+    state = make_state()
+    # 记录一个有明确 usage 的成功请求喵
+    state.record_rate_event("auto-test", 321)
+    # 渲染横幅喵
+    text = "".join(fragment for _, fragment in render_freeze_banner(state))
+    # 应该包含虚拟模型名和 RPM/TPM 数值喵
+    assert "auto-test" in text
+    assert "RPM=1" in text
+    assert "TPM=321" in text
+
+
+def test_横幅TPM未上报时明确显示未知():
+    """上游没返回 usage 时，横幅不能把 TPM 显示成 0 喵~"""
+    # 导入横幅渲染函数喵
+    from autoapi.repl import render_freeze_banner
+    # 造状态喵
+    state = make_state()
+    # 记录一个没有 usage 的成功请求喵
+    state.record_rate_event("auto-test", None)
+    # 渲染横幅喵
+    text = "".join(fragment for _, fragment in render_freeze_banner(state))
+    # RPM 仍然准确，TPM 则明确表示未完整上报喵
+    assert "RPM=1" in text
+    assert "未完整上报" in text
+    assert "TPM=0" not in text
+
+
+
 
 
 def make_repl(tmp_path):

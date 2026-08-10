@@ -228,7 +228,24 @@ rules:
 
 一条既没写 `status` 也没写 `body_regex` 的规则会匹配一切，属于危险配置，加载阶段会直接被拒喵。
 
-## 交互式命令行
+## 日志与动态负载
+
+成功日志会按请求类型附带性能信息喵：
+
+```text
+INFO autoapi.proxy [d3c518] 成功 主力(...)（第 1 次尝试）喵 非流 总时长=842ms
+INFO autoapi.proxy [d3c518] 成功 主力(...)（第 1 次尝试）喵 流 首字=410ms 放行时长=760ms
+INFO autoapi.server 流式请求结束 虚拟模型=auto-strong 总时长=12840ms usage_tokens=1536 喵
+```
+
+- 非流式请求的总时长：从向上游发请求到完整响应体读完喵~
+- 流式请求的首字时长：从请求开始到上游首次返回任意字节喵~
+- 流式请求的放行时长：从请求开始到代理确认流健康并开始转发喵~
+- 流式请求的总时长：等上游流结束后记录，放行后不会再受 `stream_timeout` 截断喵~
+
+REPL 底部状态栏会按虚拟模型显示最近 **60 秒滚动窗口** 的动态 RPM 与 TPM 喵~ RPM 是窗口内成功请求数，TPM **只使用上游响应中的 usage token**，不会按字符数或本地 tokenizer 估算喵~ 如果上游没有返回 usage，RPM 仍会统计，但 TPM 会显示「未完整上报」，避免把不准确的数字当成真实消耗喵~
+
+常见 usage 字段包括 OpenAI 的 `usage.total_tokens`，或 `prompt_tokens + completion_tokens`，以及 Anthropic 的 `input_tokens + output_tokens` 喵~ 上游不返回这些字段时，代理不会擅自修改请求或猜测 token 数喵。
 
 代理跑起来之后，同一个终端里就是一个 REPL（提示符 `autoapi> `），可以随时看状态、改配置、清冻结，**改完立即生效，不用重启**喵。它跑在独立线程里，敲命令不会影响正在转发的请求喵。
 

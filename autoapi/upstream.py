@@ -113,6 +113,21 @@ class AttemptResult:
     # httpx 的 aiter_raw 会在第一次迭代时把 is_stream_consumed 置位，再调第二次会直接抛
     # StreamConsumed。所以探测和转发必须共用同一个迭代器，从上次停下的地方接着读喵。
     iterator: AsyncIterator[bytes] | None = None
+    # 这次成功从上游明确得到的 token 总数。None 表示上游没有报 usage，
+    # 必须保持未知，绝不能按字符数或本地 tokenizer 瞎估喵。
+    usage_tokens: int | None = None
+    # 这次尝试开始向上游发请求的单调时钟时刻，单位：秒喵
+    started_at: float | None = None
+    # 流式时首次收到上游任意字节的单调时钟时刻，None 表示放行前还没收到字节喵
+    first_byte_at: float | None = None
+    # 流式时确认健康、把流交给客户端的单调时钟时刻喵
+    released_at: float | None = None
+    # 流式转发阶段继续观察 SSE usage 的对象喵
+    usage_observer: StreamUsageObserver | None = None
+    # 统计所属的虚拟模型名，流结束时由 server 用于补写 TPM 喵
+    virtual_model: str | None = None
+    # RPM 事件对象，流结束时补写最终 usage 喵
+    rate_event: Any | None = None
 
     @property
     def media_type(self) -> str:
@@ -126,21 +141,98 @@ class AttemptResult:
         return "application/json"
 
 
+def _extract_usage_tokens(payload: Any) -> int | None:
+    """
+    只从上游响应明确提供的 usage 字段提取 token 总数喵~
+
+    支持 OpenAI 的 total_tokens / prompt_tokens + completion_tokens，以及 Anthropic 的
+    input_tokens + output_tokens。没有 usage、字段不是合法非负整数时一律返回 None；
+    绝不按字符数、字节数或本地 tokenizer 估算，因为那样的 TPM 是假的喵。
+    """
+    # 喵~防御：顶层不是字典就不可能有标准 usage，保守返回未知喵
+    if not isinstance(payload, dict):
+        return None
+    # 取 usage 子对象喵
+    usage = payload.get("usage")
+    # 喵~防御：usage 缺失或不是字典，说明上游没有上报喵
+    if not isinstance(usage, dict):
+        return None
+    # 先尝试优先级最高的 total_tokens 喵
+    total = usage.get("total_tokens")
+    # bool 是 int 子类，必须挡掉避免 True 被统计成 1 token 喵
+    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+        return total
+    # OpenAI 没有 total 时，仅在同一份 usage 中把输入和输出 token 相加喵
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (prompt, completion)):
+        return prompt + completion
+    # Anthropic 的 usage 用 input_tokens / output_tokens 命名喵
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (input_tokens, output_tokens)):
+        return input_tokens + output_tokens
+    # 字段不完整时保持未知，不能擅自把其中一项当总数喵
+    return None
+
+
+def extract_usage_from_body(body: bytes) -> int | None:
+    """从非流式完整 JSON 响应体里取上游明确上报的 token 数喵~"""
+    # 尝试解析 JSON 喵
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    # 喵~防御：非 JSON 接口没有标准 usage，保持未知喵
+    except (json.JSONDecodeError, ValueError):
+        return None
+    # 交给统一提取器喵
+    return _extract_usage_tokens(payload)
+
+
+class StreamUsageObserver:
+    """增量观察 SSE 的 data JSON 行，从上游尾包提取 usage，绝不改动原始字节喵~"""
+
+    def __init__(self) -> None:
+        # 增量解码器处理跨 chunk 的 UTF-8 字符喵
+        import codecs
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # 没拼成完整行的尾巴喵
+        self._pending_line = ""
+        # 最新一次从上游明确解析到的 token 总数喵
+        self.tokens: int | None = None
+
+    def feed(self, chunk: bytes) -> None:
+        """观察一段原始 SSE 字节，能解析 usage 就更新 tokens 喵~"""
+        # 空块没有可观察内容喵
+        if not chunk:
+            return
+        # 增量解码并拼上残行喵
+        text = self._pending_line + self._decoder.decode(chunk)
+        # 统一换行后拆成行喵
+        lines = text.replace("\r\n", "\n").split("\n")
+        # 最后一行可能不完整，留给下个 chunk 喵
+        self._pending_line = lines.pop()
+        # 逐行找 SSE data 负载喵
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("data:"):
+                continue
+            payload_text = stripped[5:].strip()
+            if not payload_text or payload_text == "[DONE]":
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            tokens = _extract_usage_tokens(payload)
+            if tokens is not None:
+                self.tokens = tokens
+
+
 def build_timeout(timeouts: EffectiveTimeouts, is_stream: bool) -> httpx.Timeout:
     """
     按这次请求实际生效的超时值现算一份 httpx 超时设置喵~
 
-    为什么每条请求都现算而不是复用客户端上的默认值：
-        httpx 客户端是在 lifespan 里建的、全程复用，它身上的 timeout 是启动那一刻定死的。
-        如果只依赖那个值，主人在运行中把超时调大，客户端仍然按旧的小值掐断，
-        改动看起来「没生效」，而且很难看出为什么。所以这里每条请求都现算一份传给 httpx，
-        让超时配置（以及节点上的专属覆盖）都能立即生效喵。
-
-    流式和非流式的 read 超时含义完全不同，所以要分开设：
-        流式   read 超时 = 允许上游静默多久。SSE 是「一点点吐」，两个 chunk 之间的间隔
-               才是有意义的度量；用总预算当 read 超时的话，卡死的流要等满整个预算才被发现喵。
-        非流式 read 超时 = 总预算。非流式是「上游憋完整篇再一次性返回」，中间本来就没有
-               任何字节可收，用静默时长去掐它会把慢模型全部冤枉掉喵。
+    流式 read 超时衡量静默时长；非流式 read 超时衡量完整响应总预算喵。
     """
     # 流式看静默、非流式看总预算，选出这次该用的 read 超时喵
     read_timeout = timeouts.stall if is_stream else timeouts.nonstream
@@ -247,6 +339,8 @@ async def _probe_until_content(
     buffered: bytearray,
     stall_timeout: float,
     stream_timeout: float,
+    usage_observer: StreamUsageObserver | None = None,
+    stream_timing: dict[str, float | None] | None = None,
 ) -> tuple[str, str]:
     """
     从上游流里持续读取，直到探测出明确结论、判定它静默太久、或者用光总预算喵~
@@ -365,6 +459,12 @@ async def _probe_until_content(
         # 喵~防御：空字节块不算「有动静」，不重置静默计时器。
         # 否则一个疯狂吐空块的上游能让静默计时器永远不触发，白白耗掉整个总预算喵
         if chunk:
+            # 第一次收到任意真实字节时记录首字节时刻喵
+            if stream_timing is not None and stream_timing.get("first_byte_at") is None:
+                stream_timing["first_byte_at"] = time.monotonic()
+            # 收到真实字节时让 usage 观察器同步看一眼喵
+            if usage_observer is not None:
+                usage_observer.feed(chunk)
             # 收到了真字节，静默计时器归零重新数喵
             last_byte_at = time.monotonic()
             # 累加收到的字节数喵
@@ -471,6 +571,10 @@ async def _attempt_stream(
     buffered = bytearray()
     # 拿到字节迭代器，整个请求全程只创建这一个，探测和转发共用它喵
     iterator = response.aiter_bytes()
+    # 观察后续 SSE 尾包里的上游 usage，完全不改动要回传的原始字节喵
+    usage_observer = StreamUsageObserver()
+    # 记录探测阶段的性能时刻，字典方便在探测函数内部更新喵
+    stream_timing: dict[str, float | None] = {"first_byte_at": None}
     # 算出探测阶段还剩多少总预算：总预算减掉建连和等响应头已经花掉的时间喵
     probe_budget = timeouts.stream - (time.monotonic() - request_started_at)
     # 喵~防御：建连和等响应头就把预算耗光了（比如上游 4 分钟才给响应头，预算只有 5 分钟），
@@ -499,6 +603,10 @@ async def _attempt_stream(
             timeouts.stall,
             # 探测阶段还剩的总预算喵
             probe_budget,
+            # 观察探测阶段已经读到的 usage 尾包喵
+            usage_observer,
+            # 回填首字节时刻的容器喵
+            stream_timing,
         )
     # 喵~防御：读流时超时（httpx 自己的 read 超时先响了），归为卡流。
     # 因为 read 超时的语义正好就是「两次读取之间隔太久」，和我们的静默判定是一回事喵
@@ -534,6 +642,16 @@ async def _attempt_stream(
             buffered=bytes(buffered),
             # 把探测用的迭代器一起带出去，转发阶段从它停下的地方接着读喵
             iterator=iterator,
+            # 探测阶段观察到的 usage，常见情况为 None 表示上游没有上报喵
+            usage_tokens=usage_observer.tokens,
+            # 流式转发继续复用同一个 usage 观察器喵
+            usage_observer=usage_observer,
+            # 这次请求的开始时刻喵
+            started_at=request_started_at,
+            # 首次收到任意字节的时刻喵
+            first_byte_at=stream_timing.get("first_byte_at"),
+            # 确认健康并准备放行的时刻喵
+            released_at=time.monotonic(),
             # 上游的响应头，过滤掉逐跳头后回传给客户端喵
             headers=_filter_response_headers(response),
         )
@@ -616,6 +734,7 @@ async def _attempt_nonstream(
         必须一直等。一个长回答加上思考时间，十几分钟都可能，所以默认给 600 秒喵。
     """
     # 发请求并一次性读完整个响应喵
+    request_started_at = time.monotonic()
     try:
         response = await asyncio.wait_for(
             # 普通的非流式请求，超时同样按这次生效的值现算后显式传进去喵
@@ -683,6 +802,10 @@ async def _attempt_nonstream(
         status=200,
         # 完整响应体字节，proxy 会原样回传给客户端喵
         body=raw,
+        # 成功响应里上游明确提供的 usage token 喵
+        usage_tokens=extract_usage_from_body(raw),
+        # 非流式请求从发出到完整读完的计时起点喵
+        started_at=request_started_at,
         # 过滤后的响应头喵
         headers=_filter_response_headers(response),
     )
@@ -746,12 +869,13 @@ async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:
     """
     把一次流式成功的结果变成给客户端用的字节流喵~
 
+    这里继续逐字节透传，不改写 SSE；同时观察尾部 usage，调用方可在生成器结束后读取
+    result.usage_tokens 得到上游明确上报的总 token 数喵。
+
     顺序很重要：先把探测阶段已经读掉的前缀字节吐出去，再接着读上游剩下的字节，
     这样客户端收到的字节序列和上游原始输出完全一致，一个字节都不差喵。
 
-    关键点：这里复用的是探测阶段那个迭代器（result.iterator），而不是重新调一次
-           response.aiter_bytes()。httpx 的流只能迭代一次，重新调会抛 StreamConsumed；
-           而复用同一个迭代器就能从探测停下的位置无缝接着读，既不重复也不丢字节喵。
+    关键点：这里复用的是探测阶段那个字节迭代器，避免 httpx StreamConsumed 喵。
 
     边界条件：无论正常读完还是中途出异常，finally 里都会关掉上游响应，
             防止连接泄漏把连接池占满喵。
@@ -763,9 +887,17 @@ async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:
     try:
         # 先吐探测阶段缓冲的前缀字节喵
         if result.buffered:
+            if result.usage_observer is not None:
+                result.usage_observer.feed(result.buffered)
             yield result.buffered
         # 再从同一个迭代器接着读，把上游剩下的字节一块块转发出去喵
         async for chunk in result.iterator:
+            # 观察原始 SSE 里的 usage，但绝不改写 chunk 喵
+            if result.usage_observer is not None:
+                result.usage_observer.feed(chunk)
+            # 让最新 usage 对外可见喵
+            if result.usage_observer is not None:
+                result.usage_tokens = result.usage_observer.tokens
             yield chunk
     # 喵~防御：上游中途断连时不再抛给客户端（此时响应头已经发出去了，抛异常也没用），
     # 直接结束这条流，客户端的 SDK 会按「流意外结束」处理喵

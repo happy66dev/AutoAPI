@@ -25,6 +25,8 @@ from __future__ import annotations
 import asyncio
 # logging 用来输出服务层日志喵
 import logging
+# time 用来记录流式请求完整生命周期的总时长喵
+import time
 # contextlib 的 asynccontextmanager 用来写 FastAPI 的 lifespan 喵
 from contextlib import asynccontextmanager
 # pathlib 用于热重载时检查配置文件的修改时间喵
@@ -307,6 +309,26 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
         if outcome.is_stream:
             # 复制一份上游响应头，再补上几个流式必需的头喵
             stream_headers = dict(attempt.headers)
+            # 把流式总时长、尾包 usage 与 TPM 补写收拢到生成器结束后的 finally 喵
+            async def observed_stream():
+                # 记录流式上游请求开始时刻喵
+                stream_started_at = attempt.started_at or time.monotonic()
+                try:
+                    # 逐块透传并观察尾包 usage 喵
+                    async for chunk in iter_upstream_bytes(attempt):
+                        yield chunk
+                finally:
+                    # 流结束或客户端断开时记录总时长，避免把放行时长误叫完整总时长喵
+                    total_ms = (time.monotonic() - stream_started_at) * 1000
+                    logger.info(
+                        "流式请求结束 虚拟模型=%s 总时长=%.0fms usage_tokens=%s 喵",
+                        attempt.virtual_model or "未知",
+                        total_ms,
+                        attempt.usage_tokens if attempt.usage_tokens is not None else "未上报",
+                    )
+                    # 尾包 usage 只能在这里拿到，补写之前已计入 RPM 的事件喵
+                    if attempt.rate_event is not None:
+                        state.attach_usage_tokens(attempt.rate_event, attempt.usage_tokens)
             # 禁止缓存，否则中间层可能把 SSE 缓存起来导致客户端收不到增量喵
             stream_headers["Cache-Control"] = "no-cache"
             # 关掉 nginx 一类反向代理的缓冲，不加这个头会导致流被攒成一大坨才下发喵
@@ -317,7 +339,7 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
             # 返回流式响应，字节来源是「已缓冲前缀 + 上游后续字节」喵
             return StreamingResponse(
                 # 字节生成器喵
-                iter_upstream_bytes(attempt),
+                observed_stream(),
                 # 状态码固定 200，因为只有 200 才会走到这里喵
                 status_code=200,
                 # 过滤后的上游响应头喵
