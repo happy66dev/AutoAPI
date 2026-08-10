@@ -698,6 +698,12 @@ def test_非JSON的心跳行不会误判():
     assert probe.feed(b": keep-alive\n\ndata: ping\n\n") == VERDICT_PENDING
 
 
+def make_state() -> RuntimeState:
+    """造一个装好测试配置的运行时状态喵~"""
+    # 用测试配置创建状态对象喵
+    return RuntimeState(parse_config(make_config_dict()))
+
+
 def test_滚动RPM和TPM只统计上游明确usage():
     """
     RPM 统计每条成功请求，TPM 只能统计上游明确报的 usage，绝不本地猜喵~
@@ -810,10 +816,22 @@ def test_流式请求结束后才增加RPM():
     assert state.snapshot_virtual_model_rates()[0].rpm == 1
 
 
-def make_state() -> RuntimeState:
-    """造一个装好测试配置的运行时状态喵~"""
-    # 用测试配置创建状态对象喵
-    return RuntimeState(parse_config(make_config_dict()))
+def test_流结束后上报事件携带最终usage与耗时():
+    """流完整结束后统一上报的事件应同时带最终 usage 和完整耗时喵~"""
+    # 造状态喵
+    state = make_state()
+    # 模拟上游流结束后才创建的统计事件喵
+    event = state.record_rate_event("auto-test", 88)
+    # 模拟完整流的结束耗时喵
+    state.attach_elapsed_ms(event, 456.0)
+    # 取快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # 流结束后才会看见一条 RPM 喵
+    assert row.rpm == 1
+    # TPM 来自最终上游 usage 喵
+    assert row.tpm == 88
+    # 平均耗时来自完整流结束时刻喵
+    assert row.average_elapsed_ms == 456.0
 
 
 def test_冻结与解冻():

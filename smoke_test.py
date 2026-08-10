@@ -164,6 +164,8 @@ server:
   # 流式和非流式的总预算也压小，免得万一哪个检查卡住会等很久喵
   stream_timeout: 30
   nonstream_timeout: 30
+  # 动态 RPM/TPM/平均耗时的统计窗口，单位：分钟。冒烟测试里显式写出，验证模板字段可用喵
+  metrics_window_minutes: 30
   min_content_chars: 10
   connect_timeout: 5
   reload_poll_interval: 0
@@ -346,8 +348,19 @@ async def run_smoke() -> bool:
                 )
             )
 
-            # ---- 检查 4：坏上游被冻结了喵 ----
-            print("\n检查 4：坏上游按上游说的 6 分钟被冻结喵")
+            # ---- 检查 4：动态统计窗口配置已生效喵 ----
+            print("\n检查 4：动态 RPM/TPM 统计窗口配置喵")
+            # 临时配置明确写的是 30 分钟，加载后必须是同一个值喵
+            results.append(
+                check(
+                    "metrics_window_minutes 已加载为 30 分钟",
+                    state.config.server.metrics_window_minutes == 30.0,
+                    f"实际 {state.config.server.metrics_window_minutes}",
+                )
+            )
+
+            # ---- 检查 5：坏上游被冻结了喵 ----
+            print("\n检查 5：坏上游按上游说的 6 分钟被冻结喵")
             # 取出链首那个坏候选喵
             bad_candidate = state.config.virtual_models["auto-smoke"][0]
             # 查它的剩余冻结时间喵
