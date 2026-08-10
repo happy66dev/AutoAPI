@@ -82,6 +82,7 @@ HELP_TEXT = """
                               min_content_chars      放行前要累积的内容字符数
                               auto_hedge_threshold   连续失败几次就自动避险，0=关闭
                               auto_hedge_minutes     自动避险冻结多少分钟
+                              metrics_window_minutes 动态 RPM/TPM/平均耗时窗口（分钟），默认 30
                               connect_timeout        连接握手超时（秒）
                               reload_poll_interval   配置热重载轮询间隔（秒），0=关闭
                               port                   监听端口
@@ -175,12 +176,21 @@ def render_freeze_banner(state: RuntimeState) -> list[tuple[str, str]]:
     for rate in rate_rows:
         # TPM 未完整上报时明确显示未知，不把未知伪装成 0 喵
         tpm_text = f"{rate.tpm}" if rate.tpm is not None else "未完整上报"
-        # 每个虚拟模型一行，动态值会随 60 秒滚动窗口刷新喵
+        # 平均耗时只看已完整结束的请求，没有完成请求时显示未知喵
+        average_text = (
+            f"{rate.average_elapsed_ms:.0f}ms"
+            if rate.average_elapsed_ms is not None
+            else "未完成"
+        )
+        # RPM=0 的模型不显示，节约状态栏空间喵
+        if rate.rpm <= 0:
+            continue
+        # 每个有流量的虚拟模型一行，动态值会随配置窗口刷新喵
         if fragments:
             fragments.append(("", "\n"))
         fragments.extend([
             ("class:node", f"{rate.virtual_model}"),
-            ("", f"  RPM={rate.rpm}  TPM={tpm_text}"),
+            ("", f"  RPM={rate.rpm}  TPM={tpm_text}  平均耗时={average_text}"),
         ])
     # 一个都没有就显示「全部可用」那一行喵
     if not rows:
@@ -803,6 +813,8 @@ class Repl:
             "auto_hedge_threshold": int,
             # 自动避险的冻结时长，单位：分钟喵
             "auto_hedge_minutes": float,
+            # 动态 RPM/TPM/平均耗时的滚动窗口，单位：分钟喵
+            "metrics_window_minutes": float,
             # 监听端口喵
             "port": int,
         }
@@ -1250,7 +1262,7 @@ class Repl:
             # 全局 server 配置字段喵
             "set", "set stall_timeout", "set stream_timeout",
             "set nonstream_timeout", "set connect_timeout", "set min_content_chars",
-            "set auto_hedge_threshold", "set auto_hedge_minutes",
+            "set auto_hedge_threshold", "set auto_hedge_minutes", "set metrics_window_minutes",
             "set reload_poll_interval", "set port",
             # cand set 可修改的节点字段喵
             "cand set base_url", "cand set api_key", "cand set model", "cand set name",

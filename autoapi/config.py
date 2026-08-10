@@ -246,6 +246,8 @@ class ServerConfig:
     auto_hedge_threshold: int = 5
     # 自动避险触发后冻结多少分钟喵
     auto_hedge_minutes: float = 10.0
+    # 动态 RPM/TPM/平均耗时的滚动统计窗口，单位：分钟，默认近 30 分钟喵
+    metrics_window_minutes: float = 30.0
     # 配置文件热重载的轮询间隔秒数，0 表示关闭喵
     reload_poll_interval: float = 2.0
 
@@ -547,6 +549,8 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
         auto_hedge_threshold=max(0, int(server_raw.get("auto_hedge_threshold", 5))),
         # 自动避险的冻结时长，至少 0.1 分钟（6 秒），防止配成 0 导致冻结形同虚设喵
         auto_hedge_minutes=max(0.1, float(server_raw.get("auto_hedge_minutes", 10.0))),
+        # 动态性能统计窗口，至少 0.1 分钟，防止配成 0 导致每次读状态都全清空喵
+        metrics_window_minutes=max(0.1, float(server_raw.get("metrics_window_minutes", 30.0))),
         # 热重载轮询间隔，允许为 0 表示彻底关闭该功能喵
         reload_poll_interval=max(0.0, float(server_raw.get("reload_poll_interval", 2.0))),
     )

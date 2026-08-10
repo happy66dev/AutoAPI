@@ -55,6 +55,8 @@ class RequestMetric:
     at: float
     # 上游明确上报的 token 总数；None 表示上游没给 usage，绝不本地估算喵
     usage_tokens: int | None = None
+    # 完整请求实际结束后的耗时，单位：毫秒；None 表示流尚未结束，不能计入平均值喵
+    elapsed_ms: float | None = None
 
 
 @dataclass
@@ -69,6 +71,10 @@ class VirtualModelRate:
     usage_reported_requests: int
     # 只累计上游明确给出的 token，总数未知时为 None 喵
     tpm: int | None
+    # 窗口内已完整结束的请求数量，用于平均耗时分母喵
+    completed_requests: int
+    # 窗口内已完成请求的平均完整耗时，单位：毫秒；没有完成请求时为 None 喵
+    average_elapsed_ms: float | None
 
 
 @dataclass
@@ -96,10 +102,8 @@ class RuntimeState:
         self._freezes: dict[str, FreezeInfo] = {}
         # 统计表：候选身份串 → 统计数据喵
         self._stats: dict[str, CandidateStats] = {}
-        # 虚拟模型动态负载：虚拟模型名 → 最近 60 秒的成功请求记录喵
+        # 虚拟模型动态负载：虚拟模型名 → 当前统计窗口内的成功请求记录喵
         self._rate_events: dict[str, list[RequestMetric]] = {}
-        # 代理动态 RPM/TPM 的滚动窗口，单位：秒喵
-        self.rate_window_seconds = 60.0
         # 代理累计处理的客户端请求数喵
         self.total_requests = 0
         # 代理累计彻底失败（整条候选链都用尽）的请求数喵
@@ -296,10 +300,20 @@ class RuntimeState:
             # 写入上游明确给出的 token 总数喵
             event.usage_tokens = usage_tokens
 
+    def attach_elapsed_ms(self, event: RequestMetric, elapsed_ms: float) -> None:
+        """给成功事件补上完整请求结束后的耗时，供窗口平均值使用喵~"""
+        # 喵~防御：非正耗时说明调用方的计时出了问题，直接忽略避免污染平均值喵
+        if elapsed_ms < 0:
+            return
+        # 加锁写入，避免 REPL 同时读横幅时看到撕裂状态喵
+        with self._lock:
+            # 记录完整生命周期耗时喵
+            event.elapsed_ms = elapsed_ms
+
     def _prune_rate_events_locked(self, now: float) -> None:
         """在已持锁状态下删掉滚动窗口外的请求记录喵~"""
-        # 算出还应该保留到什么时刻之后的事件喵
-        cutoff = now - self.rate_window_seconds
+        # 算出当前配置对应的滚动窗口边界，单位：秒喵
+        cutoff = now - (self._config.server.metrics_window_minutes * 60.0)
         # 逐个虚拟模型清理喵
         for virtual_model, events in list(self._rate_events.items()):
             # 保留边界之后的记录，保持原始时间顺序喵
@@ -335,6 +349,10 @@ class RuntimeState:
                 known = [event.usage_tokens for event in events if event.usage_tokens is not None]
                 # 只有全窗口的请求都上报 usage 时，TPM 才可作为完整数字展示喵
                 tpm = sum(known) if rpm > 0 and len(known) == rpm else None
+                # 只让已经完整结束的请求参与平均耗时喵
+                completed = [event.elapsed_ms for event in events if event.elapsed_ms is not None]
+                # 结束请求越多，平均值越稳定；没有完成请求时保持未知喵
+                average_elapsed_ms = sum(completed) / len(completed) if completed else None
                 # 组装这一行快照喵
                 rows.append(
                     VirtualModelRate(
@@ -342,6 +360,8 @@ class RuntimeState:
                         rpm=rpm,
                         usage_reported_requests=len(known),
                         tpm=tpm,
+                        completed_requests=len(completed),
+                        average_elapsed_ms=average_elapsed_ms,
                     )
                 )
         # 返回拷贝出来的快照，REPL 在锁外慢慢渲染喵

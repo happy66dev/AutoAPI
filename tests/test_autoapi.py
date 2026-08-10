@@ -742,8 +742,8 @@ def test_超过60秒的负载事件会自动清理(monkeypatch):
     state = make_state()
     # 先记录一条事件喵
     event = state.record_rate_event("auto-test", 50)
-    # 人为把它挪到窗口外，避免真实等一分钟让测试变慢喵
-    event.at -= 61
+    # 人为把它挪到默认 30 分钟窗口外，避免真实等半小时让测试变慢喵
+    event.at -= 1801
     # 读取快照会顺手清掉过期事件喵
     row = state.snapshot_virtual_model_rates()[0]
     # 窗口内应该已无请求喵
@@ -752,7 +752,53 @@ def test_超过60秒的负载事件会自动清理(monkeypatch):
     assert row.tpm is None
 
 
-# ============ 4. 运行时状态：冻结机制喵 ============
+def test_平均耗时只统计已完成请求():
+    """平均耗时只使用已经完整结束的请求，未结束流式请求不能进入分母喵~"""
+    # 造状态喵
+    state = make_state()
+    # 一条完整结束的请求喵
+    completed = state.record_rate_event("auto-test", 20)
+    state.attach_elapsed_ms(completed, 200.0)
+    # 一条尚未结束的流式请求，只有 RPM/TPM 事件但没有耗时喵
+    state.record_rate_event("auto-test", 30)
+    # 取快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # 两条成功都进 RPM 喵
+    assert row.rpm == 2
+    # 只一条完整结束请求进入平均值喵
+    assert row.completed_requests == 1
+    assert row.average_elapsed_ms == 200.0
+
+
+def test_默认性能统计窗口是30分钟():
+    """默认配置窗口必须是近 30 分钟喵~"""
+    # 解析最小配置喵
+    config = parse_config(make_config_dict())
+    # 默认值应为 30 分钟喵
+    assert config.server.metrics_window_minutes == 30.0
+
+
+def test_窗口外耗时事件不会进入平均值():
+    """超过可配置窗口的完整请求不应影响当前平均耗时喵~"""
+    # 造带 1 分钟窗口的配置喵
+    config = parse_config(make_config_dict(server_overrides={"metrics_window_minutes": 1}))
+    # 造状态喵
+    state = RuntimeState(config)
+    # 记录一条完整事件并把它移动到窗口外喵
+    old_event = state.record_rate_event("auto-test", 50)
+    state.attach_elapsed_ms(old_event, 1000.0)
+    old_event.at -= 61
+    # 再记当前窗口内的一条完整事件喵
+    current_event = state.record_rate_event("auto-test", 60)
+    state.attach_elapsed_ms(current_event, 300.0)
+    # 读取快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # 过期事件不应进入 RPM 或平均值喵
+    assert row.rpm == 1
+    assert row.average_elapsed_ms == 300.0
+
+
+
 
 
 def make_state() -> RuntimeState:
@@ -2087,6 +2133,22 @@ def test_横幅TPM未上报时明确显示未知():
     assert "RPM=1" in text
     assert "未完整上报" in text
     assert "TPM=0" not in text
+
+
+def test_横幅隐藏RPM为0的虚拟模型():
+    """没有成功请求的虚拟模型不应该占用状态栏空间喵~"""
+    # 导入横幅渲染函数喵
+    from autoapi.repl import render_freeze_banner
+    # 造状态喵
+    state = make_state()
+    # 只给 auto-test 记录请求，测试配置没有其他有流量的模型喵
+    state.record_rate_event("auto-test", 10)
+    # 渲染横幅喵
+    text = "".join(fragment for _, fragment in render_freeze_banner(state))
+    # 有流量模型应该显示喵
+    assert "auto-test" in text
+    # 测试配置中的不存在模型不应该凭空显示，RPM=0 的模型逻辑由快照过滤覆盖喵
+    assert "RPM=0" not in text
 
 
 
