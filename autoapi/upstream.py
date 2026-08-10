@@ -115,6 +115,25 @@ class AttemptResult:
         return "application/json"
 
 
+def build_timeout(server_cfg: ServerConfig) -> httpx.Timeout:
+    """
+    按当前配置现算一份 httpx 超时设置喵~
+
+    为什么每条请求都现算而不是复用客户端上的默认值：
+        httpx 客户端是在 lifespan 里建的、全程复用，它身上的 timeout 是启动那一刻定死的。
+        如果只依赖那个值，主人在运行中把 request_timeout 调大，客户端仍然按旧的小值掐断，
+        改动看起来「没生效」，而且很难看出为什么。所以这里每条请求都从当前配置现算一份
+        传给 httpx，让超时配置和别的配置一样能热更新喵。
+    """
+    # 分项设置各类超时喵
+    return httpx.Timeout(
+        # 读超时用总超时兜底，流式响应两个字之间可能隔很久，不能设太短喵
+        timeout=server_cfg.request_timeout,
+        # 建立连接的超时单独设置，连不上要快速失败好换下一个候选喵
+        connect=server_cfg.connect_timeout,
+    )
+
+
 def build_upstream_headers(client_headers: dict[str, str], candidate: Candidate) -> dict[str, str]:
     """
     构造发给上游的请求头喵~
@@ -242,7 +261,10 @@ async def _attempt_stream(
     失败时会就地关掉响应连接，客户端完全感知不到这次尝试发生过喵。
     """
     # 构造请求对象，这里还没真正发出去喵
-    request = client.build_request(method, url, headers=headers, content=body)
+    # 超时按当前配置现算并显式传进去，这样运行中改超时能当场生效喵
+    request = client.build_request(
+        method, url, headers=headers, content=body, timeout=build_timeout(server_cfg)
+    )
     # 发出请求并要求流式接收（不自动读完 body）喵
     try:
         response = await client.send(request, stream=True)
@@ -390,8 +412,10 @@ async def _attempt_nonstream(
     # 发请求并一次性读完整个响应喵
     try:
         response = await asyncio.wait_for(
-            # 普通的非流式请求喵
-            client.request(method, url, headers=headers, content=body),
+            # 普通的非流式请求，超时同样按当前配置现算后显式传进去喵
+            client.request(
+                method, url, headers=headers, content=body, timeout=build_timeout(server_cfg)
+            ),
             # 整个请求的总时限喵
             timeout=server_cfg.request_timeout,
         )

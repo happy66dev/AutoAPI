@@ -986,6 +986,28 @@ async def test_非流式的200里带error也算假成功():
     assert hits == ["primary.test", "backup.test"]
 
 
+def test_超时按当前配置现算():
+    """
+    超时必须每条请求现算，否则运行中改超时会被启动时的旧值压住喵~
+
+    这个用例守的是一个很容易悄悄坏掉的行为：httpx 客户端是全程复用的，它身上的 timeout
+    在启动时就定死了，所以超时必须显式按当前配置传给每条请求喵。
+    """
+    # 引入现算超时的函数喵
+    from autoapi.upstream import build_timeout
+    # 取一份配置喵
+    config = parse_config(make_config_dict())
+    # 现算一份超时喵
+    timeout = build_timeout(config.server)
+    # 连接超时应该来自配置里的 connect_timeout 喵
+    assert timeout.connect == config.server.connect_timeout
+    # 读超时应该来自配置里的 request_timeout 喵
+    assert timeout.read == config.server.request_timeout
+    # 改掉配置里的超时之后，现算出来的应该跟着变喵
+    config.server.request_timeout = 777.0
+    assert build_timeout(config.server).read == 777.0
+
+
 # ============ 7. 交互式改配置喵 ============
 
 

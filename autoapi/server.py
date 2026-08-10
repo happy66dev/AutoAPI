@@ -49,13 +49,24 @@ from .upstream import iter_upstream_bytes
 logger = logging.getLogger("autoapi.server")
 
 
-async def _config_reload_loop(state: RuntimeState, path: Path, interval: float) -> None:
+# 热重载被关掉（reload_poll_interval 设为 0）时，每隔这么多秒回头看一眼这个开关有没有
+# 被重新打开，单位：秒。这样主人在 REPL 里敲 set reload_poll_interval 2 就能当场启用，
+# 不用重启代理喵
+DISABLED_RECHECK_SECONDS = 5.0
+
+
+async def _config_reload_loop(state: RuntimeState, path: Path) -> None:
     """
     配置文件热重载的后台任务喵~
 
-    思路：每隔 interval 秒看一眼配置文件的修改时间，变了就重新加载并整体替换掉内存里的
-         配置。用轮询 mtime 而不是引入 watchdog 依赖，是因为这个需求太简单了，多一个
-         C 扩展依赖不值得，而且轮询在 Windows 上行为更可预测喵。
+    思路：每隔一段时间看一眼配置文件的修改时间，变了就重新加载并整体替换掉内存里的配置。
+         用轮询 mtime 而不是引入 watchdog 依赖，是因为这个需求太简单了，多一个 C 扩展
+         依赖不值得，而且轮询在 Windows 上行为更可预测喵。
+
+    关键点：轮询间隔是每一轮都从 state 现读的，不是启动时定死的参数。这样主人改了
+           reload_poll_interval（无论是手改文件还是在 REPL 里 set）都会当场生效；
+           而且设成 0 关掉热重载之后，这个任务并不退出，只是转成每 5 秒瞄一眼开关，
+           所以之后还能再打开，不需要重启代理喵。
 
     边界条件：新配置有语法错或校验不通过时，保留旧配置继续服务、只打一条错误日志。
             绝不能因为编辑器保存了一个写坏的配置就让整个代理停摆喵。
@@ -70,8 +81,24 @@ async def _config_reload_loop(state: RuntimeState, path: Path, interval: float) 
         pass
     # 无限循环，直到任务被取消（进程退出时 lifespan 会取消它）喵
     while True:
-        # 先睡够间隔时间，睡眠期间不占任何 CPU喵
-        await asyncio.sleep(interval)
+        # 每一轮都现读间隔配置，所以改了这个值当场就生效喵
+        interval = state.config.server.reload_poll_interval
+        # 间隔为 0 表示主人关掉了热重载喵
+        if interval <= 0:
+            # 睡一会儿再回来看这个开关有没有被重新打开，期间不碰配置文件喵
+            await asyncio.sleep(DISABLED_RECHECK_SECONDS)
+            # 关掉期间文件可能被改过，把基准时间同步成当前值，
+            # 这样重新打开后不会立刻触发一次「补重载」，语义更符合直觉喵
+            try:
+                last_mtime = path.stat().st_mtime
+            # 喵~防御：取不到就保持原值，无害喵
+            except OSError:
+                pass
+            # 回到循环顶部继续等喵
+            continue
+        # 先睡够间隔时间，睡眠期间不占任何 CPU 喵
+        # 喵~防御：间隔压一个 0.5 秒的下限，防止被配成 0.001 导致每秒疯狂 stat 磁盘喵
+        await asyncio.sleep(max(0.5, interval))
         # 取当前修改时间喵
         try:
             mtime = path.stat().st_mtime
@@ -111,9 +138,11 @@ def create_app(state: RuntimeState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """管理 httpx 客户端和热重载任务的生命周期喵~"""
-        # 取当前配置，用来读超时和热重载间隔喵
+        # 取当前配置，用来读连接池设置和热重载开关喵
         config = state.config
-        # 配置 httpx 的分项超时喵
+        # 这里给客户端设的超时只是个兜底默认值喵。
+        # 真正生效的超时是每条请求在 upstream.py 里现算现传的（见 build_timeout），
+        # 这样主人在运行中改了超时配置能当场生效，而不会被这个启动时定死的值压住喵。
         timeout = httpx.Timeout(
             # 读超时给足，流式响应两个字之间可能隔很久喵
             timeout=config.server.request_timeout,
@@ -134,12 +163,13 @@ def create_app(state: RuntimeState) -> FastAPI:
             app.state.http_client = client
             # 热重载任务的句柄，默认没有喵
             reload_task: asyncio.Task | None = None
-            # 只有配置了正数间隔且知道配置文件路径时才启动热重载喵
-            if config.server.reload_poll_interval > 0 and config.source_path is not None:
-                # 创建后台任务喵
-                reload_task = asyncio.create_task(
-                    _config_reload_loop(state, config.source_path, config.server.reload_poll_interval)
-                )
+            # 只要知道配置文件在哪就把这个任务起起来喵。
+            # 注意这里不再判断 reload_poll_interval 是否大于 0 —— 那个判断挪进循环内部了，
+            # 因为如果在这里判断，启动时设成 0 的话任务压根不起，之后主人就再也没法
+            # 在不重启的情况下打开热重载了喵。
+            if config.source_path is not None:
+                # 创建后台任务，间隔由它自己每轮现读喵
+                reload_task = asyncio.create_task(_config_reload_loop(state, config.source_path))
             # 到这里服务就绪，把控制权交给 uvicorn 开始接请求喵
             try:
                 yield
