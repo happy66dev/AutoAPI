@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 # json 用来序列化改过 model 的请求体喵
 import json
+# time 用来取单调时钟，给探测阶段的两个计时器算剩余预算喵
+import time
 # dataclass 用来定义结果容器喵
 from dataclasses import dataclass, field
 # AsyncIterator 用于标注流式生成器的返回类型喵
@@ -31,7 +33,13 @@ from typing import Any, AsyncIterator
 import httpx
 
 # 引入候选类型和两个特殊状态码喵
-from .config import STATUS_BAD_STREAM, STATUS_NETWORK_ERROR, Candidate, ServerConfig
+from .config import (
+    STATUS_BAD_STREAM,
+    STATUS_NETWORK_ERROR,
+    STATUS_STALLED_STREAM,
+    Candidate,
+    ServerConfig,
+)
 # 引入流探测器和结论常量喵
 from .sse import VERDICT_CONTENT, VERDICT_PENDING, StreamProbe
 
@@ -212,37 +220,93 @@ def _summarize_error(status: int, text: str) -> str:
 MAX_PROBE_BUFFER_BYTES = 2 * 1024 * 1024
 
 
+# 探测阶段的额外结论：缓冲区被撑爆了喵
+PROBE_BUFFER_OVERFLOW = "buffer_overflow"
+# 探测阶段的额外结论：流卡住了（等不到结论）喵
+PROBE_STALLED = "stalled"
+
+
 async def _probe_until_content(
     iterator: AsyncIterator[bytes],
     probe: StreamProbe,
     buffered: bytearray,
-) -> str:
+    first_content_timeout: float,
+    stall_timeout: float,
+) -> tuple[str, str]:
     """
-    从上游流里持续读取，直到探测出明确结论喵~
+    从上游流里持续读取，直到探测出明确结论或者判定它卡住了喵~
 
-    输入：上游的字节迭代器、探测器、用于暂存原始字节的可变缓冲区
-    输出：探测结论（VERDICT_* 之一）
+    输入：
+        iterator              上游的字节迭代器
+        probe                 探测器（内部维护字数门槛）
+        buffered              用于暂存原始字节的可变缓冲区
+        first_content_timeout 一个字符都没吐时的最长等待，用来快速失败
+        stall_timeout         整个探测阶段的总时限，用来兜住「吐了几个字然后卡住」
+    输出：(结论, 说明文本)，结论是 VERDICT_* 或 PROBE_STALLED / PROBE_BUFFER_OVERFLOW
+
+    为什么每次读取都要单独套超时，而不是在外面套一个大的 wait_for：
+        上游卡住的时候，我们是阻塞在「等下一个字节块」这件事上的。如果只在最外面套
+        wait_for，语义上是对的，但拿不到「已经吐了几个字」这种细节来区分是「一个字都没吐」
+        还是「吐了几个字然后卡住」，日志会说不清楚。所以这里对每次读取算一个剩余预算，
+        预算取两个计时器里更紧的那个喵。
+
     副作用：读到的所有原始字节都会追加进 buffered，一个字节都不丢，
-           这样确认健康后才能把它们原样replay给客户端喵。
+           这样确认健康后才能把它们原样 replay 给客户端喵。
 
     注意：这里接收的是「迭代器」而不是「响应对象」，因为探测停下之后，转发阶段必须从
          同一个迭代器接着读。httpx 的流只能迭代一次，重新调 aiter_bytes() 会抛
          StreamConsumed，所以迭代器必须在两个阶段之间传递下去喵。
     """
-    # 用 async for 逐块读取，读到哪停在哪，迭代器的位置会保留给下一阶段喵
-    async for chunk in iterator:
+    # 记下探测开始的时刻，两个计时器都以它为基准喵
+    started_at = time.monotonic()
+    # 一直读到得出结论为止喵
+    while True:
+        # 算出已经花了多少秒喵
+        elapsed = time.monotonic() - started_at
+        # 探测阶段总时限的剩余预算喵
+        remaining = stall_timeout - elapsed
+        # 总时限用完了，判定这条流卡住了喵
+        if remaining <= 0:
+            # 说明文本里带上已经吐了几个字，方便从日志区分是「完全没动静」还是「吐了几个字卡住」喵
+            return PROBE_STALLED, (
+                f"上游建立了流但在 {stall_timeout:.0f} 秒内没能吐出足够内容"
+                f"（已收到 {probe.content_chars} 个字符）"
+            )
+        # 本次读取允许等待的预算，先取总时限的剩余量喵
+        budget = remaining
+        # 还一个字符都没收到时，额外受首字符计时器约束，好让完全没动静的上游快点失败喵
+        if probe.content_chars == 0:
+            # 首字符计时器的剩余预算喵
+            remaining_first = first_content_timeout - elapsed
+            # 首字符预算用完了，同样判定卡住（主人要求这种情况也重发一次）喵
+            if remaining_first <= 0:
+                return PROBE_STALLED, (
+                    f"上游建立了流但 {first_content_timeout:.0f} 秒内一个内容字符都没吐"
+                )
+            # 取两个预算里更紧的那个喵
+            budget = min(budget, remaining_first)
+        # 读下一个字节块，套上算好的预算喵
+        try:
+            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=budget)
+        # 迭代器正常结束，说明上游把流吐完了，交给 finish() 做最终判定喵
+        except StopAsyncIteration:
+            return probe.finish(), probe.detail
+        # 喵~防御：本次读取超时，说明上游挂着不动了，回到循环顶部由计时器判定该报什么喵
+        except asyncio.TimeoutError:
+            # 循环顶部会重新算 elapsed 并给出准确的卡流说明，所以这里只需继续喵
+            continue
         # 先把原始字节存好，replay 时要用喵
         buffered.extend(chunk)
         # 再喂给探测器做判断喵
         verdict = probe.feed(chunk)
         # 有明确结论就立刻返回；此时迭代器停在这一块之后，后续字节一个都没丢喵
         if verdict != VERDICT_PENDING:
-            return verdict
+            return verdict, probe.detail
         # 喵~防御：缓冲区超过硬上限说明上游一直在吐没用的东西，判定为不健康的流喵
         if len(buffered) > MAX_PROBE_BUFFER_BYTES:
-            return "buffer_overflow"
-    # 流读完了还没结论，交给 finish() 给最终判定喵
-    return probe.finish()
+            return PROBE_BUFFER_OVERFLOW, (
+                f"上游在吐出足够内容前已发送超过 {MAX_PROBE_BUFFER_BYTES} 字节"
+            )
 
 
 async def _attempt_stream(
@@ -303,29 +367,26 @@ async def _attempt_stream(
             # 上游可能通过这个头告诉我们多久后可以再试喵
             retry_after=response.headers.get("retry-after"),
         )
-    # 走到这里是 200，开始探测这条流到底是真健康还是假成功喵
-    probe = StreamProbe()
+    # 走到这里是 200，开始探测这条流到底是真健康、假成功、还是卡住了喵
+    # 字数门槛从配置里取，这样主人改了 min_content_chars 能立即生效喵
+    probe = StreamProbe(min_content_chars=server_cfg.min_content_chars)
     # 暂存探测阶段读到的所有原始字节，确认健康后要原样replay给客户端喵
     buffered = bytearray()
     # 拿到字节迭代器，整个请求全程只创建这一个，探测和转发共用它喵
     iterator = response.aiter_bytes()
-    # 用 wait_for 给探测阶段套一个总时限，防止上游挂着不吐字导致请求永远悬着喵
+    # 开始探测。两个计时器都在函数内部处理，所以这里不再额外套 wait_for 喵
     try:
-        verdict = await asyncio.wait_for(
-            # 探测协程，传迭代器而不是响应对象喵
-            _probe_until_content(iterator, probe, buffered),
-            # 等首个有效内容的最长时间喵
-            timeout=server_cfg.first_content_timeout,
-        )
-    # 喵~防御：等首个内容超时，判定这条流不可用并换下一个候选喵
-    except asyncio.TimeoutError:
-        # 关掉这条没用的连接喵
-        await response.aclose()
-        # 用 bad_stream 状态返回，让规则里的 status: bad_stream 能命中喵
-        return AttemptResult(
-            ok=False,
-            status=STATUS_BAD_STREAM,
-            error_text=f"等待上游首个内容字符超过 {server_cfg.first_content_timeout} 秒",
+        verdict, detail = await _probe_until_content(
+            # 字节迭代器喵
+            iterator,
+            # 探测器喵
+            probe,
+            # 原始字节缓冲区喵
+            buffered,
+            # 一个字符都没吐时的最长等待喵
+            server_cfg.first_content_timeout,
+            # 整个探测阶段的总时限喵
+            server_cfg.stall_timeout,
         )
     # 喵~防御：探测过程中上游把连接掐断了，归为网络错误喵
     except (httpx.HTTPError, OSError) as exc:
@@ -353,16 +414,24 @@ async def _attempt_stream(
             # 上游的响应头，过滤掉逐跳头后回传给客户端喵
             headers=_filter_response_headers(response),
         )
-    # 探测结论是空流、error 事件或缓冲区溢出，都属于「200 假成功」喵
+    # 走到这里说明这条流不能用了，先把连接关掉释放连接池槽位喵
     await response.aclose()
-    # 缓冲区溢出有专门的说明文案，其他情况用探测器给出的说明喵
-    detail = (
-        f"上游在吐出第一个内容字符前已发送超过 {MAX_PROBE_BUFFER_BYTES} 字节"
-        if verdict == "buffer_overflow"
-        else (probe.detail or "上游返回 200 但流内容不正常")
+    # 卡流单独用一个状态码，因为它的处置方式和别的不一样喵：
+    # 卡流是「等不到结论」，原地重发一次很可能就好了；而空流/error 是「已经确定坏了」，
+    # 重发同一个上游大概率还是坏的，换候选更划算。所以两者要能被不同规则分别匹配喵。
+    if verdict == PROBE_STALLED:
+        # 返回卡流状态，让规则里的 status: stalled_stream 能命中喵
+        return AttemptResult(
+            ok=False,
+            status=STATUS_STALLED_STREAM,
+            error_text=detail or "上游的流卡住了",
+        )
+    # 其余情况（空流、流内 error、缓冲区溢出）都归为「200 假成功」喵
+    return AttemptResult(
+        ok=False,
+        status=STATUS_BAD_STREAM,
+        error_text=detail or "上游返回 200 但流内容不正常",
     )
-    # 返回假成功结果，交给规则引擎决定换候选还是重试喵
-    return AttemptResult(ok=False, status=STATUS_BAD_STREAM, error_text=detail)
 
 
 def _nonstream_fake_success(body: bytes) -> str:

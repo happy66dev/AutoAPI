@@ -11,6 +11,8 @@ autoapi 的单元测试与端到端测试喵~
 # 引入注解特性喵
 from __future__ import annotations
 
+# asyncio 用来做并发测试和模拟卡住的流喵
+import asyncio
 # json 用来构造测试用的请求体和 SSE 负载喵
 import json
 # time 用来测试冻结过期喵
@@ -25,6 +27,7 @@ import pytest
 from autoapi.config import (
     STATUS_BAD_STREAM,
     STATUS_NETWORK_ERROR,
+    STATUS_STALLED_STREAM,
     Candidate,
     ConfigError,
     parse_config,
@@ -60,7 +63,11 @@ def make_config_dict(**overrides):
             "host": "127.0.0.1",
             "port": 8787,
             "request_timeout": 5,
-            "first_content_timeout": 2,
+            # 超时都设得很小，让卡流类的测试能快点跑完喵
+            "first_content_timeout": 0.6,
+            "stall_timeout": 0.9,
+            # 门槛保持默认的 10，这样能测到「吐几个字不够门槛」的行为喵
+            "min_content_chars": 10,
             "connect_timeout": 2,
             "reload_poll_interval": 0,
         },
@@ -93,6 +100,8 @@ def make_config_dict(**overrides):
                 "freeze_seconds": 300,
             },
             {"match": {"status": [500, 502, 503]}, "action": "retry", "max_attempts": 2, "backoff_base": 1.0},
+            # 卡流：原地重发一次（含首次共 2 次），两次都卡才换候选喵
+            {"match": {"status": "stalled_stream"}, "action": "retry", "max_attempts": 2, "backoff_base": 1.0},
             {"match": {"status": "bad_stream"}, "action": "next"},
             {"match": {"status": [401, 403, 404]}, "action": "next"},
             {"match": {"status": 400}, "action": "passthrough"},
@@ -115,8 +124,8 @@ def test_配置能正常加载():
     assert len(config.virtual_models) == 1
     # 那个虚拟模型应该有两个候选喵
     assert len(config.virtual_models["auto-test"]) == 2
-    # 应该有五条规则喵
-    assert len(config.rules) == 5
+    # 应该有六条规则喵（freeze、5xx retry、卡流 retry、bad_stream、401 系、400）
+    assert len(config.rules) == 6
     # 第一个候选的真实模型名应该被正确解析喵
     assert config.virtual_models["auto-test"][0].model == "gpt-4o"
 
@@ -316,6 +325,38 @@ class 分块字节流(httpx.AsyncByteStream):
             yield self._data[i : i + self._chunk_size]
 
 
+class 卡住的字节流(httpx.AsyncByteStream):
+    """
+    一个模拟「卡流」的假上游流喵~
+
+    行为：先吐出给定的前缀字节（通常是几个字符的内容），然后就一直挂着不再吐东西，
+         连接也不断开。这正是主人描述的那种最阴险的坏上游喵。
+    """
+
+    def __init__(self, prefix: bytes = b"") -> None:
+        """记下要先吐出的前缀喵~"""
+        # 挂住之前先吐出的字节，可以为空（表示一个字都不吐）喵
+        self._prefix = prefix
+
+    async def __aiter__(self):
+        """吐完前缀就永远睡下去喵~"""
+        # 有前缀就先吐出去喵
+        if self._prefix:
+            yield self._prefix
+        # 然后一直挂着。睡一个很长的时间，代理那边的探测超时会先到并主动放弃喵
+        await asyncio.sleep(3600)
+
+
+def 卡流响应(prefix: bytes = b"") -> httpx.Response:
+    """造一个「吐几个字然后卡住」的响应喵~"""
+    # 用卡住的流当响应体喵
+    return httpx.Response(
+        200,
+        stream=卡住的字节流(prefix),
+        headers={"content-type": "text/event-stream"},
+    )
+
+
 def 流式响应(data: bytes) -> httpx.Response:
     """造一个用真正分块流承载 SSE 的响应喵~"""
     # 用自定义的分块流当响应体，content-type 设成 SSE 的标准值喵
@@ -327,29 +368,38 @@ def 流式响应(data: bytes) -> httpx.Response:
 
 
 def test_识别OpenAI风格的内容():
-    """OpenAI 的 delta.content 有字就该判定为健康喵~"""
-    # 造一个探测器喵
-    probe = StreamProbe()
+    """
+    OpenAI 的 delta.content 里的文字应该被正确识别喵~
+
+    这里显式用门槛 1，因为本用例测的是「能不能认出内容」这件事，
+    和「够不够字数才放行」是两个独立的关注点，分开测才不会互相干扰喵。
+    """
+    # 造一个门槛为 1 的探测器，只验证识别能力喵
+    probe = StreamProbe(min_content_chars=1)
     # 喂一个带内容的 chunk 喵
     verdict = probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "你好"}}]})))
     # 应该判定为有内容喵
     assert verdict == VERDICT_CONTENT
+    # 字数也该被正确累计喵
+    assert probe.content_chars == 2
 
 
 def test_识别Anthropic风格的内容():
-    """Anthropic 的 content_block_delta.text 有字就该判定为健康喵~"""
-    # 造一个探测器喵
-    probe = StreamProbe()
+    """Anthropic 的 content_block_delta.text 里的文字应该被正确识别喵~"""
+    # 造一个门槛为 1 的探测器喵
+    probe = StreamProbe(min_content_chars=1)
     # 造一个 Anthropic 风格的内容增量事件喵
     event = json.dumps({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "你好"}})
     # 喂进去喵
     assert probe.feed(sse(event)) == VERDICT_CONTENT
+    # 字数也该被正确累计喵
+    assert probe.content_chars == 2
 
 
 def test_识别推理模型的思维链内容():
-    """推理模型先吐 reasoning_content，这也算流是健康的喵~"""
-    # 造一个探测器喵
-    probe = StreamProbe()
+    """推理模型先吐 reasoning_content，这也算有效内容喵~"""
+    # 造一个门槛为 1 的探测器喵
+    probe = StreamProbe(min_content_chars=1)
     # 造一个只有思维链没有正文的增量喵
     event = json.dumps({"choices": [{"delta": {"reasoning_content": "让我想想"}}]})
     # 应该判定为有内容喵
@@ -415,8 +465,8 @@ def test_跨块被切断的行能正确拼接():
     这是最容易出 bug 的地方喵：上游的 TCP 分块边界和 SSE 行边界毫无关系，
     一行 data: 被切成两半时必须能拼回来喵。
     """
-    # 造一个探测器喵
-    probe = StreamProbe()
+    # 造一个门槛为 1 的探测器，本用例只关心行拼接是否正确喵
+    probe = StreamProbe(min_content_chars=1)
     # 造完整的字节流喵
     full = sse(json.dumps({"choices": [{"delta": {"content": "喵"}}]}))
     # 在正中间切开喵
@@ -432,14 +482,127 @@ def test_跨块被切断的中文字符不会乱码():
     UTF-8 的中文占 3 个字节，被切开时用普通 decode 会抛异常或出乱码，
     必须靠增量解码器正确处理喵。
     """
-    # 造一个探测器喵
-    probe = StreamProbe()
+    # 造一个门槛为 1 的探测器，本用例只关心中文字节被切开时会不会乱码喵
+    probe = StreamProbe(min_content_chars=1)
     # 造一个内容是中文的字节流喵
     full = sse(json.dumps({"choices": [{"delta": {"content": "早上好"}}]}, ensure_ascii=False))
     # 逐字节喂进去，这是最极端的切分方式喵
     verdicts = [probe.feed(full[i : i + 1]) for i in range(len(full))]
     # 最终应该能识别出内容，说明中文没被切坏喵
     assert VERDICT_CONTENT in verdicts
+
+
+def test_字数不够门槛时不放行():
+    """
+    这是新增门槛的核心用例喵：只吐一两个字符时绝不能放行，
+    否则「吐一两个字然后卡死」的上游会骗过检查、字节一出门就换不了候选了喵。
+    """
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 只吐两个字符喵
+    assert probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "嗯嗯"}}]}))) == VERDICT_PENDING
+    # 字数应该被累计上了喵
+    assert probe.content_chars == 2
+    # 再吐几个，还是不够 10 个喵
+    assert probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "好的呢"}}]}))) == VERDICT_PENDING
+    assert probe.content_chars == 5
+
+
+def test_字数攒够门槛就放行():
+    """跨多个 chunk 累计够 10 个字符就该放行喵~"""
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 分多次喂，每次 3 个字符喵
+    for _ in range(3):
+        assert probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "一二三"}}]}))) == VERDICT_PENDING
+    # 第 4 次之后累计到 12 个字符，超过门槛，应该放行喵
+    assert probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "四五六"}}]}))) == VERDICT_CONTENT
+    # 累计字数应该是 12 喵
+    assert probe.content_chars == 12
+
+
+def test_短回答流正常结束时照常放行():
+    """
+    很重要的边界喵：整条流只有几个字就正常结束（比如模型只回「好的」），
+    绝不能因为凑不满 10 个字符就判失败，那会把正常的短回答全干掉喵。
+    """
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 吐两个字符，此时还不够门槛喵
+    assert probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "好的"}}]}))) == VERDICT_PENDING
+    # 紧接着流正常结束，这时应该判定健康并放行喵
+    assert probe.feed(sse("[DONE]")) == VERDICT_CONTENT
+
+
+def test_短回答的Anthropic流也照常放行():
+    """Anthropic 的 message_stop 同样要能触发短回答放行喵~"""
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 吐一点点内容喵
+    event = json.dumps({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "好"}})
+    assert probe.feed(sse(event)) == VERDICT_PENDING
+    # 收到 message_stop，应该放行喵
+    assert probe.feed(sse(json.dumps({"type": "message_stop"}))) == VERDICT_CONTENT
+
+
+def test_只调工具不吐文字也要放行():
+    """
+    模型只调工具时 content 一直是空的，字数永远凑不满门槛。
+    这种必须绕过字数门槛直接放行，否则会被误判成卡流喵。
+    """
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 只有 tool_calls，没有任何文字喵
+    event = json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1"}]}}]})
+    # 应该直接放行喵
+    assert probe.feed(sse(event)) == VERDICT_CONTENT
+
+
+def test_Anthropic的工具参数增量也要放行():
+    """Anthropic 用 partial_json 传工具参数，同样不带可读文字，也要放行喵~"""
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 造一个工具参数增量事件喵
+    event = json.dumps(
+        {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": '{"a":'}}
+    )
+    # 应该直接放行喵
+    assert probe.feed(sse(event)) == VERDICT_CONTENT
+
+
+def test_收到finish_reason也要放行():
+    """finish_reason 说明这一轮已正常收尾，不该再等字数喵~"""
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 造一个带 finish_reason 的 chunk 喵
+    event = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    # 应该直接放行喵
+    assert probe.feed(sse(event)) == VERDICT_CONTENT
+
+
+def test_连接断掉但吐过字符时当短回答放行():
+    """
+    上游吐了几个字就把连接断了（没有 [DONE]）：内容已经到手，放行比失败好喵。
+    有些上游本来就不发 [DONE]，判失败会误伤它们喵。
+    """
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 吐两个字符喵
+    probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "嗯嗯"}}]})))
+    # 此时还不够门槛喵
+    assert probe.verdict == VERDICT_PENDING
+    # 流结束了，应该当成短回答放行喵
+    assert probe.finish() == VERDICT_CONTENT
+
+
+def test_一个字符都没有时流结束仍判空流():
+    """一个字符都没吐就结束，这是真正的假成功，必须判失败喵~"""
+    # 造一个门槛为 10 的探测器喵
+    probe = StreamProbe(min_content_chars=10)
+    # 只喂一个元信息事件，没有任何内容喵
+    probe.feed(sse(json.dumps({"type": "message_start"})))
+    # 流结束，应该判空流喵
+    assert probe.finish() == VERDICT_DONE_EMPTY
 
 
 def test_非JSON的心跳行不会误判():
@@ -871,6 +1034,140 @@ async def test_假成功的流会被转移():
     assert outcome.is_stream is True
     # 应该先试主力发现是假成功，再换到备用喵
     assert hits == ["primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_吐几个字然后卡住会被识别并重发():
+    """
+    主人要求新增的核心用例喵：上游吐了几个字符然后一直挂着不动。
+    代理应该识别成卡流、原地重发一次，重发还是卡住才降级到下一个候选喵。
+    """
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力吐两个字就卡住，备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力：吐两个字符（不够 10 个门槛）然后永远挂着喵
+        if request.url.host == "primary.test":
+            return 卡流响应(sse(json.dumps({"choices": [{"delta": {"content": "嗯嗯"}}]})))
+        # 备用：正常的内容流，内容够长喵
+        return 流式响应(sse(json.dumps({"choices": [{"delta": {"content": "这是一段够长的正常回答内容"}}]}), "[DONE]"))
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次流式编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 最终应该靠备用成功喵
+    assert outcome.success is True
+    # 主力应该被试了 2 次（首次 + 重试 1 次），然后才换到备用喵
+    assert hits == ["primary.test", "primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_一个字都不吐的卡流也会被识别():
+    """上游建立了流但一个字符都不吐，同样要能识别并重发喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力建立流但一个字都不吐，备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力：什么都不吐，直接挂着喵
+        if request.url.host == "primary.test":
+            return 卡流响应()
+        # 备用：正常内容喵
+        return 流式响应(sse(json.dumps({"choices": [{"delta": {"content": "这是一段够长的正常回答内容"}}]}), "[DONE]"))
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次流式编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 应该靠备用成功喵
+    assert outcome.success is True
+    # 同样是重发一次后降级喵
+    assert hits == ["primary.test", "primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_卡流状态码能被规则单独匹配():
+    """卡流和假成功要能被不同规则分别处置，这是新状态码存在的意义喵~"""
+    # 取规则列表喵
+    rules = parse_config(make_config_dict()).rules
+    # 卡流应该命中 retry 规则喵
+    stalled = decide(rules, STATUS_STALLED_STREAM, "上游的流卡住了")
+    assert stalled.action == "retry"
+    # 含首次共 2 次，也就是最多重试 1 次喵
+    assert stalled.max_attempts == 2
+    # 假成功应该命中 next 规则，和卡流走不同的路喵
+    bad = decide(rules, STATUS_BAD_STREAM, "空流")
+    assert bad.action == "next"
+
+
+@pytest.mark.asyncio
+async def test_短回答的流不会被门槛误伤():
+    """
+    端到端确认：整条流只有几个字就正常结束时，客户端要能正常收到，
+    绝不能因为凑不满 10 个字符就被判失败换候选喵。
+    """
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+    # 造一条很短但完整的流：两个字 + 结束标记喵
+    short_stream = sse(json.dumps({"choices": [{"delta": {"content": "好的"}}]}), "[DONE]")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：链首就回一条很短的正常流喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 回那条短流喵
+        return 流式响应(short_stream)
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次流式编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 应该直接成功喵
+    assert outcome.success is True
+    # 只该打链首一次，不该发生任何转移喵
+    assert hits == ["primary.test"]
+    # 收到的字节应该和上游原始输出一字不差喵
+    from autoapi.upstream import iter_upstream_bytes
+    # 收集所有字节喵
+    collected = b""
+    # 逐块收集喵
+    async for chunk in iter_upstream_bytes(outcome.attempt):
+        collected += chunk
+    # 必须完全一致喵
+    assert collected == short_stream
+
+
+@pytest.mark.asyncio
+async def test_只调工具的流不会被门槛误伤():
+    """模型只调工具、完全不吐文字时也要能正常放行，不能被当成卡流喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+    # 造一条只有工具调用的流喵
+    tool_stream = sse(
+        json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1"}]}}]}),
+        "[DONE]",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：链首回一条只有工具调用的流喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 回那条流喵
+        return 流式响应(tool_stream)
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次流式编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 应该直接成功，不发生转移喵
+    assert outcome.success is True
+    assert hits == ["primary.test"]
 
 
 @pytest.mark.asyncio

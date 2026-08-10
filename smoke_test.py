@@ -42,6 +42,8 @@ from autoapi.state import RuntimeState
 PORT_PROXY = 9100
 PORT_BAD = 9101
 PORT_GOOD = 9102
+# 卡流上游的端口：返回 200 并吐几个字，然后一直挂着不动喵
+PORT_STALL = 9103
 
 
 def make_bad_upstream() -> FastAPI:
@@ -65,6 +67,36 @@ def make_bad_upstream() -> FastAPI:
                 }
             },
         )
+
+    # 返回应用喵
+    return app
+
+
+def make_stalling_upstream() -> FastAPI:
+    """
+    造一个「卡流」上游喵~
+
+    行为：返回 200 并开始吐 SSE，先吐两个字符（不够放行门槛），然后就一直挂着不动、
+         连接也不断。这是主人描述的那种最阴险的坏上游，专门用来验证卡流检测喵。
+    """
+    # 创建应用喵
+    app = FastAPI()
+
+    @app.post("/{path:path}")
+    async def stall(path: str):
+        """吐两个字就卡住喵~"""
+
+        async def gen():
+            """先吐一点内容，然后永远挂着喵~"""
+            # 吐一个只有 role 的占位首包，模拟真实上游喵
+            yield f'data: {json.dumps({"choices": [{"delta": {"role": "assistant", "content": ""}}]})}\n\n'.encode()
+            # 再吐两个字符，不够 10 个门槛喵
+            yield f'data: {json.dumps({"choices": [{"delta": {"content": "嗯嗯"}}]}, ensure_ascii=False)}\n\n'.encode()
+            # 然后一直挂着，代理的探测超时会先到并主动放弃这个候选喵
+            await asyncio.sleep(3600)
+
+        # 返回这条永远不会正常结束的流喵
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     # 返回应用喵
     return app
@@ -127,7 +159,10 @@ server:
   host: 127.0.0.1
   port: {PORT_PROXY}
   request_timeout: 30
-  first_content_timeout: 10
+  # 超时设得比较小，让卡流检测能在几秒内触发，冒烟测试才跑得快喵
+  first_content_timeout: 2
+  stall_timeout: 3
+  min_content_chars: 10
   connect_timeout: 5
   reload_poll_interval: 0
 
@@ -144,6 +179,19 @@ virtual_models:
       model: 真实的好模型名
       auth_style: bearer
 
+  # 专门用来验证卡流的虚拟模型：链首是那个吐两个字就挂住的上游，第二位是好上游喵
+  auto-stall:
+    - name: 卡流上游
+      base_url: http://127.0.0.1:{PORT_STALL}
+      api_key: sk-stall-key-for-smoke-test
+      model: 卡流模型
+      auth_style: bearer
+    - name: 好上游
+      base_url: http://127.0.0.1:{PORT_GOOD}
+      api_key: sk-good-key-for-smoke-test
+      model: 真实的好模型名
+      auth_style: bearer
+
 rules:
   - match:
       status: 429
@@ -152,6 +200,11 @@ rules:
     freeze_from_group: 1
     freeze_unit: minutes
     freeze_seconds: 300
+  - match:
+      status: stalled_stream
+    action: retry
+    max_attempts: 2
+    backoff_base: 1.0
   - match:
       status: bad_stream
     action: next
@@ -226,11 +279,14 @@ async def run_smoke() -> bool:
         bad_server = await serve(make_bad_upstream(), PORT_BAD)
         # 好上游喵
         good_server = await serve(make_good_upstream(), PORT_GOOD)
+        # 卡流上游：吐两个字就挂住喵
+        stall_server = await serve(make_stalling_upstream(), PORT_STALL)
         # 被测的代理本体喵
         proxy_server = await serve(create_app(state), PORT_PROXY)
         # 打印就绪信息喵
         print(f"  坏上游 http://127.0.0.1:{PORT_BAD}（一律返回 429 额度用尽）")
         print(f"  好上游 http://127.0.0.1:{PORT_GOOD}（正常工作）")
+        print(f"  卡流上游 http://127.0.0.1:{PORT_STALL}（吐两个字然后永远挂着）")
         print(f"  autoapi 代理 http://127.0.0.1:{PORT_PROXY}\n")
         # 代理的基础地址喵
         base = f"http://127.0.0.1:{PORT_PROXY}"
@@ -242,8 +298,14 @@ async def run_smoke() -> bool:
             r = await client.get(f"{base}/healthz")
             # 状态码应该是 200 喵
             results.append(check("healthz 返回 200", r.status_code == 200, f"实际 {r.status_code}"))
-            # 应该报告有 1 个虚拟模型喵
-            results.append(check("报告了 1 个虚拟模型", r.json().get("virtual_models") == 1))
+            # 应该报告有 2 个虚拟模型（auto-smoke 和用于测卡流的 auto-stall）喵
+            results.append(
+                check(
+                    "报告了 2 个虚拟模型",
+                    r.json().get("virtual_models") == 2,
+                    f"实际 {r.json().get('virtual_models')}",
+                )
+            )
 
             # ---- 检查 2：模型列表接口喵 ----
             print("\n检查 2：模型列表接口喵")
@@ -370,8 +432,58 @@ async def run_smoke() -> bool:
             # 请求计数应该加了 1 喵
             results.append(check("请求计数正确递增", state.total_requests == before + 1))
 
-            # ---- 检查 8：并发压测喵 ----
-            print("\n检查 8：并发压测（60 条请求同时打进来，对应 60rpm 全挤在一秒）喵")
+            # ---- 检查 8：卡流检测（走真 socket）喵 ----
+            print("\n检查 8：卡流检测喵（链首吐两个字就永远挂着，应该重发一次后降级到好上游）")
+            # 收集收到的所有 SSE 行喵
+            stall_lines: list[str] = []
+            # 记下开始时间，用来确认没有一直干等下去喵
+            stall_start = asyncio.get_event_loop().time()
+            # 用流式方式打那个链首是卡流上游的虚拟模型喵
+            async with client.stream(
+                "POST",
+                f"{base}/v1/chat/completions",
+                json={"model": "auto-stall", "messages": [{"role": "user", "content": "你好"}], "stream": True},
+            ) as resp:
+                # 尽管链首会卡住，客户端最终应该拿到 200 喵
+                results.append(check("卡流后客户端仍收到 200", resp.status_code == 200, f"实际 {resp.status_code}"))
+                # 逐行读取喵
+                async for line in resp.aiter_lines():
+                    # 只收集非空行喵
+                    if line.strip():
+                        stall_lines.append(line)
+            # 算出总耗时喵
+            stall_elapsed = asyncio.get_event_loop().time() - stall_start
+            # 拼起来方便检查内容喵
+            stall_joined = "\n".join(stall_lines)
+            # 内容应该来自好上游，而不是卡流上游那两个「嗯嗯」喵
+            results.append(
+                check(
+                    "内容来自好上游而非卡流上游",
+                    all(w in stall_joined for w in ["好上游", "正在", "流式", "回答"]),
+                    f"共收到 {len(stall_lines)} 行",
+                )
+            )
+            # 卡流上游吐的那两个字绝不能漏给客户端 —— 它们在探测阶段就被丢掉了喵
+            results.append(
+                check(
+                    "卡流上游吐的残缺内容没有漏给客户端",
+                    "嗯嗯" not in stall_joined,
+                    "漏出去说明放行门槛没起作用",
+                )
+            )
+            # 耗时应该约等于「两次卡流各 3 秒 + 1 秒退避」，不该无限干等喵
+            results.append(
+                check(
+                    "在合理时间内完成降级（没有无限干等）",
+                    stall_elapsed < 20,
+                    f"实际耗时 {stall_elapsed:.1f} 秒",
+                )
+            )
+            # 打印耗时供参考喵
+            print(f"       耗时 {stall_elapsed:.1f} 秒（两次卡流探测各 3 秒 + 1 秒退避 + 好上游生成时间）喵~")
+
+            # ---- 检查 9：并发压测喵 ----
+            print("\n检查 9：并发压测（60 条请求同时打进来，对应 60rpm 全挤在一秒）喵")
             # 记下开始时间喵
             start = asyncio.get_event_loop().time()
             # 同时发 60 条请求喵
@@ -395,8 +507,8 @@ async def run_smoke() -> bool:
             # 打印吞吐量供参考喵
             print(f"       耗时 {elapsed:.2f} 秒，约合 {60 / max(elapsed, 0.001):.0f} 请求/秒，远超 60rpm 的要求喵~")
 
-        # 测完把三个服务都停掉喵
-        for server in (proxy_server, good_server, bad_server):
+        # 测完把四个服务都停掉喵
+        for server in (proxy_server, good_server, bad_server, stall_server):
             # 置位退出标志，uvicorn 会优雅停机喵
             server.should_exit = True
         # 给它们一点时间收尾喵

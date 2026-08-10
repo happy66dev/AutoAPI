@@ -33,12 +33,21 @@ STATUS_NETWORK_ERROR = -1
 # 特殊状态码：表示上游返回了 200 但这条 SSE 流里没有任何有效内容（假成功）喵
 STATUS_BAD_STREAM = -2
 
+# 特殊状态码：表示这条流「卡住了」喵。
+# 具体指：上游确实建立了 SSE 流，可能还吐了几个字，然后就一直挂着不再吐有效内容，
+# 直到探测阶段的总时限用完。和 bad_stream 的区别是 bad_stream 已经能确定这条流是坏的
+# （明确收到了 error 事件或空的结束标记），而 stalled_stream 是「一直没等到结论」，
+# 所以适合原地重发一次试试，而不是立刻换候选喵。
+STATUS_STALLED_STREAM = -3
+
 # YAML 里能写的状态别名 → 内部特殊状态码的映射表喵
 STATUS_ALIASES = {
     # 写 network 就等于网络层失败喵
     "network": STATUS_NETWORK_ERROR,
-    # 写 bad_stream 就等于 200 假成功喵
+    # 写 bad_stream 就等于 200 假成功（明确坏掉的流）喵
     "bad_stream": STATUS_BAD_STREAM,
+    # 写 stalled_stream 就等于流卡住了（吐了几个字或没吐，然后一直挂着）喵
+    "stalled_stream": STATUS_STALLED_STREAM,
 }
 
 # 规则引擎允许的四种动作名，拼错的话加载阶段直接报错喵
@@ -152,8 +161,16 @@ class ServerConfig:
     port: int = 8787
     # 单次上游请求的总超时秒数喵
     request_timeout: float = 300.0
-    # 等第一个有效内容字符的超时秒数喵
+    # 等第一个有效内容字符的超时秒数。上游一个字都不吐时靠这个快速失败喵
     first_content_timeout: float = 45.0
+    # 整个探测阶段的总时限秒数。上游吐了几个字然后卡住不动时靠这个兜住，
+    # 超时就判定为 stalled_stream（流卡住了）喵
+    stall_timeout: float = 60.0
+    # 放行给客户端之前，需要先累积够这么多个内容字符。
+    # 设成 10 是为了避开「上游先吐一两个字符然后卡死」这种情况 —— 只等 1 个字符的话
+    # 会被这种流骗过去，字节一出门就再也没法换候选了喵。
+    # 注意：如果整条流在凑够这个数之前就正常结束了（短回答），也会照常放行，不会干等喵。
+    min_content_chars: int = 10
     # 建立连接的超时秒数喵
     connect_timeout: float = 15.0
     # 配置文件热重载的轮询间隔秒数，0 表示关闭喵
@@ -342,6 +359,11 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
         request_timeout=max(1.0, float(server_raw.get("request_timeout", 300.0))),
         # 首内容超时至少 1 秒，同理喵
         first_content_timeout=max(1.0, float(server_raw.get("first_content_timeout", 45.0))),
+        # 探测阶段总时限至少 1 秒喵
+        stall_timeout=max(1.0, float(server_raw.get("stall_timeout", 60.0))),
+        # 放行门槛至少 1 个字符。设成 0 或负数等于不设门槛，收到任何内容就放行，
+        # 那样就完全失去了防「吐一两个字然后卡死」的能力，所以这里压到 1 喵
+        min_content_chars=max(1, int(server_raw.get("min_content_chars", 10))),
         # 连接超时至少 1 秒喵
         connect_timeout=max(1.0, float(server_raw.get("connect_timeout", 15.0))),
         # 热重载轮询间隔，允许为 0 表示彻底关闭该功能喵
