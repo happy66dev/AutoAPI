@@ -1,0 +1,12 @@
+# FastAPI 提供 HTTP 服务框架和路由能力喵
+fastapi==0.115.6
+# uvicorn 是跑 FastAPI 的 ASGI 服务器，标准版附带高性能事件循环喵
+uvicorn[standard]==0.34.0
+# httpx 提供全异步 HTTP 客户端，支持流式读取上游 SSE 喵
+httpx==0.28.1
+# PyYAML 用来读写 config.yaml 配置文件喵
+PyYAML==6.0.2
+# pytest 跑单元测试用喵
+pytest==8.3.4
+# pytest-asyncio 让 pytest 能测试 async 函数喵
+pytest-asyncio==0.25.2

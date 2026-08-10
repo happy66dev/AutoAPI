@@ -1,0 +1,1013 @@
+"""
+autoapi 的单元测试与端到端测试喵~
+
+覆盖四块：
+    1. 配置加载与校验（合法配置能过，各种坏配置要被挡下来）
+    2. 规则引擎（正则抽取冻结时长、重试、换候选、原样回传、默认动作）
+    3. SSE 流探测（两种协议的内容识别、假成功识别、跨块切断的行和中文字）
+    4. 端到端故障转移（用 httpx 的 MockTransport 假装上游，验证真的会换候选）
+"""
+
+# 引入注解特性喵
+from __future__ import annotations
+
+# json 用来构造测试用的请求体和 SSE 负载喵
+import json
+# time 用来测试冻结过期喵
+import time
+
+# httpx 提供 MockTransport，可以假装成上游喵
+import httpx
+# pytest 是测试框架喵
+import pytest
+
+# 引入被测的配置模块喵
+from autoapi.config import (
+    STATUS_BAD_STREAM,
+    STATUS_NETWORK_ERROR,
+    Candidate,
+    ConfigError,
+    parse_config,
+)
+# 引入被测的编排层喵
+from autoapi.proxy import detect_stream_flag, handle_request, parse_client_body
+# 引入被测的规则引擎喵
+from autoapi.rules import decide
+# 引入被测的 SSE 探测器喵
+from autoapi.sse import (
+    VERDICT_CONTENT,
+    VERDICT_DONE_EMPTY,
+    VERDICT_ERROR,
+    VERDICT_PENDING,
+    StreamProbe,
+)
+# 引入被测的运行时状态喵
+from autoapi.state import RuntimeState
+# 引入被测的上游请求构造函数喵
+from autoapi.upstream import build_upstream_body, build_upstream_headers
+
+
+def make_config_dict(**overrides):
+    """
+    造一份最小可用的配置字典给测试用喵~
+
+    说明：默认配两个候选、几条典型规则，测试里按需覆盖某些字段喵。
+    """
+    # 基础配置字典喵
+    data = {
+        # 服务器段，超时都设得很小以便测试跑得快喵
+        "server": {
+            "host": "127.0.0.1",
+            "port": 8787,
+            "request_timeout": 5,
+            "first_content_timeout": 2,
+            "connect_timeout": 2,
+            "reload_poll_interval": 0,
+        },
+        # 一个虚拟模型带两个候选，用于验证故障转移喵
+        "virtual_models": {
+            "auto-test": [
+                {
+                    "name": "主力",
+                    "base_url": "https://primary.test",
+                    "api_key": "sk-primary-key-1234",
+                    "model": "gpt-4o",
+                    "auth_style": "bearer",
+                },
+                {
+                    "name": "备用",
+                    "base_url": "https://backup.test",
+                    "api_key": "sk-backup-key-5678",
+                    "model": "claude-sonnet",
+                    "auth_style": "x-api-key",
+                },
+            ]
+        },
+        # 典型规则集喵
+        "rules": [
+            {
+                "match": {"status": 429, "body_regex": r"refreshes?\s+in\s+(\d+)\s+minutes?"},
+                "action": "freeze",
+                "freeze_from_group": 1,
+                "freeze_unit": "minutes",
+                "freeze_seconds": 300,
+            },
+            {"match": {"status": [500, 502, 503]}, "action": "retry", "max_attempts": 2, "backoff_base": 1.0},
+            {"match": {"status": "bad_stream"}, "action": "next"},
+            {"match": {"status": [401, 403, 404]}, "action": "next"},
+            {"match": {"status": 400}, "action": "passthrough"},
+        ],
+    }
+    # 应用测试传入的覆盖项喵
+    data.update(overrides)
+    # 返回配置字典喵
+    return data
+
+
+# ============ 1. 配置加载与校验喵 ============
+
+
+def test_配置能正常加载():
+    """合法配置应该被完整解析出来喵~"""
+    # 解析配置喵
+    config = parse_config(make_config_dict())
+    # 应该有一个虚拟模型喵
+    assert len(config.virtual_models) == 1
+    # 那个虚拟模型应该有两个候选喵
+    assert len(config.virtual_models["auto-test"]) == 2
+    # 应该有五条规则喵
+    assert len(config.rules) == 5
+    # 第一个候选的真实模型名应该被正确解析喵
+    assert config.virtual_models["auto-test"][0].model == "gpt-4o"
+
+
+def test_状态码别名会被翻译成特殊值():
+    """bad_stream 和 network 这两个别名应该被翻译成内部负数状态码喵~"""
+    # 造一份只有一条 network 规则的配置喵
+    data = make_config_dict(rules=[{"match": {"status": "network"}, "action": "next"}])
+    # 解析喵
+    config = parse_config(data)
+    # 那条规则的状态码集合里应该是网络错误的特殊值喵
+    assert STATUS_NETWORK_ERROR in config.rules[0].status_codes
+
+
+def test_候选缺少必填字段要报错():
+    """候选少了 api_key 应该在加载阶段就被挡下来喵~"""
+    # 造一个缺 api_key 的候选喵
+    data = make_config_dict(
+        virtual_models={"bad": [{"base_url": "https://x.test", "model": "gpt-4o"}]}
+    )
+    # 应该抛 ConfigError 且消息里点明缺了哪个字段喵
+    with pytest.raises(ConfigError, match="api_key"):
+        parse_config(data)
+
+
+def test_虚拟模型候选链为空要报错():
+    """空候选链意味着这个虚拟模型永远无法服务，必须在加载阶段挡下来喵~"""
+    # 造一个候选链为空的虚拟模型喵
+    data = make_config_dict(virtual_models={"empty": []})
+    # 应该抛 ConfigError 喵
+    with pytest.raises(ConfigError, match="非空列表"):
+        parse_config(data)
+
+
+def test_规则动作拼错要报错():
+    """action 拼错必须在加载阶段发现，不能等到线上才失效喵~"""
+    # 造一条 action 拼错的规则喵
+    data = make_config_dict(rules=[{"match": {"status": 500}, "action": "retryyy"}])
+    # 应该抛 ConfigError 且消息里列出合法动作喵
+    with pytest.raises(ConfigError, match="不合法"):
+        parse_config(data)
+
+
+def test_既无状态码又无正则的规则要报错():
+    """这种规则会匹配一切，属于危险配置，必须拒绝喵~"""
+    # 造一条 match 为空的规则喵
+    data = make_config_dict(rules=[{"match": {}, "action": "next"}])
+    # 应该抛 ConfigError 喵
+    with pytest.raises(ConfigError, match="会匹配所有情况"):
+        parse_config(data)
+
+
+def test_正则语法错误要报错():
+    """坏正则必须在加载阶段被编译出错，而不是运行时才炸喵~"""
+    # 造一条正则写坏的规则（括号没闭合）喵
+    data = make_config_dict(rules=[{"match": {"status": 429, "body_regex": "(unclosed"}, "action": "next"}])
+    # 应该抛 ConfigError 喵
+    with pytest.raises(ConfigError, match="编译失败"):
+        parse_config(data)
+
+
+def test_api_key会被脱敏():
+    """脱敏后的 key 不能包含中间部分，避免日志泄密喵~"""
+    # 造一个候选喵
+    candidate = Candidate(name="测试", base_url="https://x.test", api_key="sk-abcdefghijklmnop", model="m")
+    # 脱敏结果里不应该出现中间那段喵
+    assert "ghijkl" not in candidate.masked_key
+    # 但应该保留开头方便肉眼对号喵
+    assert candidate.masked_key.startswith("sk-abc")
+
+
+# ============ 2. 规则引擎喵 ============
+
+
+def test_从错误消息里抽取冻结时长():
+    """上游说 6 分钟后恢复，就应该冻结 6 分钟（外加 5 秒缓冲）喵~"""
+    # 取规则列表喵
+    rules = parse_config(make_config_dict()).rules
+    # 造一条真实世界里的 429 错误消息喵
+    body = "status_code=429, key sk-3ce*** has reached its rolling 1h usage quota; refreshes in 6 minutes"
+    # 让规则引擎决策喵
+    decision = decide(rules, 429, body)
+    # 动作应该是冻结喵
+    assert decision.action == "freeze"
+    # 冻结时长应该是 6 分钟 + 5 秒缓冲 = 365 秒喵
+    assert decision.freeze_seconds == pytest.approx(365.0)
+
+
+def test_抽取不到时长就用兜底值():
+    """429 但消息里没写恢复时间时，应该走后面那条 retry 规则喵~"""
+    # 取规则列表喵
+    rules = parse_config(make_config_dict()).rules
+    # 造一条不含恢复时间的 429 消息喵
+    decision = decide(rules, 429, "rate limit exceeded")
+    # 第一条 freeze 规则要求正则命中，没命中就该落到第二条 retry 规则上——
+    # 但第二条只匹配 5xx，所以最终会落到默认动作 next 喵
+    assert decision.action == "next"
+
+
+def test_Retry_After头会被用作冻结时长():
+    """规则没配捕获组时，应该退而使用上游的 Retry-After 头喵~"""
+    # 造一条只按状态码冻结、不抽取捕获组的规则喵
+    data = make_config_dict(rules=[{"match": {"status": 429}, "action": "freeze", "freeze_seconds": 999}])
+    # 取规则列表喵
+    rules = parse_config(data).rules
+    # 决策时带上 Retry-After 头喵
+    decision = decide(rules, 429, "too many requests", retry_after="30")
+    # 应该用头里的 30 秒加 5 秒缓冲，而不是兜底的 999 秒喵
+    assert decision.freeze_seconds == pytest.approx(35.0)
+
+
+def test_五百开头的错误走原地重试():
+    """5xx 通常是上游抖动，原地重试比换渠道更划算喵~"""
+    # 取规则列表喵
+    rules = parse_config(make_config_dict()).rules
+    # 对 502 做决策喵
+    decision = decide(rules, 502, "bad gateway")
+    # 动作应该是重试喵
+    assert decision.action == "retry"
+    # 最大尝试次数应该是配置里的 2 喵
+    assert decision.max_attempts == 2
+
+
+def test_四百原样回传不做转移():
+    """400 是客户端自己请求写错了，换渠道也没用喵~"""
+    # 取规则列表喵
+    rules = parse_config(make_config_dict()).rules
+    # 对 400 做决策喵
+    decision = decide(rules, 400, "invalid messages field")
+    # 动作应该是原样回传喵
+    assert decision.action == "passthrough"
+
+
+def test_没规则命中时走默认换候选():
+    """默认动作必须是最保守的 next 喵~"""
+    # 取规则列表喵
+    rules = parse_config(make_config_dict()).rules
+    # 用一个没有任何规则覆盖的状态码做决策喵
+    decision = decide(rules, 418, "i am a teapot")
+    # 应该落到默认动作喵
+    assert decision.action == "next"
+
+
+def test_规则顺序决定优先级():
+    """靠前的规则应该先命中，这样才能用 rule mv 调整优先级喵~"""
+    # 造两条都能匹配 429 的规则，第一条是 next 第二条是 freeze 喵
+    data = make_config_dict(
+        rules=[
+            {"match": {"status": 429}, "action": "next"},
+            {"match": {"status": 429}, "action": "freeze", "freeze_seconds": 60},
+        ]
+    )
+    # 取规则列表喵
+    rules = parse_config(data).rules
+    # 决策结果应该是靠前那条的动作喵
+    assert decide(rules, 429, "").action == "next"
+
+
+# ============ 3. SSE 流探测喵 ============
+
+
+def sse(*payloads: str) -> bytes:
+    """把若干个 data 负载拼成标准的 SSE 字节流喵~"""
+    # 每条负载一行 data:，后面跟一个空行做事件分隔，这是 SSE 的规范格式喵
+    return "".join(f"data: {p}\n\n" for p in payloads).encode("utf-8")
+
+
+class 分块字节流(httpx.AsyncByteStream):
+    """
+    一个真正分块吐字节的假上游流喵~
+
+    为什么必须要它：httpx.Response(200, content=b"...") 会把内容整块存在内存里，
+    重复迭代也不会报错。这会掩盖「同一条流被迭代两次」这种线上必炸的 bug
+    （真上游会直接抛 StreamConsumed）。所以这里实现一个只能迭代一次、且分多块吐出的流，
+    让测试环境的行为和真实上游一致喵。
+    """
+
+    def __init__(self, data: bytes, chunk_size: int = 16) -> None:
+        """记下要吐的数据和每块大小喵~"""
+        # 要吐出的完整字节喵
+        self._data = data
+        # 每块多大，故意设得很小以模拟真实网络的碎片化喵
+        self._chunk_size = chunk_size
+        # 是否已经被迭代过，用来模拟真上游「流只能读一次」的语义喵
+        self._consumed = False
+
+    async def __aiter__(self):
+        """按块吐出字节，第二次迭代直接报错喵~"""
+        # 喵~防御：已经被读过一次就抛错，模拟 httpx 对真实流的 StreamConsumed 行为喵
+        if self._consumed:
+            raise RuntimeError("这条流已经被读过一次了喵，不能重复迭代~")
+        # 标记为已读喵
+        self._consumed = True
+        # 按固定大小切块吐出喵
+        for i in range(0, len(self._data), self._chunk_size):
+            # 吐出一块喵
+            yield self._data[i : i + self._chunk_size]
+
+
+def 流式响应(data: bytes) -> httpx.Response:
+    """造一个用真正分块流承载 SSE 的响应喵~"""
+    # 用自定义的分块流当响应体，content-type 设成 SSE 的标准值喵
+    return httpx.Response(
+        200,
+        stream=分块字节流(data),
+        headers={"content-type": "text/event-stream"},
+    )
+
+
+def test_识别OpenAI风格的内容():
+    """OpenAI 的 delta.content 有字就该判定为健康喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 喂一个带内容的 chunk 喵
+    verdict = probe.feed(sse(json.dumps({"choices": [{"delta": {"content": "你好"}}]})))
+    # 应该判定为有内容喵
+    assert verdict == VERDICT_CONTENT
+
+
+def test_识别Anthropic风格的内容():
+    """Anthropic 的 content_block_delta.text 有字就该判定为健康喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 造一个 Anthropic 风格的内容增量事件喵
+    event = json.dumps({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "你好"}})
+    # 喂进去喵
+    assert probe.feed(sse(event)) == VERDICT_CONTENT
+
+
+def test_识别推理模型的思维链内容():
+    """推理模型先吐 reasoning_content，这也算流是健康的喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 造一个只有思维链没有正文的增量喵
+    event = json.dumps({"choices": [{"delta": {"reasoning_content": "让我想想"}}]})
+    # 应该判定为有内容喵
+    assert probe.feed(sse(event)) == VERDICT_CONTENT
+
+
+def test_识别工具调用也算健康():
+    """模型在调工具时 content 是空的，但流是健康的，不能误判喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 造一个只有 tool_calls 的增量喵
+    event = json.dumps({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "x"}]}}]})
+    # 应该判定为有内容喵
+    assert probe.feed(sse(event)) == VERDICT_CONTENT
+
+
+def test_空的角色占位包不算内容():
+    """很多上游首包只有 role 没有内容，此时还不能放行喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 造一个只有 role、content 为空串的首包喵
+    event = json.dumps({"choices": [{"delta": {"role": "assistant", "content": ""}}]})
+    # 应该还是 pending，需要继续等真正的内容喵
+    assert probe.feed(sse(event)) == VERDICT_PENDING
+
+
+def test_只有DONE没有内容判定为假成功():
+    """这是最重要的一个用例：200 但一个字都没吐，必须能识别出来喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 只喂一个 [DONE] 喵
+    verdict = probe.feed(sse("[DONE]"))
+    # 应该判定为空流喵
+    assert verdict == VERDICT_DONE_EMPTY
+
+
+def test_流里的error事件能被识别():
+    """上游在流里报错也必须能识别，否则错误会被当成正常内容转给客户端喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 造一个带 error 字段的负载喵
+    event = json.dumps({"error": {"message": "insufficient quota"}})
+    # 应该判定为错误喵
+    assert probe.feed(sse(event)) == VERDICT_ERROR
+    # 错误说明里应该带上上游的原始消息，方便规则引擎做正则匹配喵
+    assert "insufficient quota" in probe.detail
+
+
+def test_连接被提前掐断判定为假成功():
+    """流读完了却没有任何内容也没有结束标记，同样是假成功喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 只喂一个元信息事件，没有内容也没有结束标记喵
+    probe.feed(sse(json.dumps({"type": "message_start"})))
+    # 此时还是 pending 喵
+    assert probe.verdict == VERDICT_PENDING
+    # 流结束了，finish 应该判定为空流喵
+    assert probe.finish() == VERDICT_DONE_EMPTY
+
+
+def test_跨块被切断的行能正确拼接():
+    """
+    这是最容易出 bug 的地方喵：上游的 TCP 分块边界和 SSE 行边界毫无关系，
+    一行 data: 被切成两半时必须能拼回来喵。
+    """
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 造完整的字节流喵
+    full = sse(json.dumps({"choices": [{"delta": {"content": "喵"}}]}))
+    # 在正中间切开喵
+    mid = len(full) // 2
+    # 喂前半段，应该还看不出结果喵
+    assert probe.feed(full[:mid]) == VERDICT_PENDING
+    # 喂后半段，拼起来之后应该能识别出内容喵
+    assert probe.feed(full[mid:]) == VERDICT_CONTENT
+
+
+def test_跨块被切断的中文字符不会乱码():
+    """
+    UTF-8 的中文占 3 个字节，被切开时用普通 decode 会抛异常或出乱码，
+    必须靠增量解码器正确处理喵。
+    """
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 造一个内容是中文的字节流喵
+    full = sse(json.dumps({"choices": [{"delta": {"content": "早上好"}}]}, ensure_ascii=False))
+    # 逐字节喂进去，这是最极端的切分方式喵
+    verdicts = [probe.feed(full[i : i + 1]) for i in range(len(full))]
+    # 最终应该能识别出内容，说明中文没被切坏喵
+    assert VERDICT_CONTENT in verdicts
+
+
+def test_非JSON的心跳行不会误判():
+    """有些上游会插入注释行或心跳，绝不能因为解析不了就误判成失败喵~"""
+    # 造一个探测器喵
+    probe = StreamProbe()
+    # 喂一个 SSE 注释行（冒号开头）和一个非 JSON 的 data 行喵
+    assert probe.feed(b": keep-alive\n\ndata: ping\n\n") == VERDICT_PENDING
+
+
+# ============ 4. 运行时状态：冻结机制喵 ============
+
+
+def make_state() -> RuntimeState:
+    """造一个装好测试配置的运行时状态喵~"""
+    # 用测试配置创建状态对象喵
+    return RuntimeState(parse_config(make_config_dict()))
+
+
+def test_冻结与解冻():
+    """冻结后应该查得到剩余时间，解冻后应该立刻可用喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 一开始不该被冻结喵
+    assert state.is_frozen(candidate) == 0
+    # 冻结 60 秒喵
+    state.freeze(candidate, 60, "额度用尽")
+    # 现在应该查到还剩接近 60 秒喵
+    assert 55 < state.is_frozen(candidate) <= 60
+    # 手动解冻喵
+    state.unfreeze(candidate)
+    # 现在应该可用了喵
+    assert state.is_frozen(candidate) == 0
+
+
+def test_冻结会自动过期():
+    """冻结时间到了应该自动失效，不需要后台清理任务喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 冻结一个极短的时间喵
+    state.freeze(candidate, 0.05, "短暂冻结")
+    # 立刻查应该还在冻结中喵
+    assert state.is_frozen(candidate) > 0
+    # 等它过期喵
+    time.sleep(0.1)
+    # 现在应该自动失效了喵
+    assert state.is_frozen(candidate) == 0
+
+
+def test_成功一次会自动解冻():
+    """候选成功证明它已经恢复，应该立刻解冻而不是等倒计时走完喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 先冻结很久喵
+    state.freeze(candidate, 3600, "额度用尽")
+    # 确认真的冻上了喵
+    assert state.is_frozen(candidate) > 0
+    # 记一次成功喵
+    state.record_success(candidate)
+    # 应该立刻解冻喵
+    assert state.is_frozen(candidate) == 0
+
+
+def test_同一个key在不同虚拟模型里共享冻结():
+    """冻结是全局的，同一个 (地址,key,模型) 三元组在哪个虚拟模型里都该被跳过喵~"""
+    # 造两个内容完全相同的候选对象喵
+    a = Candidate(name="甲", base_url="https://x.test", api_key="sk-1", model="m")
+    b = Candidate(name="乙", base_url="https://x.test", api_key="sk-1", model="m")
+    # 造状态喵
+    state = make_state()
+    # 冻结第一个喵
+    state.freeze(a, 60, "额度用尽")
+    # 第二个也应该被认为在冻结中，因为身份串相同喵
+    assert state.is_frozen(b) > 0
+
+
+def test_不同key独立冻结():
+    """额度是按 key 算的，所以同一个地址的两个 key 必须独立冻结喵~"""
+    # 造两个只有 key 不同的候选喵
+    a = Candidate(name="甲", base_url="https://x.test", api_key="sk-1", model="m")
+    b = Candidate(name="乙", base_url="https://x.test", api_key="sk-2", model="m")
+    # 造状态喵
+    state = make_state()
+    # 只冻结第一个喵
+    state.freeze(a, 60, "额度用尽")
+    # 第二个应该完全不受影响喵
+    assert state.is_frozen(b) == 0
+
+
+# ============ 5. 请求构造喵 ============
+
+
+def test_只替换顶层model其余字段原样保留():
+    """透传的核心：除了 model，别的字段一个都不能动喵~"""
+    # 造一个带各种字段的请求体喵
+    body = {
+        "model": "auto-test",
+        "messages": [{"role": "user", "content": "你好"}],
+        "temperature": 0.7,
+        "custom_upstream_field": {"nested": True},
+    }
+    # 造一个候选喵
+    candidate = Candidate(name="测试", base_url="https://x.test", api_key="sk-1", model="真实模型名")
+    # 构造上游请求体并解析回来喵
+    result = json.loads(build_upstream_body(body, candidate))
+    # model 应该被换成候选的真实模型名喵
+    assert result["model"] == "真实模型名"
+    # 其余字段应该一字不差地保留喵
+    assert result["messages"] == body["messages"]
+    assert result["temperature"] == 0.7
+    assert result["custom_upstream_field"] == {"nested": True}
+    # 原始字典不应该被改动，因为它后面还要用于日志喵
+    assert body["model"] == "auto-test"
+
+
+def test_bearer风格的鉴权头():
+    """OpenAI 系应该用 Authorization: Bearer 喵~"""
+    # 造一个 bearer 风格的候选喵
+    candidate = Candidate(name="测试", base_url="https://x.test", api_key="sk-abc", model="m", auth_style="bearer")
+    # 构造请求头，客户端原本带的是别人的 key 喵
+    headers = build_upstream_headers({"authorization": "Bearer 客户端的key", "x-custom": "保留我"}, candidate)
+    # 应该被换成候选自己的 key 喵
+    assert headers["Authorization"] == "Bearer sk-abc"
+    # 客户端的自定义头应该被透传保留喵
+    assert headers["x-custom"] == "保留我"
+
+
+def test_anthropic风格的鉴权头会补版本号():
+    """Anthropic 系必须带 anthropic-version，否则上游直接 400 喵~"""
+    # 造一个 x-api-key 风格的候选喵
+    candidate = Candidate(name="测试", base_url="https://x.test", api_key="sk-ant", model="m", auth_style="x-api-key")
+    # 构造请求头喵
+    headers = build_upstream_headers({}, candidate)
+    # 应该用 x-api-key 头喵
+    assert headers["x-api-key"] == "sk-ant"
+    # 应该自动补上版本号喵
+    assert "anthropic-version" in headers
+
+
+def test_逐跳头会被剔除():
+    """host 和 content-length 这类头绝不能原样转发，否则上游会路由错或读取截断喵~"""
+    # 造一个候选喵
+    candidate = Candidate(name="测试", base_url="https://x.test", api_key="sk-1", model="m")
+    # 构造请求头，故意带上一堆逐跳头喵
+    headers = build_upstream_headers(
+        {"host": "localhost:8787", "content-length": "123", "connection": "keep-alive"}, candidate
+    )
+    # 这些头都应该被剔除喵
+    assert "host" not in headers
+    assert "content-length" not in headers
+    assert "connection" not in headers
+
+
+def test_识别流式标记():
+    """两种协议都用顶层 stream 字段，还要兼容写成字符串的客户端喵~"""
+    # 标准布尔真值喵
+    assert detect_stream_flag({"stream": True}) is True
+    # 标准布尔假值喵
+    assert detect_stream_flag({"stream": False}) is False
+    # 字段缺失时按非流式处理喵
+    assert detect_stream_flag({}) is False
+    # 兼容写成字符串的情况喵
+    assert detect_stream_flag({"stream": "true"}) is True
+
+
+def test_请求体非法会被拒绝():
+    """空体、非 JSON、顶层不是对象，三种都要挡下来喵~"""
+    # 空请求体喵
+    with pytest.raises(ValueError, match="为空"):
+        parse_client_body(b"")
+    # 非 JSON 喵
+    with pytest.raises(ValueError, match="合法的 JSON"):
+        parse_client_body(b"not json at all")
+    # 顶层是数组喵
+    with pytest.raises(ValueError, match="必须是对象"):
+        parse_client_body(b"[1, 2, 3]")
+
+
+# ============ 6. 端到端故障转移喵 ============
+
+
+def make_client(handler) -> httpx.AsyncClient:
+    """
+    造一个假装成上游的 httpx 客户端喵~
+
+    输入：handler 是个函数，接收 httpx.Request 返回 httpx.Response，用来模拟各种上游行为
+    输出：走 MockTransport 的异步客户端，完全不会发出真实网络请求喵
+    """
+    # 用 MockTransport 把所有请求都路由到 handler 上喵
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def run_proxy(client: httpx.AsyncClient, state: RuntimeState, body: dict) -> object:
+    """跑一次完整的编排流程，简化各个测试的样板代码喵~"""
+    # 调用编排层，路径和头都用最小可用的值喵
+    return await handle_request(
+        # 假上游客户端喵
+        client,
+        # 运行时状态喵
+        state,
+        # 请求方法喵
+        "POST",
+        # 请求路径喵
+        "v1/chat/completions",
+        # 没有查询串喵
+        "",
+        # 请求头喵
+        {"content-type": "application/json"},
+        # 请求体字节喵
+        json.dumps(body).encode("utf-8"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_未配置的虚拟模型返回400():
+    """未命中虚拟模型表就该回 400，并列出可用的名字喵~"""
+    # 造状态和一个永远成功的假上游喵
+    state = make_state()
+    client = make_client(lambda req: httpx.Response(200, json={"ok": True}))
+    # 请求一个没配过的模型喵
+    outcome = await run_proxy(client, state, {"model": "根本不存在的模型"})
+    # 应该失败且状态码是 400 喵
+    assert outcome.success is False
+    assert outcome.status == 400
+    # 错误体里应该列出可用的虚拟模型喵
+    assert "auto-test" in outcome.error_body["error"]["available_models"]
+
+
+@pytest.mark.asyncio
+async def test_第一个候选成功就不碰第二个():
+    """严格优先级：链首能用就绝不降级喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：一律成功喵~"""
+        # 记下被请求的主机名喵
+        hits.append(request.url.host)
+        # 返回一个正常的非流式响应喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "你好"}}]})
+
+    # 造状态和假上游喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该成功喵
+    assert outcome.success is True
+    # 只应该打了一次，且打的是链首那个喵
+    assert hits == ["primary.test"]
+
+
+@pytest.mark.asyncio
+async def test_第一个候选401时自动换第二个():
+    """401 说明这个 key 没救了，应该立刻换下一个候选喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力回 401，备用回正常内容喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力地址一律返回 401 喵
+        if request.url.host == "primary.test":
+            return httpx.Response(401, json={"error": {"message": "invalid api key"}})
+        # 备用地址返回正常响应，内容里放个 ASCII 标记方便断言喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "FROM-BACKUP"}}]})
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 最终应该成功喵
+    assert outcome.success is True
+    # 应该先打主力再打备用喵
+    assert hits == ["primary.test", "backup.test"]
+    # 返回给客户端的内容应该来自备用喵
+    assert b"FROM-BACKUP" in outcome.attempt.body
+
+
+@pytest.mark.asyncio
+async def test_额度用尽会冻结候选():
+    """带恢复时间的 429 应该把候选按上游说的时长冻结起来喵~"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力报额度用尽，备用正常喵~"""
+        # 主力返回真实世界里那种带恢复时间的 429 喵
+        if request.url.host == "primary.test":
+            return httpx.Response(
+                429,
+                text="status_code=429, key sk-3ce*** has reached its rolling 1h usage quota; refreshes in 6 minutes",
+            )
+        # 备用正常喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "备用顶上"}}]})
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该靠备用成功喵
+    assert outcome.success is True
+    # 主力应该被冻结了，且时长接近 6 分钟喵
+    primary = state.config.virtual_models["auto-test"][0]
+    assert 350 < state.is_frozen(primary) <= 365
+
+
+@pytest.mark.asyncio
+async def test_被冻结的候选会被跳过():
+    """已经冻结的候选不该再被打，这样才不会每条请求都去撞一次额度墙喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：一律成功喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 返回正常响应喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态喵
+    state = make_state()
+    # 手动把主力冻结起来喵
+    state.freeze(state.config.virtual_models["auto-test"][0], 300, "测试用冻结")
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该成功喵
+    assert outcome.success is True
+    # 应该直接打备用，完全没碰主力喵
+    assert hits == ["backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_四百原样回传给客户端():
+    """400 是客户端自己的问题，不该白白把整条链试一遍喵~"""
+    # 记录请求次数喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：一律返回 400 喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 返回 400 喵
+        return httpx.Response(400, json={"error": {"message": "messages 字段格式不对"}})
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 走 passthrough 路径，所以 success 是 True 但状态码是上游的 400 喵
+    assert outcome.success is True
+    assert outcome.attempt.status == 400
+    # 只该打一次，绝不能把备用也试一遍喵
+    assert hits == ["primary.test"]
+
+
+@pytest.mark.asyncio
+async def test_所有候选都失败时返回502():
+    """整条链用尽应该回 502，并附上每个候选各自的失败原因喵~"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：一律 401 喵~"""
+        # 所有地址都返回 401 喵
+        return httpx.Response(401, json={"error": {"message": "invalid key"}})
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该失败且状态码是 502 喵
+    assert outcome.success is False
+    assert outcome.status == 502
+    # 错误体里应该有两条失败记录，对应两个候选喵
+    assert len(outcome.error_body["error"]["attempts"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_五百错误会先原地重试再换候选():
+    """5xx 应该在同一个候选上退避重试，次数用尽才降级喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力一直 503，备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力一直挂喵
+        if request.url.host == "primary.test":
+            return httpx.Response(503, text="service unavailable")
+        # 备用正常喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 最终应该靠备用成功喵
+    assert outcome.success is True
+    # 主力应该被试了 2 次（配置里 max_attempts=2），然后才换到备用喵
+    assert hits == ["primary.test", "primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_假成功的流会被转移():
+    """
+    这是整个项目最核心的用例喵：上游回了 200 并开始吐 SSE，但流里一个字都没有。
+    代理必须识别出来并换下一个候选，而且客户端完全感知不到喵。
+    """
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力回一个只有 [DONE] 的空流，备用回正常的内容流喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力：200 但流里只有 [DONE]，典型的假成功喵
+        if request.url.host == "primary.test":
+            return 流式响应(sse("[DONE]"))
+        # 备用：正常的内容流喵
+        return 流式响应(sse(json.dumps({"choices": [{"delta": {"content": "真的内容"}}]}), "[DONE]"))
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次流式编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 最终应该成功，且被识别为流式喵
+    assert outcome.success is True
+    assert outcome.is_stream is True
+    # 应该先试主力发现是假成功，再换到备用喵
+    assert hits == ["primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_流里带error事件也会被转移():
+    """上游在流里报错同样要能转移喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力在流里报错，备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力：200 但流里塞了 error 事件喵
+        if request.url.host == "primary.test":
+            return 流式响应(sse(json.dumps({"error": {"message": "insufficient quota"}})))
+        # 备用：正常内容喵
+        return 流式响应(sse(json.dumps({"choices": [{"delta": {"content": "好的"}}]}), "[DONE]"))
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次流式编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 应该靠备用成功喵
+    assert outcome.success is True
+    assert hits == ["primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_健康的流会一字不差地转发():
+    """
+    放行后的字节序列必须和上游原始输出完全一致，包括探测阶段已经读掉的那部分喵。
+    这是「先缓冲后replay」这个设计是否正确的关键验证喵。
+    """
+    # 造一个多块内容的正常流喵
+    payloads = [
+        json.dumps({"choices": [{"delta": {"role": "assistant", "content": ""}}]}),
+        json.dumps({"choices": [{"delta": {"content": "第一段"}}]}),
+        json.dumps({"choices": [{"delta": {"content": "第二段"}}]}),
+        "[DONE]",
+    ]
+    # 拼成完整的原始字节流喵
+    original = sse(*payloads)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：用真正的分块流回这条正常内容喵~"""
+        # 用分块流承载，每块只有 16 字节，故意让 SSE 行边界被切碎喵
+        return 流式响应(original)
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次流式编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 应该成功喵
+    assert outcome.success is True
+    # 引入字节流生成器喵
+    from autoapi.upstream import iter_upstream_bytes
+    # 把生成器吐出的所有字节拼起来喵
+    collected = b""
+    # 逐块收集喵
+    async for chunk in iter_upstream_bytes(outcome.attempt):
+        collected += chunk
+    # 收到的字节必须和上游原始输出一字不差喵
+    assert collected == original
+
+
+@pytest.mark.asyncio
+async def test_网络错误会被转移():
+    """连不上上游时应该换下一个候选，而不是把异常抛给客户端喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力直接抛连接错误，备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力：模拟连接失败喵
+        if request.url.host == "primary.test":
+            raise httpx.ConnectError("连接被拒绝", request=request)
+        # 备用：正常响应喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该靠备用成功，异常不该穿透出来喵
+    assert outcome.success is True
+    assert hits == ["primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_非流式的200里带error也算假成功():
+    """有些中转站出错时也回 200，把错误塞进 body，这种要能识别喵~"""
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力回 200 但 body 里带 error，备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力：200 但内容是错误喵
+        if request.url.host == "primary.test":
+            return httpx.Response(200, json={"error": {"message": "insufficient quota"}})
+        # 备用：正常响应喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态喵
+    state = make_state()
+    # 跑一次编排喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该识别出假成功并换到备用喵
+    assert outcome.success is True
+    assert hits == ["primary.test", "backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_并发请求能正常处理():
+    """
+    验证并发能力喵：同时发 60 条请求（对应 60rpm 全部挤在同一秒的极端情况），
+    全部都该正常完成，且状态统计准确喵。
+    """
+    # 引入 asyncio 用于并发喵
+    import asyncio
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：一律成功喵~"""
+        # 返回正常响应喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态和假上游喵
+    state = make_state()
+    client = make_client(handler)
+    # 同时发 60 条请求喵
+    outcomes = await asyncio.gather(
+        *(run_proxy(client, state, {"model": "auto-test"}) for _ in range(60))
+    )
+    # 全部都该成功喵
+    assert all(o.success for o in outcomes)
+    # 统计里应该正好记了 60 条请求喵
+    assert state.total_requests == 60

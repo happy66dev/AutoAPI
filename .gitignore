@@ -1,0 +1,17 @@
+# 真实配置文件里存着上游 api key，绝对不能提交到 git 喵~
+config.yaml
+
+# Python 编译缓存喵
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境目录喵
+.venv/
+venv/
+
+# pytest 缓存喵
+.pytest_cache/
+
+# 运行日志喵
+*.log

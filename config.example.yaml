@@ -1,0 +1,98 @@
+# ===== autoapi 代理配置模板喵 =====
+# 用法：复制成 config.yaml 再填自己的真 key 喵（config.yaml 已被 gitignore 保护）
+
+server:
+  # 只监听本地回环地址，代理内存着所有上游真 key，绝对不要改成 0.0.0.0 喵
+  host: 127.0.0.1
+  # 代理对外提供服务的端口喵
+  port: 8787
+  # 单次上游请求的总超时，单位：秒（流式场景指整条流读完的上限）喵
+  request_timeout: 300
+  # 等上游吐出第一个有效内容字符的超时，单位：秒。超时就换下一个候选喵
+  first_content_timeout: 45
+  # 连接上游的握手超时，单位：秒喵
+  connect_timeout: 15
+  # 配置文件热重载的轮询间隔，单位：秒。设为 0 表示关闭自动重载喵
+  reload_poll_interval: 2.0
+
+# ===== 虚拟模型表喵 =====
+# key 是客户端请求体里要填的 model 名字，value 是按优先级排好的候选链
+# 每条请求永远从链首开始，跳过被冻结的候选，往下找第一个可用的喵
+virtual_models:
+  auto-strong:
+    - name: 官方直连                              # 候选的human可读名字，日志和 REPL 里显示用喵
+      base_url: https://api.openai.com            # 上游根地址，客户端请求的路径会原样拼在后面喵
+      api_key: sk-REPLACE-ME-1                    # 该上游的真实 api key 喵
+      model: gpt-4o                               # 替换进请求体顶层 model 字段的真实模型名喵
+      auth_style: bearer                          # 鉴权头风格：bearer 表示 Authorization: Bearer xxx 喵
+    - name: 中转A
+      base_url: https://relay-a.example.com
+      api_key: sk-REPLACE-ME-2
+      model: gpt-4o
+      auth_style: bearer
+    - name: Claude兜底
+      base_url: https://api.anthropic.com
+      api_key: sk-ant-REPLACE-ME-3
+      model: claude-sonnet-4-20250514
+      auth_style: x-api-key                       # x-api-key 风格会同时自动补 anthropic-version 头喵
+
+  auto-cheap:
+    - name: 廉价中转
+      base_url: https://relay-b.example.com
+      api_key: sk-REPLACE-ME-4
+      model: gpt-4o-mini
+      auth_style: bearer
+
+# ===== 规则引擎喵 =====
+# 自上而下匹配，第一条命中的规则决定动作，四种动作含义：
+#   retry       同一个候选内指数退避重试，重试用尽还失败才换下一个候选喵
+#   next        立刻放弃这个候选，换下一个喵
+#   freeze      全局冻结这个候选一段时间（所有虚拟模型都跳过它），然后换下一个喵
+#   passthrough 不转移，把上游的响应原样回传给客户端喵
+# match 里可写 status（整数或整数列表）和 body_regex（对响应体做正则搜索）
+# 两个特殊状态值：network 表示连不上/超时，bad_stream 表示 200 但流里没有有效内容喵
+rules:
+  # 额度用尽且上游明确告知几分钟后恢复，就照它说的分钟数精确冻结喵
+  - match:
+      status: 429
+      body_regex: 'refreshes?\s+in\s+(\d+)\s+minutes?'
+    action: freeze
+    freeze_from_group: 1        # 用正则第 1 个捕获组的数字当冻结时长喵
+    freeze_unit: minutes        # 捕获到的数字单位是分钟喵
+    freeze_seconds: 300         # 万一没抽取到数字，退回冻结这么多秒喵
+
+  # 其余 429 限流：先原地退避重试几次，通常几秒后就放行了喵
+  - match:
+      status: 429
+    action: retry
+    max_attempts: 3             # 含首次共尝试 3 次喵
+    backoff_base: 2.0           # 退避基数，第 n 次等待 backoff_base^n 秒喵
+
+  # 上游 5xx 抖动，原地重试比换渠道更划算喵
+  - match:
+      status: [500, 502, 503, 504, 520, 524]
+    action: retry
+    max_attempts: 3
+    backoff_base: 1.5
+
+  # 网络层连不上或超时，重试两次再换喵
+  - match:
+      status: network
+    action: retry
+    max_attempts: 2
+    backoff_base: 1.0
+
+  # 200 假成功但流里一个字都没吐，直接换下一个候选喵
+  - match:
+      status: bad_stream
+    action: next
+
+  # key 无效、无权限、模型不存在，这个候选没救了，直接换喵
+  - match:
+      status: [401, 403, 404]
+    action: next
+
+  # 400 通常是客户端自己请求体写错了，换渠道也没用，原样回传让客户端自己看喵
+  - match:
+      status: 400
+    action: passthrough
