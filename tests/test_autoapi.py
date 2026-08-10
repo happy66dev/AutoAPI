@@ -40,6 +40,8 @@ from autoapi.config import (
 )
 # 引入被测的编排层喵
 from autoapi.proxy import detect_stream_flag, handle_request, parse_client_body
+# 引入 count_tokens 路径识别函数，验证它不会触发自动避险喵
+from autoapi.proxy import _is_count_tokens_request
 # 引入被测的规则引擎喵
 from autoapi.rules import decide
 # 引入被测的 SSE 探测器喵
@@ -1838,6 +1840,83 @@ async def test_非流式超过总预算会被判超时():
     assert "总预算" in result.error_text
 
 
+@pytest.mark.asyncio
+async def test_目标模式首轮失败后第二轮成功(monkeypatch):
+    """目标模式应从链首循环，第二轮成功时不返回错误喵~"""
+    # 让每轮等待 5 秒立即推进，不让测试真实等待喵
+    sleep_calls: list[float] = []
+    async def fake_sleep(seconds: float) -> None:
+        # 记录目标模式固定的轮次间隔喵
+        sleep_calls.append(seconds)
+    # 替换 proxy 模块里的异步睡眠喵
+    monkeypatch.setattr("autoapi.proxy.asyncio.sleep", fake_sleep)
+    # 记录请求顺序喵
+    hits: list[str] = []
+    request_count = 0
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        hits.append(request.url.host)
+        # 第一轮返回失败，第二轮成功喵
+        if request_count == 1:
+            return httpx.Response(503, json={"error": "暂时不可用"})
+        return httpx.Response(200, json={"ok": True, "usage": {"total_tokens": 3}})
+    # 造状态并开启目标模式喵
+    state = make_state()
+    state.set_target_mode(True)
+    # 运行完整请求喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 第二轮成功，客户端不应看到失败喵
+    assert outcome.success is True
+    assert request_count == 2
+    # 目标模式等待间隔应包含候选内部已有的重试退避；这里第一轮 503 先重试 1 秒喵
+    assert sleep_calls == [1.0]
+
+
+@pytest.mark.asyncio
+async def test_目标模式截止后返回429(monkeypatch):
+    """目标模式超过 5 分钟后应返回 429，并附诊断信息喵~"""
+    current_time = 1000.0
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+    def fake_monotonic() -> float:
+        return current_time
+    # 注入单调时钟与睡眠，压缩 5 分钟测试时间喵
+    monkeypatch.setattr("autoapi.proxy.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("autoapi.proxy.asyncio.sleep", fake_sleep)
+    # 永远失败的上游喵
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+    # 造状态并开启目标模式喵
+    state = make_state()
+    state.set_target_mode(True)
+    # 运行请求喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 目标模式应该返回 429 而不是 502 喵
+    assert outcome.success is False
+    assert outcome.status == 429
+    error = outcome.error_body["error"]
+    assert error["target_mode"] is True
+    assert error["type"] == "target_mode_all_unavailable"
+    assert error["rounds"] >= 2
+    assert error["waited_seconds"] == 300.0
+
+
+def test_目标模式开关默认关闭且不写配置():
+    """目标模式是纯内存开关，默认关闭且不进入配置对象喵~"""
+    # 造状态喵
+    state = make_state()
+    # 默认必须关闭喵
+    assert state.target_mode_enabled is False
+    # 开启和关闭应返回新状态喵
+    assert state.set_target_mode(True) is True
+    assert state.target_mode_enabled is True
+    assert state.set_target_mode(False) is False
+    # 配置对象不应出现 target_mode 字段喵
+    assert not hasattr(state.config.server, "target_mode")
+
+
 # ============ 7. 自动避险喵 ============
 
 
@@ -2033,7 +2112,49 @@ async def test_避险后不会继续原地重试():
     assert hits == ["primary.test", "backup.test"]
 
 
-# ============ 8. 交互区的冻结表横幅喵 ============
+def test_count_tokens请求只精确匹配():
+    """只有 POST /v1/messages/count_tokens 才跳过自动避险累计喵~"""
+    # 精确接口应被识别喵
+    assert _is_count_tokens_request("POST", "/v1/messages/count_tokens") is True
+    # 方法不同不能误判喵
+    assert _is_count_tokens_request("GET", "/v1/messages/count_tokens") is False
+    # 路径不同不能误判喵
+    assert _is_count_tokens_request("POST", "/v1/messages") is False
+
+
+@pytest.mark.asyncio
+async def test_count_tokens错误不触发自动避险():
+    """count_tokens 连续错误不应累加阈值或冻结候选，但仍返回原有错误结果喵~"""
+    # 让上游 count_tokens 始终返回错误喵
+    def handler(request: httpx.Request) -> httpx.Response:
+        # 返回接口错误，模拟 token 计数服务不可用喵
+        return httpx.Response(400, json={"error": {"message": "count tokens failed"}})
+
+    # 设置很低阈值，确保错误累计会立即暴露喵
+    config_data = make_config_dict()
+    config_data["server"]["auto_hedge_threshold"] = 1
+    # 创建运行状态喵
+    state = RuntimeState(parse_config(config_data))
+    # 连续发送两次 count_tokens 请求喵
+    for _ in range(2):
+        outcome = await handle_request(
+            make_client(handler),
+            state,
+            "POST",
+            "/v1/messages/count_tokens",
+            "",
+            {},
+            # 请求体必须传原始 JSON 字节，模拟 server 的真实调用方式喵
+            json.dumps({"model": "auto-test", "messages": []}).encode("utf-8"),
+        )
+        # count_tokens 命中 passthrough 时由编排层原样返回该错误响应喵
+        assert outcome.attempt is not None
+        assert outcome.attempt.status == 400
+    # 取首个候选确认没有被自动避险冻结喵
+    candidate = state.config.virtual_models["auto-test"][0]
+    assert state.is_frozen(candidate) == 0
+
+
 
 
 def test_倒计时格式():

@@ -52,6 +52,16 @@ from .upstream import AttemptResult, try_candidate
 logger = logging.getLogger("autoapi.proxy")
 
 
+# count_tokens 只做 token 计数，不代表 LLM 输出能力喵~
+def _is_count_tokens_request(method: str, path: str) -> bool:
+    """判断请求是否为 Anthropic 的 token 计数接口喵~"""
+    # 统一方法和路径格式，兼容大小写与多余斜杠喵
+    normalized_method = method.upper().strip()
+    normalized_path = "/" + path.strip().lstrip("/")
+    # 仅精确匹配 POST /v1/messages/count_tokens，避免误伤其他接口喵
+    return normalized_method == "POST" and normalized_path == "/v1/messages/count_tokens"
+
+
 @dataclass
 class ProxyOutcome:
     """
@@ -248,11 +258,15 @@ async def _run_one_candidate(
                 )
             # 返回成功结论喵
             return "ok", result
-        # 失败了，记一笔失败，同时让它判断是否该触发自动避险喵。
-        # 阈值从配置里取，所以主人改了 auto_hedge_threshold 能立即生效喵
-        hedge_hits = state.record_failure(
-            candidate, result.error_text, config.server.auto_hedge_threshold
-        )
+        # count_tokens 错误不影响 LLM 输出能力，不计入自动避险连续失败次数喵
+        if _is_count_tokens_request(method, path):
+            hedge_hits = 0
+        # 其他请求失败仍按配置累计自动避险次数喵
+        else:
+            # 阈值从配置里取，所以主人改了 auto_hedge_threshold 能立即生效喵
+            hedge_hits = state.record_failure(
+                candidate, result.error_text, config.server.auto_hedge_threshold
+            )
         # 达到连续失败阈值，自动把这个节点冻结起来避险喵。
         # 注意这一步和下面规则引擎的决策是独立的两件事：
         #   规则引擎决定「这一次请求接下来怎么走」（重试 / 换候选 / 回传）
