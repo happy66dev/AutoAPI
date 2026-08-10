@@ -219,8 +219,35 @@ async def _run_one_candidate(
             logger.info("[%s] 成功 %s（第 %d 次尝试）喵", req_id, candidate.label, attempt_no)
             # 返回成功结论喵
             return "ok", result
-        # 失败了，先记一笔失败喵
-        state.record_failure(candidate, result.error_text)
+        # 失败了，记一笔失败，同时让它判断是否该触发自动避险喵。
+        # 阈值从配置里取，所以主人改了 auto_hedge_threshold 能立即生效喵
+        hedge_hits = state.record_failure(
+            candidate, result.error_text, config.server.auto_hedge_threshold
+        )
+        # 达到连续失败阈值，自动把这个节点冻结起来避险喵。
+        # 注意这一步和下面规则引擎的决策是独立的两件事：
+        #   规则引擎决定「这一次请求接下来怎么走」（重试 / 换候选 / 回传）
+        #   自动避险决定「这个节点接下来一段时间还要不要用」
+        # 所以即使规则说「原地重试」，节点也可能因为攒够失败次数而被冻结，
+        # 那么重试时它已经不可用、会自然跳到下一个候选，这正是我们想要的行为喵
+        if hedge_hits > 0:
+            # 把分钟换算成秒喵
+            hedge_seconds = config.server.auto_hedge_minutes * 60.0
+            # 写入冻结表，原因里写清楚是自动避险而不是上游告知的额度限制，
+            # 这样在 freeze ls 里能一眼区分两种冻结的来路喵
+            state.freeze(
+                candidate,
+                hedge_seconds,
+                f"自动避险：连续失败 {hedge_hits} 次（最近一次：{result.error_text[:120]}）",
+            )
+            # 记一条醒目的日志，把触发条件和冻结时长都写上喵
+            logger.warning(
+                "[%s] 自动避险 %s：连续失败 %d 次达到阈值，冻结 %.0f 分钟喵",
+                req_id,
+                candidate.label,
+                hedge_hits,
+                config.server.auto_hedge_minutes,
+            )
         # 问规则引擎该怎么办喵
         decision = decide(config.rules, result.status, result.error_text, result.retry_after)
         # 打一条失败日志，把状态码、决策和命中的规则都写清楚喵
@@ -245,6 +272,11 @@ async def _run_one_candidate(
                 "[%s] 冻结 %s 共 %.0f 秒喵", req_id, candidate.label, decision.freeze_seconds
             )
             # 冻结之后换下一个候选喵
+            return "next", result
+        # 喵~防御：如果这个节点刚刚被自动避险冻结了，就别再原地重试它了。
+        # 不加这个判断的话，规则说「重试」时我们会继续打一个已经被判定为不可用的节点，
+        # 白白浪费一次尝试和等待时间；直接换下一个候选才对喵
+        if hedge_hits > 0:
             return "next", result
         # 规则要求原地重试，且重试次数还没用完喵
         if decision.action == "retry" and attempt_no < decision.max_attempts:

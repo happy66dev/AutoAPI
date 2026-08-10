@@ -65,9 +65,16 @@ HELP_TEXT = """
     vm rm <虚拟模型名>                删掉一整个虚拟模型喵
 
   改服务器配置类：
-    set <字段> <值>         能改 request_timeout、first_content_timeout、
-                            connect_timeout、reload_poll_interval、port 喵
-                            （port 要重启才生效，其余立即生效）
+    set <字段> <值>         能改这些喵（port 要重启才生效，其余立即生效）：
+                              request_timeout        单次上游请求总超时（秒）
+                              first_content_timeout  一个字都没吐时的最长等待（秒）
+                              stall_timeout          探测阶段总时限，判定卡流（秒）
+                              min_content_chars      放行前要累积的内容字符数
+                              auto_hedge_threshold   连续失败几次就自动避险，0=关闭
+                              auto_hedge_minutes     自动避险冻结多少分钟
+                              connect_timeout        连接握手超时（秒）
+                              reload_poll_interval   配置热重载轮询间隔（秒），0=关闭
+                              port                   监听端口
 
   冻结类：
     freeze clear            立刻清空所有冻结，让所有候选马上可用喵
@@ -137,7 +144,7 @@ def render_freeze_banner(state: RuntimeState) -> list[tuple[str, str]]:
     # 有冻结的话，先放警告标题喵
     fragments: list[tuple[str, str]] = [
         # 黄色加粗的警告标题，把数量也写上喵
-        ("class:warn", f"⚠ 下列模型达到了配额限制!（{len(rows)} 个）"),
+        ("class:warn", f"⚠ 下列模型达到了配额限制或异常自动避险!（{len(rows)} 个）"),
     ]
     # 为了让倒计时对齐，先算出「虚拟模型/节点」这一段最长有多宽喵
     labels = [f"{vm}/{model}" for vm, model, _ in rows]
@@ -363,6 +370,18 @@ class Repl:
             # 打印成功、失败、被冻结次数喵
             print(f"  {shown}")
             print(f"    成功 {row.success} 次 / 失败 {row.failure} 次 / 被冻结 {row.frozen_times} 次")
+            # 当前连续失败了几次，配合阈值能看出这个节点离自动避险还有多远喵
+            if row.consecutive_failures > 0:
+                # 取出当前阈值一起显示，方便主人判断喵
+                threshold = self.state.config.server.auto_hedge_threshold
+                # 阈值大于 0 才显示「离触发还差多少」，否则只显示当前次数喵
+                if threshold > 0:
+                    print(f"    连续失败 {row.consecutive_failures}/{threshold} 次（再失败 {threshold - row.consecutive_failures} 次就自动避险）")
+                else:
+                    print(f"    连续失败 {row.consecutive_failures} 次（自动避险已关闭）")
+            # 被自动避险过的次数，说明这个节点历史上不太稳定喵
+            if row.hedged_times > 0:
+                print(f"    曾因连续失败被自动避险 {row.hedged_times} 次")
             # 有最近错误就打印出来喵
             if row.last_error:
                 # 截断到 120 字符保持整洁喵
@@ -683,6 +702,14 @@ class Repl:
             "connect_timeout": float,
             # 配置热重载的轮询间隔，单位：秒喵
             "reload_poll_interval": float,
+            # 探测阶段总时限，用来判定流卡住，单位：秒喵
+            "stall_timeout": float,
+            # 放行给客户端前需要累积的内容字符数喵
+            "min_content_chars": int,
+            # 自动避险：连续失败多少次就冻结这个节点，0 表示关闭喵
+            "auto_hedge_threshold": int,
+            # 自动避险的冻结时长，单位：分钟喵
+            "auto_hedge_minutes": float,
             # 监听端口喵
             "port": int,
         }

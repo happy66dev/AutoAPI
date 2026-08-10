@@ -1305,7 +1305,202 @@ def test_超时按当前配置现算():
     assert build_timeout(config.server).read == 777.0
 
 
-# ============ 7. 交互区的冻结表横幅喵 ============
+# ============ 7. 自动避险喵 ============
+
+
+def test_连续失败达到阈值才触发避险():
+    """连续失败次数没攒够时不该触发，攒够那一次才返回触发信号喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 前 4 次失败都不该触发（阈值设成 5）喵
+    for i in range(4):
+        assert state.record_failure(candidate, f"第{i}次错误", 5) == 0
+    # 第 5 次达到阈值，应该返回触发时的次数喵
+    assert state.record_failure(candidate, "第5次错误", 5) == 5
+
+
+def test_中间成功一次会清零连续失败计数():
+    """
+    这是「连续」二字的核心语义喵：中间成功过就重新数，
+    否则一个偶尔失败但整体健康的节点会被慢慢攒到阈值然后误冻结喵。
+    """
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 先失败 4 次喵
+    for _ in range(4):
+        state.record_failure(candidate, "错误", 5)
+    # 成功一次，计数应该清零喵
+    state.record_success(candidate)
+    # 再失败 4 次也不该触发，因为是从 0 重新数的喵
+    for _ in range(4):
+        assert state.record_failure(candidate, "错误", 5) == 0
+    # 第 5 次才触发喵
+    assert state.record_failure(candidate, "错误", 5) == 5
+
+
+def test_触发后计数清零需要再攒一轮():
+    """触发过一次之后要重新攒满才会再触发，避免冻结时间被无意义地反复延长喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 攒满触发一次喵
+    for _ in range(4):
+        state.record_failure(candidate, "错误", 5)
+    assert state.record_failure(candidate, "错误", 5) == 5
+    # 紧接着再失败一次不该立刻又触发喵
+    assert state.record_failure(candidate, "错误", 5) == 0
+
+
+def test_阈值为零时关闭自动避险():
+    """阈值设成 0 应该完全不触发，这是关闭开关喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 失败很多次也不该触发喵
+    for _ in range(20):
+        assert state.record_failure(candidate, "错误", 0) == 0
+
+
+def test_不同节点的连续失败计数互相独立():
+    """一个节点连续失败不该影响另一个节点的计数喵~"""
+    # 造状态和两个候选喵
+    state = make_state()
+    chain = state.config.virtual_models["auto-test"]
+    # 第一个节点失败 4 次喵
+    for _ in range(4):
+        state.record_failure(chain[0], "错误", 5)
+    # 第二个节点第一次失败，不该受影响、更不该触发喵
+    assert state.record_failure(chain[1], "错误", 5) == 0
+
+
+def test_避险配置能被正确解析():
+    """新增的两个配置项要能正常读出来，并且有安全下限喵~"""
+    # 默认值喵
+    config = parse_config(make_config_dict())
+    # 测试配置里没写这两项，应该拿到默认值喵
+    assert config.server.auto_hedge_threshold == 5
+    assert config.server.auto_hedge_minutes == 10.0
+    # 喵~防御：负阈值应该被压成 0（也就是关闭），而不是变成诡异的负数行为喵
+    data = make_config_dict()
+    data["server"]["auto_hedge_threshold"] = -3
+    assert parse_config(data).server.auto_hedge_threshold == 0
+    # 喵~防御：冻结时长为 0 应该被压到 0.1 分钟，防止冻结形同虚设喵
+    data["server"]["auto_hedge_minutes"] = 0
+    assert parse_config(data).server.auto_hedge_minutes == 0.1
+
+
+@pytest.mark.asyncio
+async def test_端到端自动避险会冻结节点():
+    """
+    端到端验证喵：一个持续返回各种错误的节点，攒够次数后应该被自动冻结，
+    之后的请求会直接跳过它喵。
+    """
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力一直返回 404（规则里是 next，本身不会冻结它），备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力一直挂喵
+        if request.url.host == "primary.test":
+            return httpx.Response(404, json={"error": {"message": "model not found"}})
+        # 备用正常喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态，把避险阈值调成 3 好让测试快点喵
+    data = make_config_dict()
+    data["server"]["auto_hedge_threshold"] = 3
+    data["server"]["auto_hedge_minutes"] = 5
+    state = RuntimeState(parse_config(data))
+    # 造假上游客户端喵
+    client = make_client(handler)
+    # 取出主力节点，之后要查它的冻结状态喵
+    primary = state.config.virtual_models["auto-test"][0]
+    # 发 3 条请求，每条都会让主力失败一次喵
+    for _ in range(3):
+        await run_proxy(client, state, {"model": "auto-test"})
+    # 主力应该已经被自动避险冻结了喵
+    remaining = state.is_frozen(primary)
+    # 冻结时长应该接近 5 分钟喵
+    assert 295 < remaining <= 300
+    # 清空记录，观察下一条请求的走向喵
+    hits.clear()
+    # 再发一条请求喵
+    outcome = await run_proxy(client, state, {"model": "auto-test"})
+    # 应该成功喵
+    assert outcome.success is True
+    # 应该直接打备用，完全跳过被避险的主力喵
+    assert hits == ["backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_避险原因能区分于配额冻结():
+    """
+    自动避险和「上游告知的额度限制」都会写进冻结表，
+    但原因文本要能区分开，这样 freeze ls 里能看出冻结的来路喵。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力一直 404，备用正常喵~"""
+        # 主力一直挂喵
+        if request.url.host == "primary.test":
+            return httpx.Response(404, json={"error": {"message": "model not found"}})
+        # 备用正常喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态，阈值调成 2 喵
+    data = make_config_dict()
+    data["server"]["auto_hedge_threshold"] = 2
+    state = RuntimeState(parse_config(data))
+    # 造客户端喵
+    client = make_client(handler)
+    # 发 2 条请求触发避险喵
+    for _ in range(2):
+        await run_proxy(client, state, {"model": "auto-test"})
+    # 取冻结列表喵
+    freezes = state.list_freezes()
+    # 应该有一条冻结记录喵
+    assert len(freezes) == 1
+    # 原因里应该明确写着「自动避险」，好和额度限制区分开喵
+    assert "自动避险" in freezes[0][2]
+
+
+@pytest.mark.asyncio
+async def test_避险后不会继续原地重试():
+    """
+    节点刚被避险冻结时，即使规则说「原地重试」也该直接换候选喵。
+    不然会白白再打一次已经判定为不可用的节点喵。
+    """
+    # 记录每次请求打到了哪个地址喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力一直 503（规则里是 retry x2），备用正常喵~"""
+        # 记下主机名喵
+        hits.append(request.url.host)
+        # 主力一直挂喵
+        if request.url.host == "primary.test":
+            return httpx.Response(503, text="service unavailable")
+        # 备用正常喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    # 造状态，阈值设成 1 —— 第一次失败就触发避险喵
+    data = make_config_dict()
+    data["server"]["auto_hedge_threshold"] = 1
+    state = RuntimeState(parse_config(data))
+    # 跑一条请求喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该靠备用成功喵
+    assert outcome.success is True
+    # 主力只该被打一次 —— 虽然规则说 retry x2，但它已经被避险冻结，
+    # 所以不该有第二次原地重试喵
+    assert hits == ["primary.test", "backup.test"]
+
+
+# ============ 8. 交互区的冻结表横幅喵 ============
 
 
 def test_倒计时格式():

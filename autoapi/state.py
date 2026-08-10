@@ -41,6 +41,10 @@ class CandidateStats:
     frozen_times: int = 0
     # 最近一次失败的简短原因，方便排查喵
     last_error: str = ""
+    # 当前连续失败了多少次。成功一次就清零，达到自动避险阈值就冻结这个节点喵
+    consecutive_failures: int = 0
+    # 因为连续失败而被自动避险的次数喵
+    hedged_times: int = 0
 
 
 @dataclass
@@ -230,24 +234,63 @@ class RuntimeState:
     # ---------- 统计相关喵 ----------
 
     def record_success(self, candidate: Candidate) -> None:
-        """记录一次成功，并顺手解冻这个候选喵~"""
+        """记录一次成功，顺手解冻这个候选并清零它的连续失败计数喵~"""
         # 加锁更新统计并删除冻结记录喵
         with self._lock:
+            # 取出（或新建）该候选的统计对象喵
+            stats = self._stats.setdefault(candidate.identity, CandidateStats())
             # 成功次数加一喵
-            self._stats.setdefault(candidate.identity, CandidateStats()).success += 1
+            stats.success += 1
+            # 连续失败计数清零 —— 这是「连续」的含义所在：中间只要成功过一次，
+            # 之前攒的失败次数就不该再算进自动避险的账上喵
+            stats.consecutive_failures = 0
             # 既然成功了就说明它已经恢复，立刻解冻，不用等倒计时走完喵
             self._freezes.pop(candidate.identity, None)
 
-    def record_failure(self, candidate: Candidate, error: str) -> None:
-        """记录一次失败和失败原因喵~"""
-        # 加锁更新统计喵
+    def record_failure(self, candidate: Candidate, error: str, hedge_threshold: int = 0) -> int:
+        """
+        记录一次失败，并判断是否该触发自动避险喵~
+
+        输入：
+            candidate       失败的候选
+            error           失败原因
+            hedge_threshold 自动避险阈值，连续失败达到这个次数就该冻结它。传 0 表示关闭
+        输出：达到阈值时返回当前的连续失败次数（调用方据此去冻结并写日志）；
+             没达到就返回 0
+
+        为什么「加一」和「判断是否达标」必须在同一个锁里做：
+            并发时多条请求可能同时失败。如果先加一、解锁、再另外读一次来判断，
+            两条请求可能都读到「刚好等于阈值」，于是重复触发两次避险、日志刷两遍。
+            在锁内一次性完成「加一 + 判断 + 清零」才能保证阈值只被跨过一次喵。
+
+        为什么达标后要把计数清零：
+            清零之后需要再攒满一轮才会再次触发。否则节点被冻结期间如果还有请求漏进来
+            （比如冻结刚过期那一刻），会立刻又触发一次避险，冻结时间被无意义地延长喵。
+        """
+        # 加锁更新统计并判断喵
         with self._lock:
             # 取出（或新建）该候选的统计对象喵
             stats = self._stats.setdefault(candidate.identity, CandidateStats())
             # 失败次数加一喵
             stats.failure += 1
+            # 连续失败次数也加一喵
+            stats.consecutive_failures += 1
             # 记下最近一次失败原因，截断到 200 字符防止内存膨胀喵
             stats.last_error = error[:200]
+            # 阈值为 0 表示关闭自动避险，直接返回不触发喵
+            if hedge_threshold <= 0:
+                return 0
+            # 还没攒够就不触发喵
+            if stats.consecutive_failures < hedge_threshold:
+                return 0
+            # 达到阈值了，记下当前次数用于返回和日志喵
+            reached = stats.consecutive_failures
+            # 自动避险次数加一，供 stats 命令展示喵
+            stats.hedged_times += 1
+            # 计数清零，这样需要再攒满一轮才会再次触发喵
+            stats.consecutive_failures = 0
+            # 返回触发时的连续失败次数喵
+            return reached
 
     def snapshot_stats(self) -> dict[str, CandidateStats]:
         """拷贝一份统计快照给 REPL 打印，避免 REPL 长时间持锁喵~"""

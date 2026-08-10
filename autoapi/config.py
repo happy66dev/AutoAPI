@@ -173,6 +173,11 @@ class ServerConfig:
     min_content_chars: int = 10
     # 建立连接的超时秒数喵
     connect_timeout: float = 15.0
+    # 自动避险：一个节点在全局范围内连续失败多少次就自动冻结它。
+    # 设成 0 表示关闭这个功能喵
+    auto_hedge_threshold: int = 5
+    # 自动避险触发后冻结多少分钟喵
+    auto_hedge_minutes: float = 10.0
     # 配置文件热重载的轮询间隔秒数，0 表示关闭喵
     reload_poll_interval: float = 2.0
 
@@ -366,6 +371,10 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
         min_content_chars=max(1, int(server_raw.get("min_content_chars", 10))),
         # 连接超时至少 1 秒喵
         connect_timeout=max(1.0, float(server_raw.get("connect_timeout", 15.0))),
+        # 自动避险阈值，0 表示关闭。压一个 0 的下限防止配成负数喵
+        auto_hedge_threshold=max(0, int(server_raw.get("auto_hedge_threshold", 5))),
+        # 自动避险的冻结时长，至少 0.1 分钟（6 秒），防止配成 0 导致冻结形同虚设喵
+        auto_hedge_minutes=max(0.1, float(server_raw.get("auto_hedge_minutes", 10.0))),
         # 热重载轮询间隔，允许为 0 表示彻底关闭该功能喵
         reload_poll_interval=max(0.0, float(server_raw.get("reload_poll_interval", 2.0))),
     )
