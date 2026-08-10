@@ -1079,6 +1079,57 @@ def test_不许把候选链删空(tmp_path):
     assert len(repl.state.config.virtual_models["auto-test"]) == 1
 
 
+def test_交互式改候选的地址和模型名(tmp_path):
+    """cand set 应该能改单个字段，且不影响该候选在链里的位置喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 改第 1 个候选的上游地址喵
+    repl.dispatch("cand set auto-test 1 base_url https://changed.test")
+    # 改第 1 个候选的真实模型名喵
+    repl.dispatch("cand set auto-test 1 model gpt-4o-2024-11-20")
+    # 取出候选链喵
+    chain = repl.state.config.virtual_models["auto-test"]
+    # 地址和模型名都应该变了喵
+    assert chain[0].base_url == "https://changed.test"
+    assert chain[0].model == "gpt-4o-2024-11-20"
+    # 位置不该变，它还是链首喵
+    assert chain[0].name == "主力"
+    # 其他字段不该被碰到喵
+    assert chain[0].api_key == "sk-primary-key-1234"
+    # 磁盘上也应该被更新喵
+    assert "changed.test" in path.read_text(encoding="utf-8")
+
+
+def test_交互式换key(tmp_path):
+    """cand set api_key 应该能换 key，这是最常用的运维操作喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 换掉第 2 个候选的 key 喵
+    repl.dispatch("cand set auto-test 2 api_key sk-brand-new-key-abcdefg")
+    # 新 key 应该生效喵
+    assert repl.state.config.virtual_models["auto-test"][1].api_key == "sk-brand-new-key-abcdefg"
+    # 换 key 之后身份串变了，所以旧 key 的冻结记录不会误伤新 key 喵
+    assert repl.state.is_frozen(repl.state.config.virtual_models["auto-test"][1]) == 0
+
+
+def test_改候选字段的各种非法输入(tmp_path):
+    """字段名不认识、序号越界、值为空，都该被挡下且不动配置喵~"""
+    # 造 REPL 喵
+    repl, path = make_repl(tmp_path)
+    # 记下改动前的磁盘内容喵
+    before = path.read_text(encoding="utf-8")
+    # 字段名不认识喵
+    repl.dispatch("cand set auto-test 1 乱写的字段 值")
+    # 序号越界喵
+    repl.dispatch("cand set auto-test 99 model m")
+    # 序号不是数字喵
+    repl.dispatch("cand set auto-test abc model m")
+    # 虚拟模型不存在喵
+    repl.dispatch("cand set 不存在 1 model m")
+    # 磁盘文件应该一个字节都没被动过喵
+    assert path.read_text(encoding="utf-8") == before
+
+
 def test_交互式调整候选优先级(tmp_path):
     """cand mv 应该能把备用提到链首喵~"""
     # 造 REPL 喵

@@ -27,6 +27,8 @@ import asyncio
 import json
 # logging 用来输出转发过程的日志喵
 import logging
+# secrets 用来生成请求 ID，用它而不是 random 是因为它天生线程安全喵
+import secrets
 # dataclass 用来定义编排结果容器喵
 from dataclasses import dataclass, field
 # Any 用于标注解析出来的请求体喵
@@ -145,6 +147,21 @@ def _pick_usable_candidates(
     return usable, skipped
 
 
+def new_request_id() -> str:
+    """
+    给每条客户端请求生成一个短 ID 喵~
+
+    为什么需要：并发时多条请求的日志会交错在一起，光看「失败了、换候选了」根本认不出
+    哪几行属于同一条请求。给每行日志都带上同一个 ID，就能用它把一条请求的完整旅程
+    grep 出来了喵。
+
+    用 6 位十六进制（约 1600 万种），同一时刻在飞的请求撞 ID 的概率低到可以忽略，
+    而且短到不会把日志行撑长喵。
+    """
+    # 取 3 个随机字节转成 6 位十六进制喵
+    return secrets.token_hex(3)
+
+
 async def _run_one_candidate(
     client: httpx.AsyncClient,
     state: RuntimeState,
@@ -155,6 +172,7 @@ async def _run_one_candidate(
     headers: dict[str, str],
     body_obj: dict[str, Any],
     is_stream: bool,
+    req_id: str,
 ) -> tuple[str, AttemptResult]:
     """
     在一个候选上尝试到底（含该候选内部的退避重试）喵~
@@ -198,7 +216,7 @@ async def _run_one_candidate(
             # 更新统计并解冻喵
             state.record_success(candidate)
             # 记一条成功日志，第几次尝试也记上，方便观察上游稳定性喵
-            logger.info("成功 %s（第 %d 次尝试）喵", candidate.label, attempt_no)
+            logger.info("[%s] 成功 %s（第 %d 次尝试）喵", req_id, candidate.label, attempt_no)
             # 返回成功结论喵
             return "ok", result
         # 失败了，先记一笔失败喵
@@ -207,7 +225,8 @@ async def _run_one_candidate(
         decision = decide(config.rules, result.status, result.error_text, result.retry_after)
         # 打一条失败日志，把状态码、决策和命中的规则都写清楚喵
         logger.warning(
-            "失败 %s 状态=%s 决策=%s 依据=%s 原因=%s 喵",
+            "[%s] 失败 %s 状态=%s 决策=%s 依据=%s 原因=%s 喵",
+            req_id,
             candidate.label,
             result.status,
             decision.action,
@@ -222,7 +241,9 @@ async def _run_one_candidate(
             # 写入冻结表，时长由规则引擎算好（可能是从上游消息里抽出来的）喵
             state.freeze(candidate, decision.freeze_seconds, result.error_text)
             # 记一条冻结日志，写明冻多久喵
-            logger.warning("冻结 %s 共 %.0f 秒喵", candidate.label, decision.freeze_seconds)
+            logger.warning(
+                "[%s] 冻结 %s 共 %.0f 秒喵", req_id, candidate.label, decision.freeze_seconds
+            )
             # 冻结之后换下一个候选喵
             return "next", result
         # 规则要求原地重试，且重试次数还没用完喵
@@ -233,7 +254,8 @@ async def _run_one_candidate(
             delay = min(delay, 30.0)
             # 记一条重试日志喵
             logger.info(
-                "退避重试 %s，等待 %.1f 秒后进行第 %d/%d 次尝试喵",
+                "[%s] 退避重试 %s，等待 %.1f 秒后进行第 %d/%d 次尝试喵",
+                req_id,
                 candidate.name,
                 delay,
                 attempt_no + 1,
@@ -265,6 +287,9 @@ async def handle_request(
     边界条件：请求体非法 → 400；虚拟模型不存在 → 400；整条链用尽 → 502。
             任何情况下都返回 ProxyOutcome，绝不把异常抛给 FastAPI 层喵。
     """
+    # 给这条请求生成一个短 ID，它会出现在这条请求产生的每一行日志上，
+    # 这样并发时也能用它把一条请求的完整转移过程 grep 出来喵
+    req_id = new_request_id()
     # 累计请求数加一，用于 REPL 的 stats 展示喵
     state.total_requests += 1
     # 解析客户端请求体喵
@@ -299,7 +324,7 @@ async def handle_request(
     # 喵~防御：虚拟模型没配过就回 400，并把所有可用的名字列出来帮用户改配置喵
     if chain is None:
         # 记一条日志，方便发现客户端配错了模型名喵
-        logger.warning("客户端请求了未配置的虚拟模型 %r 喵", virtual_model)
+        logger.warning("[%s] 客户端请求了未配置的虚拟模型 %r 喵", req_id, virtual_model)
         # 返回 400 并附上可用列表喵
         return ProxyOutcome(
             success=False,
@@ -318,7 +343,8 @@ async def handle_request(
     usable, skipped = _pick_usable_candidates(state, chain)
     # 记一条开始处理的日志，写明虚拟模型、是否流式、可用候选数喵
     logger.info(
-        "处理请求 虚拟模型=%s 流式=%s 可用候选=%d/%d 喵",
+        "[%s] 处理请求 虚拟模型=%s 流式=%s 可用候选=%d/%d 喵",
+        req_id,
         virtual_model,
         is_stream,
         len(usable),
@@ -343,6 +369,8 @@ async def handle_request(
             headers,
             body_obj,
             is_stream,
+            # 这条请求的 ID，让候选层的日志也带上它喵
+            req_id,
         )
         # 成功了，直接返回，后面的候选不再尝试喵
         if verdict == "ok":
@@ -361,7 +389,9 @@ async def handle_request(
     # 整条候选链都走完了还没成功喵
     state.total_exhausted += 1
     # 记一条错误日志，把所有失败原因都写进去喵
-    logger.error("虚拟模型 %s 的所有候选都失败了喵：%s", virtual_model, " | ".join(failures))
+    logger.error(
+        "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
+    )
     # 回 502 并附上每个候选各自的失败原因，方便一眼看出是全挂了还是全在冻结喵
     return ProxyOutcome(
         success=False,

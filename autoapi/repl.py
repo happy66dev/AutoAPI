@@ -58,6 +58,9 @@ HELP_TEXT = """
     cand add <虚拟模型> <JSON>        给候选链末尾追加一个候选喵
     cand rm <虚拟模型> <序号>         删掉指定序号的候选喵
     cand mv <虚拟模型> <原> <新>      挪动候选优先级，第 1 位最优先喵
+    cand set <虚拟模型> <序号> <字段> <值>
+                            改某个候选的单个字段，位置不变喵
+                            字段可选：base_url、api_key、model、name、auth_style
     vm add <虚拟模型名> <候选JSON>    新建虚拟模型并配上第一个候选喵
     vm rm <虚拟模型名>                删掉一整个虚拟模型喵
 
@@ -80,6 +83,11 @@ HELP_TEXT = """
     rule add {"match": {"status": [500, 502]}, "action": "next"}
     cand add auto-strong {"name": "新中转", "base_url": "https://x.com", "api_key": "sk-xxx", "model": "gpt-4o"}
     vm add my-model {"base_url": "https://y.com", "api_key": "sk-yyy", "model": "gpt-4o-mini"}
+
+  改单个字段的例子喵（不用把整个候选重新敲一遍，位置也不会变）：
+    cand set auto-strong 2 api_key sk-new-key-here
+    cand set auto-strong 2 base_url https://newrelay.com
+    cand set auto-strong 2 model gpt-4o-2024-11-20
 
   候选的字段说明喵：
     必填：base_url、api_key、model（model 是发给上游的真实模型名）
@@ -436,6 +444,72 @@ class Repl:
         # 走统一的改配置流程喵
         self._mutate_config(mutator)
 
+    def cmd_cand_set(self, vm_name: str, index_text: str, field: str, value: str) -> None:
+        """
+        改某个候选节点的单个字段喵~
+
+        用来改上游地址、api key、真实模型名这些。比「删了重加」好用得多：
+        不用把整个候选重新敲一遍，而且节点在链里的位置（也就是优先级）不会变喵。
+        """
+        # 允许改的字段，以及各自的中文说明喵
+        allowed_fields = {
+            # 上游根地址喵
+            "base_url": "上游根地址",
+            # 该上游的 api key 喵
+            "api_key": "api key",
+            # 发给上游的真实模型名喵
+            "model": "真实模型名",
+            # 显示用的名字喵
+            "name": "显示名字",
+            # 鉴权头风格喵
+            "auth_style": "鉴权风格（bearer 或 x-api-key）",
+        }
+        # 喵~防御：字段名不认识时列出所有能改的字段和它们的含义喵
+        if field not in allowed_fields:
+            print("能改的字段是喵：")
+            # 逐个打印字段名和说明喵
+            for key, desc in allowed_fields.items():
+                print(f"  {key:12} {desc}")
+            return
+        # 喵~防御：序号必须能转成整数喵
+        try:
+            index = int(index_text)
+        except ValueError:
+            print(f"序号 {index_text!r} 不是数字喵~")
+            return
+        # 喵~防御：值不能是空字符串，空的 base_url 或 api_key 会让这个节点必然失败喵
+        if not value.strip():
+            print(f"{field} 不能设成空的喵~")
+            return
+
+        def mutator(data: dict[str, Any]) -> str:
+            """改指定候选的指定字段喵~"""
+            # 取出候选链喵
+            chain = self._get_chain_raw(data, vm_name)
+            # 喵~防御：序号必须在有效范围内喵
+            if not (1 <= index <= len(chain)):
+                raise ConfigError(f"序号要在 1~{len(chain)} 之间喵")
+            # 取出要改的那个候选喵
+            candidate = chain[index - 1]
+            # 喵~防御：候选必须是字典才能改字段喵
+            if not isinstance(candidate, dict):
+                raise ConfigError(f"第 {index} 个候选不是字典，无法改字段喵")
+            # 记下原值用于展示喵
+            old = candidate.get(field, "（未设置）")
+            # api key 属于敏感信息，展示时脱敏，避免在终端上打出完整的旧 key 喵
+            if field == "api_key":
+                # 旧 key 太短就整体打码，否则只留头尾喵
+                old = "***" if len(str(old)) <= 11 else f"{str(old)[:6]}***{str(old)[-4:]}"
+            # 写入新值，去掉首尾空白防止复制粘贴带进空格喵
+            candidate[field] = value.strip()
+            # 返回改动描述，新值同样对 key 做脱敏喵
+            shown = "（已更新，为安全不回显）" if field == "api_key" else repr(value.strip())
+            # 拼成人话喵
+            return f"已把虚拟模型 {vm_name} 第 {index} 个候选的 {field} 从 {old} 改成 {shown}"
+
+        # 走统一的改配置流程喵
+        self._mutate_config(mutator)
+
     def cmd_cand_mv(self, vm_name: str, from_text: str, to_text: str) -> None:
         """挪动候选的位置来调整优先级喵~"""
         # 喵~防御：两个序号都必须能转成整数喵
@@ -723,8 +797,24 @@ class Repl:
                     return
                 self.cmd_cand_mv(vm_name, parts[3], parts[4])
                 return
+            # cand set 改某个候选的单个字段（地址、key、模型名等）喵
+            if sub == "set":
+                # 喵~防御：需要序号、字段名、新值三样喵
+                if len(parts) < 6:
+                    print(
+                        "用法喵：cand set <虚拟模型> <序号> <字段> <值>\n"
+                        "  例如：cand set auto-strong 2 api_key sk-new-key-here\n"
+                        "        cand set auto-strong 2 base_url https://newrelay.com\n"
+                        "        cand set auto-strong 2 model gpt-4o-2024-11-20"
+                    )
+                    return
+                # 只切前五段，第六段之后保留原样当值（值里可能有空格，比如显示名字）喵
+                pieces = line.split(maxsplit=5)
+                # 调用改字段命令喵
+                self.cmd_cand_set(vm_name, parts[3], parts[4].lower(), pieces[5])
+                return
             # 喵~防御：不认识的子命令给出提示喵
-            print(f"不认识的 cand 子命令 {sub!r} 喵，支持 add / rm / mv~")
+            print(f"不认识的 cand 子命令 {sub!r} 喵，支持 add / rm / mv / set~")
             return
         # set 命令改 server 段的配置项喵
         if head == "set":
