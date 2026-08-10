@@ -320,6 +320,9 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                 finally:
                     # 流结束或客户端断开时记录总时长，避免把放行时长误叫完整总时长喵
                     total_ms = (time.monotonic() - stream_started_at) * 1000
+                    # 把完整流耗时补进平均耗时统计，只有走到这里才算请求完整结束喵
+                    if attempt.rate_event is not None:
+                        state.attach_elapsed_ms(attempt.rate_event, total_ms)
                     logger.info(
                         "流式请求结束 虚拟模型=%s 总时长=%.0fms usage_tokens=%s 喵",
                         attempt.virtual_model or "未知",

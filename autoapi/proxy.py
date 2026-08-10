@@ -222,6 +222,9 @@ async def _run_one_candidate(
             result.rate_event = state.record_rate_event(virtual_model, result.usage_tokens)
             # 保存虚拟模型名，流结束时 server 需要用它补写尾包 usage 喵
             result.virtual_model = virtual_model
+            # 非流式请求此刻已经完整结束，立即补上完整耗时；流式要等生成器结束后再补喵
+            if not is_stream and result.rate_event is not None and result.started_at is not None:
+                state.attach_elapsed_ms(result.rate_event, (time.monotonic() - result.started_at) * 1000)
             # 计算从向上游发请求到当前成功点的耗时喵
             elapsed_ms = (time.monotonic() - result.started_at) * 1000 if result.started_at else 0.0
             # 流式在此刻只是确认健康并放行，完整总时长要等流结束后才知道喵
