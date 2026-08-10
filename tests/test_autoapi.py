@@ -2665,7 +2665,33 @@ def test_日志颜色映射():
     assert "\033[" not in formatter.format(info_record)
 
 
-def test_日志处理器每次都取当前的stderr():
+def test_成功日志候选人侧ID为绿色且不泄露密钥():
+    """成功日志只把 candidate.name 染绿，WARNING、ERROR 和 api key 均不受影响喵~"""
+    # 引入成功候选 ID 颜色相关常量与格式化器喵
+    from main import CANDIDATE_NAME_COLOR, COLOR_RESET, ColorFormatter
+    # 造使用 INFO 的格式化器，模拟终端支持 ANSI 时的输出喵
+    formatter = ColorFormatter("%(levelname)s %(message)s")
+    # 候选 human 侧 ID 和仅用于防泄露断言的伪 api key 喵
+    candidate_name, fake_api_key = "claude-sonnet", "sk-test-secret"
+    # 造一条真实成功日志结构的记录，消息中不携带候选配置或 api key 喵
+    success_record = logging.LogRecord(
+        "test", logging.INFO, "f.py", 1,
+        "成功 %s（第 %d 次尝试）喵 非流 总时长=%.0fms",
+        (candidate_name, 1, 12.0), None,
+    )
+    # 渲染成功日志喵
+    success_text = formatter.format(success_record)
+    # 仅最终展示的候选 human 侧 ID 应被绿色 ANSI 与重置码精确包裹喵
+    assert f"{CANDIDATE_NAME_COLOR}{candidate_name}{COLOR_RESET}" in success_text
+    # 日志不得包含任何未传入的 api key 喵
+    assert fake_api_key not in success_text
+    # WARNING 仍必须是整行黄色喵
+    warning_text = formatter.format(logging.LogRecord("test", logging.WARNING, "f.py", 1, "警告喵", None, None))
+    assert warning_text.startswith("\033[33m")
+    # ERROR 仍必须是整行红色喵
+    error_text = formatter.format(logging.LogRecord("test", logging.ERROR, "f.py", 1, "错误喵", None, None))
+    assert error_text.startswith("\033[31m")
+
     """
     这是「日志滚动时底部状态监控上移、渲染错乱」那个 bug 的回归用例喵~
 

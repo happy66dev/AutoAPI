@@ -22,6 +22,8 @@ import argparse
 import logging
 # os 用来读 NO_COLOR 环境变量，判断主人是否明确要求不上色喵
 import os
+# re 用来精确定位成功日志里的候选 ID，避免给整条 INFO 日志上色喵
+import re
 # sys 用来控制退出码喵
 import sys
 # pathlib 用来算脚本自己所在的目录，好让配置文件不依赖当前工作目录喵
@@ -59,6 +61,10 @@ LEVEL_COLORS = {
 }
 # 重置颜色的 ANSI 码，每行结尾都要补上它，否则颜色会漏到后面的输出去喵
 COLOR_RESET = "\033[0m"
+# 成功日志中的候选 human 侧 ID 使用绿色，避免和级别颜色混淆喵
+CANDIDATE_NAME_COLOR = "\033[32m"
+# 成功日志的稳定结构只匹配候选 ID 这个字段，避免把其他日志内容错误上色喵
+SUCCESS_CANDIDATE_PATTERN = re.compile(r"(成功 )(.+?)(（第 \d+ 次尝试）)")
 
 
 def supports_color() -> bool:
@@ -102,6 +108,26 @@ def supports_color() -> bool:
         return False
 
 
+def color_candidate_name(candidate_name: str) -> str:
+    """仅为成功日志里的候选 human 侧 ID 添加绿色 ANSI 颜色喵~"""
+    # 喵~防御：候选 ID 不是字符串或为空时原样转成安全文本，避免格式化日志失败喵
+    safe_candidate_name = candidate_name if isinstance(candidate_name, str) else str(candidate_name)
+    # 只包装候选 ID 本身，不接触候选配置，因而不会泄露 api key 喵
+    return f"{CANDIDATE_NAME_COLOR}{safe_candidate_name}{COLOR_RESET}"
+
+
+def color_success_candidate_name(message: str) -> str:
+    """仅将成功日志中最终展示的候选 human 侧 ID 包为绿色 ANSI 文本喵~"""
+    # 喵~防御：消息不是字符串时原样返回，避免异常日志格式化失败而掩盖原始问题喵
+    if not isinstance(message, str):
+        return message
+    # 只替换「成功」和尝试次数之间的候选 ID，不读取候选配置，因此不会泄露 api key 喵
+    return SUCCESS_CANDIDATE_PATTERN.sub(
+        lambda matched: f"{matched.group(1)}{CANDIDATE_NAME_COLOR}{matched.group(2)}{COLOR_RESET}{matched.group(3)}",
+        message,
+    )
+
+
 class ColorFormatter(logging.Formatter):
     """给日志按级别上色的格式化器喵~"""
 
@@ -115,6 +141,9 @@ class ColorFormatter(logging.Formatter):
         """
         # 先让父类按格式串渲染出朴素文本喵
         text = super().format(record)
+        # 成功 INFO 日志仅将最终候选 human 侧 ID 染绿，其他 INFO 内容保持默认色喵
+        if record.levelno == logging.INFO:
+            return color_success_candidate_name(text)
         # 取这个级别对应的颜色码，没有对应色就用空串（也就是不上色）喵
         color = LEVEL_COLORS.get(record.levelname, "")
         # 没有颜色就原样返回，避免白白拼接两个空串喵
