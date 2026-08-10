@@ -2146,6 +2146,8 @@ async def test_count_tokens错误不触发自动避险():
             {},
             # 请求体必须传原始 JSON 字节，模拟 server 的真实调用方式喵
             json.dumps({"model": "auto-test", "messages": []}).encode("utf-8"),
+            # 直接调用编排层时从调用点开始计时喵
+            time.monotonic(),
         )
         # count_tokens 命中 passthrough 时由编排层原样返回该错误响应喵
         assert outcome.attempt is not None

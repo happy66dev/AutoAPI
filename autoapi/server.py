@@ -279,6 +279,8 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
         客户端的路径、查询串、请求头、请求体全部原样往上游转发，只有三样东西会被替换：
         base_url、api_key、以及请求体顶层的 model 字段喵。
         """
+        # 记录服务端收到客户端请求的时刻，平均耗时覆盖完整服务端生命周期喵
+        request_started_at = time.monotonic()
         # 把客户端的请求体完整读出来，之后要解析出虚拟模型名喵
         raw_body = await request.body()
         # 把请求头转成普通字典，交给编排层处理喵
@@ -299,6 +301,8 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
             headers,
             # 客户端原始请求体喵
             raw_body,
+            # 服务端收到客户端请求的起始时刻喵
+            request_started_at,
         )
         # 编排失败（400 或 502），把错误体作为 JSON 回给客户端喵
         if not outcome.success or outcome.attempt is None:
@@ -311,8 +315,8 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
             stream_headers = dict(attempt.headers)
             # 把流式总时长、尾包 usage 与 TPM 补写收拢到生成器结束后的 finally 喵
             async def observed_stream():
-                # 记录流式上游请求开始时刻喵
-                stream_started_at = attempt.started_at or time.monotonic()
+                # 记录从服务端收到客户端请求到流响应生命周期结束的全程耗时喵
+                stream_started_at = request_started_at
                 try:
                     # 逐块透传并观察尾包 usage 喵
                     async for chunk in iter_upstream_bytes(attempt):
@@ -330,7 +334,7 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                     if attempt.rate_event is not None:
                         state.attach_elapsed_ms(attempt.rate_event, total_ms)
                     logger.info(
-                        "流式请求结束 虚拟模型=%s 总时长=%.0fms usage_tokens=%s 喵",
+                        "流式请求结束 虚拟模型=%s 返回请求耗时=%.0fms usage_tokens=%s 喵",
                         attempt.virtual_model or "未知",
                         total_ms,
                         attempt.usage_tokens if attempt.usage_tokens is not None else "未上报",

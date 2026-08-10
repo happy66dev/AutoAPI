@@ -186,6 +186,7 @@ async def _run_one_candidate(
     is_stream: bool,
     req_id: str,
     virtual_model: str,
+    request_started_at: float,
 ) -> tuple[str, AttemptResult]:
     """
     在一个候选上尝试到底（含该候选内部的退避重试）喵~
@@ -235,10 +236,10 @@ async def _run_one_candidate(
             # 保存虚拟模型名，流结束时 server 需要用它补写尾包 usage 喵
             result.virtual_model = virtual_model
             # 非流式请求此刻已经完整结束，立即补上完整耗时；流式要等生成器结束后再补喵
-            if not is_stream and result.rate_event is not None and result.started_at is not None:
-                state.attach_elapsed_ms(result.rate_event, (time.monotonic() - result.started_at) * 1000)
-            # 计算从向上游发请求到当前成功点的耗时喵
-            elapsed_ms = (time.monotonic() - result.started_at) * 1000 if result.started_at else 0.0
+            if not is_stream and result.rate_event is not None:
+                state.attach_elapsed_ms(result.rate_event, (time.monotonic() - request_started_at) * 1000)
+            # 计算从服务端接收客户端请求到成功响应准备完成的全程耗时喵
+            elapsed_ms = (time.monotonic() - request_started_at) * 1000
             # 流式在此刻只是确认健康并放行，完整总时长要等流结束后才知道喵
             if is_stream:
                 first_byte_ms = (
@@ -247,13 +248,13 @@ async def _run_one_candidate(
                     else 0.0
                 )
                 logger.info(
-                    "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 放行时长=%.0fms",
-                    req_id, candidate.name, attempt_no, first_byte_ms, elapsed_ms,
+                    "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 放行时长=%.0fms 返回请求耗时=%.0fms",
+                    req_id, candidate.name, attempt_no, first_byte_ms, elapsed_ms, elapsed_ms,
                 )
-            # 非流式此时完整响应已读完，elapsed 就是真实总时长喵
+            # 非流式此时完整响应已读完，记录服务端返回响应前的全程耗时喵
             else:
                 logger.info(
-                    "[%s] 成功 %s（第 %d 次尝试）喵 非流 总时长=%.0fms",
+                    "[%s] 成功 %s（第 %d 次尝试）喵 非流 返回请求耗时=%.0fms",
                     req_id, candidate.name, attempt_no, elapsed_ms,
                 )
             # 返回成功结论喵
@@ -359,6 +360,7 @@ async def handle_request(
     query: str,
     headers: dict[str, str],
     raw_body: bytes,
+    request_started_at: float | None = None,
 ) -> ProxyOutcome:
     """
     处理一条客户端请求，走完整条候选链喵~ 这是本模块唯一的公开入口喵。
@@ -368,6 +370,9 @@ async def handle_request(
     边界条件：请求体非法 → 400；虚拟模型不存在 → 400；整条链用尽 → 502。
             任何情况下都返回 ProxyOutcome，绝不把异常抛给 FastAPI 层喵。
     """
+    # 测试或其他直接调用未提供起点时，从进入编排层开始计时喵
+    if request_started_at is None:
+        request_started_at = time.monotonic()
     # 给这条请求生成一个短 ID，它会出现在这条请求产生的每一行日志上，
     # 这样并发时也能用它把一条请求的完整转移过程 grep 出来喵
     req_id = new_request_id()
@@ -451,7 +456,7 @@ async def handle_request(
             # 在这个候选上尝试到底（含内部退避重试）喵
             verdict, result = await _run_one_candidate(
                 client, state, candidate, method, path, query, headers, body_obj,
-                is_stream, req_id, virtual_model,
+                is_stream, req_id, virtual_model, request_started_at,
             )
             # 成功了，直接返回，后面的候选不再尝试喵
             if verdict == "ok":
