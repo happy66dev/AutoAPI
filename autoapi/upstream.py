@@ -22,6 +22,8 @@ from __future__ import annotations
 import asyncio
 # json 用来序列化改过 model 的请求体喵
 import json
+# logging 用来写「假成功 body 观测日志」，方便主人在遇到中转站塞假 200 时看到真实内容喵
+import logging
 # time 用来取单调时钟，给探测阶段的两个计时器算剩余预算喵
 import time
 # dataclass 用来定义结果容器喵
@@ -31,6 +33,12 @@ from typing import Any, AsyncIterator
 
 # httpx 提供异步 HTTP 客户端喵
 import httpx
+
+# 模块级 logger，命名和其他模块保持同一个 "autoapi.*" 前缀，方便统一过滤日志喵
+logger = logging.getLogger("autoapi.upstream")
+
+# 假成功 body 观测日志一次最多打印多少字节，够看错误消息又不至于把日志淹没喵
+FAKE_SUCCESS_LOG_BYTES = 2048
 
 # 引入候选类型和两个特殊状态码喵
 from .config import (
@@ -679,11 +687,55 @@ async def _attempt_stream(
             error_text=detail or "流式请求用光了总预算",
         )
     # 其余情况（空流、流内 error、缓冲区溢出）都归为「200 假成功」喵
+    #
+    # 观测日志喵：这里把 Content-Type 和 buffered 前缀一起打出来，因为有些中转站
+    # 会用「HTTP 200 + 纯 JSON body」把上游的 400/5xx 藏起来，如果不打日志我们
+    # 就只能看到「流的内容为空」这种没营养的摘要，永远查不到真实错误。
+    # 日志走 warning 等级，因为 bad_stream 本身就是需要关注的事件，不会喧宾夺主喵。
+    logger.warning(
+        "假成功流被拦下喵：verdict=%s content_type=%s buffered=%d字节 detail=%s body_head=%s",
+        # 探测结论，帮主人一眼看出是空流/error/缓冲溢出中的哪一种喵
+        verdict,
+        # 上游给的 Content-Type，如果这里不是 text/event-stream 基本就实锤了「假流」喵
+        response.headers.get("content-type", "<缺失>"),
+        # 已经读到的原始字节数，配合 buffered_head 一起判断 body 是否被截断喵
+        len(buffered),
+        # 探测器/探测函数给出的原始说明文本喵
+        detail,
+        # buffered 的前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
+        _snapshot_body_for_log(bytes(buffered)),
+    )
     return AttemptResult(
         ok=False,
         status=STATUS_BAD_STREAM,
         error_text=detail or "上游返回 200 但流内容不正常",
     )
+
+
+def _snapshot_body_for_log(body: bytes, limit: int = FAKE_SUCCESS_LOG_BYTES) -> str:
+    """
+    把响应体截成一段可读日志文本喵~
+
+    输入：
+        body   响应体原始字节（流式路径就是探测阶段累计的 buffered，非流式路径就是完整 body）
+        limit  最多截取多少字节，超过就在末尾附上「(还有 N 字节未打印)」提示喵
+    输出：单行文本，换行/回车替换成可见符号，方便直接看清楚上游到底塞了什么喵
+    """
+    # 喵~防御：body 为空时直接返回占位串，避免日志里出现空引号让主人看不懂喵
+    if not body:
+        return "<空 body>"
+    # 只截前 limit 字节，剩下的省略掉，避免大 body 把日志刷屏喵
+    head = body[:limit]
+    # 用 utf-8 宽松解码，非法字节替换成 U+FFFD 而不是抛异常喵
+    text = head.decode("utf-8", errors="replace")
+    # 把控制字符换成可见形式：换行成 \n 字面量、回车成 \r 字面量，方便一行日志读完喵
+    text = text.replace("\r", "\\r").replace("\n", "\\n")
+    # body 长度超过 limit 时，明确告诉主人还有多少字节被省略掉了喵
+    if len(body) > limit:
+        # 拼上剩余字节数提示，主人一眼就知道日志被截断过喵
+        text += f" ...(还有 {len(body) - limit} 字节未打印)"
+    # 返回处理好的一行文本喵
+    return text
 
 
 def _nonstream_fake_success(body: bytes) -> str:
@@ -795,6 +847,20 @@ async def _attempt_nonstream(
     fake = _nonstream_fake_success(raw)
     # 检测到假成功，用 bad_stream 状态返回（这个状态泛指「表面 200 实则失败」）喵
     if fake:
+        # 观测日志喵：和流式路径一样，把 Content-Type 和完整 body 前缀一起记录下来。
+        # 非流式 body 是一次性读完的，所以 raw 一定就是完整响应体（不像流式的 buffered
+        # 可能是被 error 事件截断的前缀），这里能拿到最完整的现场信息喵。
+        logger.warning(
+            "假成功响应被拦下喵：content_type=%s body_len=%d detail=%s body_head=%s",
+            # 上游 Content-Type，配合 body_head 判断是不是根本没走标准协议喵
+            response.headers.get("content-type", "<缺失>"),
+            # 完整 body 的字节数，主人扫一眼就知道响应大小是否合理喵
+            len(raw),
+            # 假成功检测函数给出的错误消息，一般就是 body 里的 error.message 喵
+            fake,
+            # body 前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
+            _snapshot_body_for_log(raw),
+        )
         return AttemptResult(ok=False, status=STATUS_BAD_STREAM, error_text=fake)
     # 真正的成功，把完整响应体和响应头一起交回去喵
     return AttemptResult(
