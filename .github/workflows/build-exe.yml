@@ -57,10 +57,14 @@ jobs:
         shell: pwsh
         run: pyinstaller --noconfirm --clean --onefile --name autoapi main.py
 
-      # 验证打包后的 exe 至少能完成参数解析和导入喵
+      # 验证打包后的 exe 能在 UTF-8 控制台完成参数解析和导入喵
       - name: 验证 exe 启动喵
         shell: pwsh
-        run: .\dist\autoapi.exe --help
+        run: |
+          chcp 65001
+          $env:PYTHONUTF8 = "1"
+          $env:PYTHONIOENCODING = "utf-8"
+          .\dist\autoapi.exe --help
 
       # 组装只含公开模板和 exe 的发行目录喵
       - name: 组装发行文件喵
