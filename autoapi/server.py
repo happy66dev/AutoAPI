@@ -317,30 +317,35 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
             async def observed_stream():
                 # 记录从服务端收到客户端请求到流响应生命周期结束的全程耗时喵
                 stream_started_at = request_started_at
+                # 只有上游迭代器自然耗尽才算请求正常完成喵
+                stream_completed_normally = False
                 try:
                     # 逐块透传并观察尾包 usage 喵
                     async for chunk in iter_upstream_bytes(attempt):
                         yield chunk
+                    # 只有上游字节迭代器自然结束才允许进入成功耗时统计喵
+                    stream_completed_normally = attempt.stream_completed_normally
                 finally:
-                    # 流结束或客户端断开时记录总时长，避免把放行时长误叫完整总时长喵
+                    # 无论流如何结束都计算客户端视角的完整生命周期耗时供日志使用喵
                     total_ms = (time.monotonic() - stream_started_at) * 1000
-                    # 流式只有在生成器结束后才统一创建 RPM/TPM 事件喵
+                    # 流结束后统一创建 RPM/TPM 事件，保持既有成功流速率统计语义喵
                     if attempt.virtual_model is not None:
                         attempt.rate_event = state.record_rate_event(
                             attempt.virtual_model,
                             attempt.usage_tokens,
                         )
-                    # 把完整流耗时补进刚刚创建的统计事件喵
-                    if attempt.rate_event is not None:
+                    # 只有正常结束的流才补写完整耗时，异常流不污染平均值喵
+                    if stream_completed_normally and attempt.rate_event is not None:
                         state.attach_elapsed_ms(attempt.rate_event, total_ms)
                     logger.info(
-                        "流式请求结束 虚拟模型=%s 返回请求耗时=%.0fms usage_tokens=%s 喵",
+                        "流式请求结束 虚拟模型=%s 返回请求耗时=%.0fms 正常完成=%s usage_tokens=%s 喵",
                         attempt.virtual_model or "未知",
                         total_ms,
+                        stream_completed_normally,
                         attempt.usage_tokens if attempt.usage_tokens is not None else "未上报",
                     )
                     # 尾包 usage 已在 iterator 结束时观察完成，统计事件直接使用最终值喵
-                    # 没有 usage 时保持 None，RPM 已记录但 TPM 仍显示未完整上报喵
+                    # 没有 usage 时保持 None，正常 RPM 已记录但 TPM 仍显示未完整上报喵
             # 禁止缓存，否则中间层可能把 SSE 缓存起来导致客户端收不到增量喵
             stream_headers["Cache-Control"] = "no-cache"
             # 关掉 nginx 一类反向代理的缓冲，不加这个头会导致流被攒成一大坨才下发喵

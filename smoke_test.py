@@ -415,6 +415,18 @@ async def run_smoke() -> bool:
                     "首包丢失说明缓冲replay有问题",
                 )
             )
+            # 读取流完全结束后的统计快照，验证正常流写入完整请求耗时喵
+            stream_rate = next(
+                rate for rate in state.snapshot_virtual_model_rates() if rate.virtual_model == "auto-smoke"
+            )
+            # 正常结束的流应至少贡献一条已完成请求记录喵
+            results.append(
+                check(
+                    "正常结束的流计入平均耗时",
+                    stream_rate.completed_requests >= 1 and stream_rate.average_elapsed_ms is not None,
+                    f"已完成={stream_rate.completed_requests} 平均耗时={stream_rate.average_elapsed_ms}",
+                )
+            )
 
             # ---- 检查 6：未配置的虚拟模型回 400 喵 ----
             print("\n检查 6：未配置的虚拟模型应该回 400 喵")

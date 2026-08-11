@@ -242,14 +242,15 @@ async def _run_one_candidate(
             elapsed_ms = (time.monotonic() - request_started_at) * 1000
             # 流式在此刻只是确认健康并放行，完整总时长要等流结束后才知道喵
             if is_stream:
+                # 计算从本次上游节点请求开始到第一个非空字节到达的节点耗时喵
                 first_byte_ms = (
                     (result.first_byte_at - result.started_at) * 1000
                     if result.first_byte_at is not None and result.started_at is not None
                     else 0.0
                 )
                 logger.info(
-                    "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 放行时长=%.0fms 返回请求耗时=%.0fms",
-                    req_id, candidate.name, attempt_no, first_byte_ms, elapsed_ms, elapsed_ms,
+                    "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 请求首字=%.0fms",
+                    req_id, candidate.name, attempt_no, first_byte_ms, elapsed_ms,
                 )
             # 非流式此时完整响应已读完，记录服务端返回响应前的全程耗时喵
             else:

@@ -124,6 +124,8 @@ class AttemptResult:
     released_at: float | None = None
     # 流式转发阶段继续观察 SSE usage 的对象喵
     usage_observer: StreamUsageObserver | None = None
+    # 流式上游字节迭代器是否自然结束，异常或客户端取消时保持 False 喵
+    stream_completed_normally: bool = False
     # 统计所属的虚拟模型名，流结束时由 server 用于补写 TPM 喵
     virtual_model: str | None = None
     # RPM 事件对象，流结束时补写最终 usage 喵
@@ -899,6 +901,8 @@ async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:
             if result.usage_observer is not None:
                 result.usage_tokens = result.usage_observer.tokens
             yield chunk
+        # 只有 async for 自然耗尽才标记正常完成，异常路径不会执行到这里喵
+        result.stream_completed_normally = True
     # 喵~防御：上游中途断连时不再抛给客户端（此时响应头已经发出去了，抛异常也没用），
     # 直接结束这条流，客户端的 SDK 会按「流意外结束」处理喵
     except (httpx.HTTPError, OSError):

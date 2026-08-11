@@ -855,6 +855,21 @@ def test_流结束后上报事件携带最终usage与耗时():
     assert row.average_elapsed_ms == 456.0
 
 
+def test_异常流统计事件不带完整耗时():
+    """异常流可以保留速率事件，但没有完整耗时就不能进入平均值喵~"""
+    # 造状态喵
+    state = make_state()
+    # 模拟异常结束后只登记 RPM/TPM 的事件喵
+    state.record_rate_event("auto-test", 88)
+    # 取统计快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # 速率事件仍然存在喵
+    assert row.rpm == 1
+    # 没有完整耗时的异常流不得计入平均值喵
+    assert row.completed_requests == 0
+    assert row.average_elapsed_ms is None
+
+
 def test_冻结与解冻():
     """冻结后应该查得到剩余时间，解冻后应该立刻可用喵~"""
     # 造状态和候选喵
@@ -1551,6 +1566,66 @@ async def test_健康的流会一字不差地转发():
         collected += chunk
     # 收到的字节必须和上游原始输出一字不差喵
     assert collected == original
+
+
+@pytest.mark.asyncio
+async def test_流式放行日志区分节点首字与客户端请求首字(caplog):
+    """放行日志必须分开输出节点首字和客户端请求首字，不能提前记录完整耗时喵~"""
+    # 造一条足以通过默认内容门槛的正常 SSE 流喵
+    healthy_stream = sse(json.dumps({"choices": [{"delta": {"content": "足够通过健康探测的内容"}}]}), "[DONE]")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：回一条正常健康流喵~"""
+        # 用流式响应把健康流交给代理喵
+        return 流式响应(healthy_stream)
+
+    # 造运行时状态喵
+    state = make_state()
+    # 开启编排层日志收集喵
+    caplog.set_level(logging.INFO, logger="autoapi.proxy")
+    # 跑到流健康放行阶段喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test", "stream": True})
+    # 流探测应成功喵
+    assert outcome.success is True
+    # 取出流式成功日志喵
+    stream_logs = [record.getMessage() for record in caplog.records if "流 首字=" in record.getMessage()]
+    # 应该只输出一条放行日志喵
+    assert len(stream_logs) == 1
+    # 日志必须包含两套已知口径喵
+    assert "首字=" in stream_logs[0]
+    assert "请求首字=" in stream_logs[0]
+    # 放行阶段尚未完成请求，不能伪造完整返回耗时喵
+    assert "返回请求耗时=" not in stream_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_上游读取异常不标记流式正常完成():
+    """流式读取途中出现 HTTPX 异常时，迭代器不得标记为正常完成喵~"""
+    # 引入流转发函数和结果类型喵
+    from autoapi.upstream import AttemptResult, iter_upstream_bytes
+
+    async def broken_iterator():
+        # 先吐一块数据，模拟流已经向客户端开始转发喵
+        yield b"data: partial\n\n"
+        # 喵~防御：模拟上游读取中断，不能被误判为自然结束喵
+        raise httpx.ReadError("上游读取中断")
+
+    # 造带上游响应与异常迭代器的流式结果喵
+    result = AttemptResult(
+        ok=True,
+        status=200,
+        response=httpx.Response(200),
+        iterator=broken_iterator(),
+    )
+    # 收集代理已成功转发的前缀字节喵
+    collected = b""
+    # 消费转发迭代器；内部会吞掉预期的 HTTPX 读取异常喵
+    async for chunk in iter_upstream_bytes(result):
+        collected += chunk
+    # 已经成功转发的前缀必须保留喵
+    assert collected == b"data: partial\n\n"
+    # 读取异常不能被标记为完整结束，server 因此不会写入平均耗时喵
+    assert result.stream_completed_normally is False
 
 
 @pytest.mark.asyncio
