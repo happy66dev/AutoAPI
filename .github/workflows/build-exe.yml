@@ -1,5 +1,5 @@
 # GitHub Actions 工作流名称喵
-title: Windows exe 构建喵
+name: Windows exe 构建喵
 
 # 代码推送、版本标签和手动触发都执行构建喵
 on:
