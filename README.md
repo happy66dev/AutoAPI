@@ -74,6 +74,24 @@ python main.py
 
 启动之后把客户端的 base_url 指向 `http://127.0.0.1:8787`，`model` 填配置里的虚拟模型名就行喵。
 
+### Windows EXE 发行包
+
+GitHub Actions 会在 `master` 推送、手动触发和版本 tag（`v*`）时自动构建 Windows EXE 喵~ 普通构建的 ZIP 可以从 Actions 的 artifact 下载，版本 tag 构建还会自动附加到 GitHub Release 喵~
+
+发行包只包含 `autoapi.exe` 和公开的 `config.example` 模板，**不会内置 `config.yaml` 或任何真实 API key** 喵~ 下载并解压后，在 EXE 同目录用 PowerShell 创建自己的配置文件喵：
+
+```powershell
+Copy-Item config.example config.yaml
+```
+
+编辑 `config.yaml` 填入自己的真实 key 后启动代理喵~ 推荐后台运行时关闭交互式 REPL：
+
+```powershell
+.\\autoapi.exe --no-repl -c config.yaml
+```
+
+也可以通过 `-c` / `--config` 指向其他位置的配置文件喵~ 配置文件必须由主人自行保管，绝对不要上传到 GitHub 或放进发行包喵~
+
 ### 命令行参数
 
 | 参数 | 说明 |
@@ -257,7 +275,7 @@ target on
 target off
 ```
 
-开启后，某个虚拟模型的候选链整轮失败时，代理不会立即把 502 返回给客户端，而是每隔 5 秒从链首重新尝试，最多持续 5 分钟喵~ 5 分钟内只要任意候选成功，客户端就能继续拿到正常响应喵~
+开启后，某个虚拟模型的候选链整轮失败时，代理不会立即把 502 返回给客户端，而是按 `server.target_mode_round_interval_seconds` 从链首重新尝试，最多持续 `server.target_mode_max_wait_seconds` 喵~ 目标模式的超时动作由 `server.target_mode_timeout_action` 配置，可以返回 504、429、502，或直接断开连接喵~
 
 - 已冻结的节点仍然会跳过，不会为了目标模式反复撞额度限制或绕过自动避险喵~
 - `passthrough` 仍然立即回传，不会重试客户端自己的明确错误喵~

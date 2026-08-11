@@ -1,0 +1,112 @@
+# GitHub Actions 工作流名称喵
+title: Windows exe 构建喵
+
+# 代码推送、版本标签和手动触发都执行构建喵
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# 发布步骤需要上传 GitHub Release，其他步骤仍只操作工作区喵
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 使用 Windows runner，因为 PyInstaller 产物与操作系统绑定喵
+    runs-on: windows-latest
+    # 给后续步骤提供统一的构建编号喵
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      # 拉取仓库源码喵
+      - name: 检出源码喵
+        uses: actions/checkout@v4
+
+      # 安装项目支持的 Python 版本喵
+      - name: 安装 Python 喵
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # 安装锁定的运行依赖和固定版本的打包工具喵
+      - name: 安装依赖喵
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller==6.11.1
+
+      # 先跑现有单元测试，避免把回归问题带进发行包喵
+      - name: 运行单元测试喵
+        shell: pwsh
+        run: python -m pytest
+
+      # 跑真实本地 HTTP 冒烟测试，验证代理主链路喵
+      - name: 运行冒烟测试喵
+        shell: pwsh
+        run: python smoke_test.py
+
+      # 使用 onefile 生成不包含外置配置的独立 exe 喵
+      - name: 构建 exe 喵
+        shell: pwsh
+        run: pyinstaller --noconfirm --clean --onefile --name autoapi main.py
+
+      # 验证打包后的 exe 至少能完成参数解析和导入喵
+      - name: 验证 exe 启动喵
+        shell: pwsh
+        run: .\dist\autoapi.exe --help
+
+      # 组装只含公开模板和 exe 的发行目录喵
+      - name: 组装发行文件喵
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release\autoapi"
+          New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+          Copy-Item "dist\autoapi.exe" (Join-Path $releaseDir "autoapi.exe")
+          Copy-Item "config.example" (Join-Path $releaseDir "config.example")
+          if (Test-Path (Join-Path $releaseDir "config.yaml")) {
+            throw "发行目录不允许包含真实配置文件喵"
+          }
+          Compress-Archive -Path "$releaseDir\*" -DestinationPath "release\autoapi-windows-x64.zip" -Force
+
+      # 检查压缩包只包含预期的公开文件喵
+      - name: 检查发行包内容喵
+        shell: pwsh
+        run: |
+          $archiveEntries = tar -tf "release\autoapi-windows-x64.zip"
+          $archiveEntries | Write-Host
+          if ($archiveEntries -match "config\.yaml$|\.git/|__pycache__|\.pytest_cache") {
+            throw "发行包包含禁止文件喵"
+          }
+          if (-not ($archiveEntries -match "autoapi\.exe$")) {
+            throw "发行包缺少 autoapi.exe 喵"
+          }
+          if (-not ($archiveEntries -match "config\.example$")) {
+            throw "发行包缺少 config.example 喵"
+          }
+
+      # 普通构建和标签构建都上传 Actions artifact 喵
+      - name: 上传构建产物喵
+        uses: actions/upload-artifact@v4
+        with:
+          name: autoapi-windows-x64
+          path: release/autoapi-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      # 只有版本标签才创建 GitHub Release，避免普通提交污染发布列表喵
+      - name: 发布 GitHub Release 喵
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/autoapi-windows-x64.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
