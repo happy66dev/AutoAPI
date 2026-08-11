@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 # 引入配置加载相关喵
 from .config import AppConfig, ConfigError, load_config
 # 引入编排层喵
-from .proxy import handle_request
+from .proxy import handle_request, STATUS_DROP_CONNECTION
 # 引入运行时状态喵
 from .state import RuntimeState
 # 引入把流式结果变成字节流的工具喵
@@ -304,6 +304,10 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
             # 服务端收到客户端请求的起始时刻喵
             request_started_at,
         )
+        # 喵~防御：目标模式超时且配置为断开连接时，直接抛异常中断响应喵
+        if not outcome.success and outcome.status == STATUS_DROP_CONNECTION:
+            logger.warning("目标模式超时，断开连接不返回响应喵")
+            raise RuntimeError("目标模式超时，主动断开连接喵")
         # 编排失败（400 或 502），把错误体作为 JSON 回给客户端喵
         if not outcome.success or outcome.attempt is None:
             return JSONResponse(outcome.error_body, status_code=outcome.status)

@@ -89,6 +89,9 @@ VALID_ACTIONS = {"retry", "next", "freeze", "passthrough"}
 # 允许的鉴权头风格，bearer 对应 OpenAI 系，x-api-key 对应 Anthropic 系喵
 VALID_AUTH_STYLES = {"bearer", "x-api-key"}
 
+# 允许的目标模式超时行为喵
+VALID_TARGET_MODE_ACTIONS = {"return_504", "return_429", "return_502", "drop_connection"}
+
 
 class ConfigError(Exception):
     """配置有问题时抛这个异常，携带人能看懂的中文原因喵~"""
@@ -250,6 +253,12 @@ class ServerConfig:
     metrics_window_minutes: float = 30.0
     # 配置文件热重载的轮询间隔秒数，0 表示关闭喵
     reload_poll_interval: float = 2.0
+    # 目标模式最长等待时长，单位：秒，默认 300 秒（5 分钟）喵
+    target_mode_max_wait_seconds: float = 300.0
+    # 目标模式每轮链路失败后的等待间隔，单位：秒，默认 5 秒喵
+    target_mode_round_interval_seconds: float = 5.0
+    # 目标模式超时后的行为，取值：return_504 / return_429 / return_502 / drop_connection 喵
+    target_mode_timeout_action: str = "return_504"
 
 
 @dataclass(frozen=True)
@@ -553,10 +562,23 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
         metrics_window_minutes=max(0.1, float(server_raw.get("metrics_window_minutes", 30.0))),
         # 热重载轮询间隔，允许为 0 表示彻底关闭该功能喵
         reload_poll_interval=max(0.0, float(server_raw.get("reload_poll_interval", 2.0))),
+        # 目标模式最长等待时长，至少 1 秒喵
+        target_mode_max_wait_seconds=max(1.0, float(server_raw.get("target_mode_max_wait_seconds", 300.0))),
+        # 目标模式每轮等待间隔，至少 0.1 秒喵
+        target_mode_round_interval_seconds=max(0.1, float(server_raw.get("target_mode_round_interval_seconds", 5.0))),
+        # 目标模式超时行为，默认 return_504 喵
+        target_mode_timeout_action=str(server_raw.get("target_mode_timeout_action", "return_504")).strip().lower(),
     )
     # 喵~防御：端口必须在合法范围内，否则 uvicorn 启动会报难懂的底层错误喵
     if not (1 <= server.port <= 65535):
         raise ConfigError(f"server.port={server.port} 不在 1~65535 范围内喵")
+    # 喵~防御：目标模式超时行为必须在白名单里，拼错要立刻发现喵
+    if server.target_mode_timeout_action not in VALID_TARGET_MODE_ACTIONS:
+        allowed = "、".join(sorted(VALID_TARGET_MODE_ACTIONS))
+        raise ConfigError(
+            f"server.target_mode_timeout_action={server.target_mode_timeout_action!r} 不合法，"
+            f"只支持：{allowed} 喵"
+        )
     # 取虚拟模型表喵
     vms_raw = data.get("virtual_models")
     # 喵~防御：虚拟模型表必须存在且是字典，否则代理没有任何可服务的模型喵

@@ -55,6 +55,23 @@ server:
   metrics_window_minutes: 30
   # 配置文件热重载的轮询间隔，单位：秒。设为 0 表示关闭自动重载喵
   reload_poll_interval: 2.0
+  # ===== 目标模式配置喵 =====
+  # 目标模式可通过 REPL 的 target on/off 临时开启，开启后会让请求在所有候选都失败时
+  # 持续重试一段时间而不是立即返回 502，适合用来保住正在运行的长时间客户端任务喵。
+  # 目标模式最长等待时长，单位：秒，默认 300 秒（5 分钟）喵
+  target_mode_max_wait_seconds: 300
+  # 目标模式每轮链路失败后的等待间隔，单位：秒，默认 5 秒喵
+  target_mode_round_interval_seconds: 5
+  # 目标模式超时后的行为，可选值（不同客户端的重试机制不同，按需选择）喵：
+  #   return_504        - 返回 504 Gateway Timeout（推荐，HTTP 标准网关超时状态码，
+  #                       大多数客户端如 Claude Code、Codex 都会识别并自动重试）
+  #   return_429        - 返回 429 Too Many Requests（表示限流，部分客户端会重试，
+  #                       但语义上不太准确因为实际是超时而非限流）
+  #   return_502        - 返回 502 Bad Gateway（伪装成上游服务故障，部分客户端会重试）
+  #   drop_connection   - 直接断开 TCP 连接不返回任何 HTTP 响应（伪造网络超时，
+  #                       客户端会收到连接中断错误，可能触发底层网络重试机制，
+  #                       但调试困难且行为不可预测，不推荐使用）
+  target_mode_timeout_action: return_504
 
 # ===== 虚拟模型表喵 =====
 # key 是客户端请求体里要填的 model 名字，value 是按优先级排好的候选链

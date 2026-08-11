@@ -347,10 +347,8 @@ async def _run_one_candidate(
         return "next", result
 
 
-# 本次目标模式最多坚持多久，单位：秒喵
-TARGET_MODE_MAX_WAIT_SECONDS = 300.0
-# 目标模式一整轮链路失败后的固定等待，单位：秒喵
-TARGET_MODE_ROUND_INTERVAL_SECONDS = 5.0
+# 特殊状态码：表示目标模式超时后需要断开连接喵
+STATUS_DROP_CONNECTION = -5
 
 
 async def handle_request(
@@ -428,15 +426,20 @@ async def handle_request(
     is_stream = detect_stream_flag(body_obj)
     # 判断目标模式是否开启，开关只从内存读取，不接触 config.yaml 喵
     target_mode = state.target_mode_enabled
+    # 取一份配置快照，用于读取目标模式的各项配置喵
+    config = state.config
     # 目标模式请求的截止时刻，使用单调时钟避免系统时间跳变喵
-    target_deadline = time.monotonic() + TARGET_MODE_MAX_WAIT_SECONDS if target_mode else None
+    target_deadline = (
+        time.monotonic() + config.server.target_mode_max_wait_seconds if target_mode else None
+    )
     # 目标模式已经循环了多少轮喵
     target_rounds = 0
     # 目标模式开始时记录日志喵
     if target_mode:
         logger.warning(
             "[%s] 目标模式已接管虚拟模型 %s：链路全失效后每 %.0f 秒重试，最长 %.0f 分钟喵",
-            req_id, virtual_model, TARGET_MODE_ROUND_INTERVAL_SECONDS, TARGET_MODE_MAX_WAIT_SECONDS / 60,
+            req_id, virtual_model, config.server.target_mode_round_interval_seconds,
+            config.server.target_mode_max_wait_seconds / 60,
         )
     # 目标模式外层循环：正常模式只执行一轮，目标模式整轮失败后回到链首喵
     while True:
@@ -492,20 +495,56 @@ async def handle_request(
                     "attempts": failures,
                 }},
             )
-        # 目标模式下，截止时间到了也要让本轮完整结束后才返回 429 喵
+        # 目标模式下，截止时间到了也要让本轮完整结束后才根据配置行为返回喵
         now = time.monotonic()
         if target_deadline is not None and now >= target_deadline:
-            waited_seconds = TARGET_MODE_MAX_WAIT_SECONDS
+            waited_seconds = config.server.target_mode_max_wait_seconds
+            # 根据配置的超时行为决定返回什么喵
+            action = config.server.target_mode_timeout_action
             logger.error(
-                "[%s] 目标模式结束 虚拟模型=%s 已尝试%d轮、等待%.0f秒仍无成功响应喵：%s",
-                req_id, virtual_model, target_rounds, waited_seconds, " | ".join(failures),
+                "[%s] 目标模式结束 虚拟模型=%s 已尝试%d轮、等待%.0f秒仍无成功响应，行为=%s 喵：%s",
+                req_id, virtual_model, target_rounds, waited_seconds, action, " | ".join(failures),
             )
+            # drop_connection：断开连接不返回任何响应，客户端会感知为网络超时喵
+            if action == "drop_connection":
+                return ProxyOutcome(
+                    success=False,
+                    status=STATUS_DROP_CONNECTION,
+                    error_body={"error": {
+                        "message": "目标模式超时，断开连接喵",
+                        "type": "target_mode_drop_connection",
+                        "virtual_model": virtual_model,
+                        "rounds": target_rounds,
+                        "waited_seconds": waited_seconds,
+                    }},
+                )
+            # return_504：返回 504 Gateway Timeout，标准的网关超时状态码喵
+            elif action == "return_504":
+                status_code = 504
+                error_type = "target_mode_gateway_timeout"
+                message = "目标模式超时：所有链路等待超时喵"
+            # return_429：返回 429 Too Many Requests，表示限流喵
+            elif action == "return_429":
+                status_code = 429
+                error_type = "target_mode_rate_limit"
+                message = "目标模式超时：所有链路全部不可用喵"
+            # return_502：返回 502 Bad Gateway，伪装成上游故障喵
+            elif action == "return_502":
+                status_code = 502
+                error_type = "target_mode_bad_gateway"
+                message = "目标模式超时：所有链路返回错误喵"
+            # 喵~防御：未知行为（理论上配置加载时已经挡住了），兜底用 504 喵
+            else:
+                status_code = 504
+                error_type = "target_mode_timeout"
+                message = f"目标模式超时（未知行为 {action}）喵"
+            # 返回对应的错误响应喵
             return ProxyOutcome(
                 success=False,
-                status=429,
+                status=status_code,
                 error_body={"error": {
-                    "message": "所有链路全部不可用喵",
-                    "type": "target_mode_all_unavailable",
+                    "message": message,
+                    "type": error_type,
                     "virtual_model": virtual_model,
                     "target_mode": True,
                     "rounds": target_rounds,
@@ -513,9 +552,9 @@ async def handle_request(
                     "attempts": failures,
                 }},
             )
-        # 还没到截止时间，固定等待 5 秒后从链首开始下一轮喵
+        # 还没到截止时间，等待配置的间隔后从链首开始下一轮喵
         logger.warning(
             "[%s] 目标模式第%d轮链路全部不可用，%.0f秒后从链首重试喵：%s",
-            req_id, target_rounds, TARGET_MODE_ROUND_INTERVAL_SECONDS, " | ".join(failures),
+            req_id, target_rounds, config.server.target_mode_round_interval_seconds, " | ".join(failures),
         )
-        await asyncio.sleep(TARGET_MODE_ROUND_INTERVAL_SECONDS)
+        await asyncio.sleep(config.server.target_mode_round_interval_seconds)
