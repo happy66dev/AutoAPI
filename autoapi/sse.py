@@ -296,13 +296,20 @@ class StreamProbe:
         """处理一整行文本，更新并返回结论喵~"""
         # 去掉首尾空白，SSE 的 data: 后面通常有个空格喵
         stripped = line.strip()
-        # 只关心 data: 开头的行，event: / id: / retry: / 空行都是框架信息，跳过喵
-        if not stripped.startswith("data:"):
+        # 判断这一行是否带标准 SSE data: 前缀喵
+        has_data_prefix = stripped.startswith("data:")
+        # 兼容真实中转站把 JSON error 裸放在 SSE 流里的异常格式喵
+        is_bare_json = stripped.startswith("{") and stripped.endswith("}")
+        # 标准 SSE 只关心 data: 行，其他框架行通常直接跳过喵
+        if not has_data_prefix and not is_bare_json:
             return self._verdict
         # 去掉 data: 前缀并再次去空白，得到真正的负载喵
-        payload = stripped[5:].strip()
+        payload = stripped[5:].strip() if has_data_prefix else stripped
         # 交给分类函数看这条负载是什么种类喵
         kind, info = classify_payload(payload)
+        # 裸 JSON 只有明确表示错误时才允许影响探测结论，避免误把普通框架数据当内容喵
+        if not has_data_prefix and kind != KIND_ERROR:
+            return self._verdict
         # 带文字的负载：把字数累加进计数，够门槛才放行喵
         if kind == KIND_TEXT:
             # 累加这条负载带来的字符数喵

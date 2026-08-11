@@ -692,6 +692,30 @@ def test_一个字符都没有时流结束仍判空流():
     assert probe.finish() == VERDICT_DONE_EMPTY
 
 
+def test_SSE心跳后裸JSON错误事件能被识别():
+    """兼容真实中转站把错误 JSON 裸放在 SSE 流里的格式喵~"""
+    # 造一个默认门槛的探测器，验证错误事件优先于空流结论喵
+    probe = StreamProbe()
+    # 拼出真实观测到的 PING 心跳和无 data: 前缀的错误 JSON 喵
+    error_payload = json.dumps(
+        {
+            "error": {
+                "type": "invalid_request_error",
+                "message": "The reasoning_content in the thinking mode must be passed back to the API.",
+            },
+            "type": "error",
+        }
+    )
+    # 心跳注释行应当被忽略，裸 JSON 错误应当在流结束时被识别为明确错误喵
+    probe.feed((": PING\n\n" + error_payload).encode())
+    # 调用 finish 处理没有换行结尾的裸 JSON 错误行喵
+    verdict = probe.finish()
+    # 不能再误判成 done_empty 喵
+    assert verdict == VERDICT_ERROR
+    # 错误详情应保留上游消息，方便规则和日志定位喵
+    assert "reasoning_content" in probe.detail
+
+
 def test_非JSON的心跳行不会误判():
     """有些上游会插入注释行或心跳，绝不能因为解析不了就误判成失败喵~"""
     # 造一个探测器喵
