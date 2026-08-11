@@ -182,6 +182,8 @@ class RuntimeState:
                 return 0.0
             # 算出还剩多少秒，用单调时钟避免系统时间被改动时算错喵
             remaining = info.until - time.monotonic()
+            # 将浮点误差压回纳秒级精度，避免刚冻结时出现 300.00000000000006 这种超出原时长的显示喵
+            remaining = round(remaining, 9)
             # 喵~防御：已经到期的记录顺手删掉并返回 0，防止冻结表无限膨胀喵
             if remaining <= 0:
                 del self._freezes[candidate.identity]
