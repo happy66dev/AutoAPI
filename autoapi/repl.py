@@ -175,13 +175,19 @@ def render_freeze_banner(state: RuntimeState) -> list[tuple[str, str]]:
     rows = state.list_frozen_nodes()
     # 先取每个虚拟模型近 60 秒的动态 RPM/TPM，放在冻结状态上方喵
     rate_rows = state.snapshot_virtual_model_rates()
-    # 目标模式开启时先显示醒目的运行期提示，避免主人忘记请求会尽量坚持 5 分钟喵
+    # 目标模式开启时先显示醒目的运行期提示，避免主人忘记请求会尽量坚持配置的时长喵
     target_enabled = state.target_mode_enabled
     # 先渲染负载信息，RPM 统计成功请求，TPM 只来自上游 usage 喵
     fragments: list[tuple[str, str]] = []
-    # 目标模式提示放在横幅最顶端喵
+    # 目标模式提示放在横幅最顶端，从配置读取实际值喵
     if target_enabled:
-        fragments.append(("class:warn", "🎯 目标模式已开启：链路全失效时会每 5 秒重试，最长坚持 5 分钟"))
+        config = state.config
+        interval_sec = config.server.target_mode_round_interval_seconds
+        max_wait_min = config.server.target_mode_max_wait_seconds / 60
+        fragments.append((
+            "class:warn",
+            f"🎯 目标模式已开启：链路全失效时会每 {interval_sec:.0f} 秒重试，最长坚持 {max_wait_min:.0f} 分钟"
+        ))
     # 按配置顺序逐个显示虚拟模型，避免横幅顺序每秒跳动喵
     for rate in rate_rows:
         # TPM 未完整上报时明确显示未知，不把未知伪装成 0 喵
@@ -1237,7 +1243,13 @@ class Repl:
             # 开启目标模式喵
             if sub in ("on", "enable"):
                 self.state.set_target_mode(True)
-                print("🎯 目标模式已开启喵：链路全失效后会每 5 秒从链首重试，最长坚持 5 分钟~")
+                config = self.state.config
+                interval_sec = config.server.target_mode_round_interval_seconds
+                max_wait_min = config.server.target_mode_max_wait_seconds / 60
+                print(
+                    f"🎯 目标模式已开启喵：链路全失效后会每 {interval_sec:.0f} 秒从链首重试，"
+                    f"最长坚持 {max_wait_min:.0f} 分钟~"
+                )
                 return
             # 关闭目标模式喵
             if sub in ("off", "disable"):
