@@ -288,19 +288,70 @@ def build_upstream_headers(client_headers: dict[str, str], candidate: Candidate)
     return headers
 
 
+def _strip_reasoning_content(messages: list[Any]) -> list[Any]:
+    """
+    从消息列表里剥掉所有 assistant 消息里的 reasoning_content 字段喵~
+
+    DeepSeek 的 thinking 模式对 reasoning_content 有严格要求：
+        上游只接受「这一轮自己生成的」reasoning_content 被回传，
+        任何格式不对或不该传的 reasoning_content 都会触发 400。
+        最安全的做法是代理侧一律剥掉，让上游自己在当前轮重新生成思维链喵。
+
+    适用范围：只对 assistant 角色的消息做这个处理，user/system 消息不含此字段、
+             即使含了也不是 DeepSeek 关注的，所以不处理喵。
+
+    输入：原始 messages 列表（来自客户端请求体）
+    输出：新列表，assistant 条目均为浅拷贝并去掉 reasoning_content 字段喵
+    """
+    # 喵~防御：传进来的不是列表时直接原样返回，不抛异常喵
+    if not isinstance(messages, list):
+        return messages
+    # 结果列表喵
+    cleaned: list[Any] = []
+    # 逐条处理喵
+    for msg in messages:
+        # 喵~防御：列表元素不是字典时原样保留，不做任何修改喵
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        # 只处理 assistant 角色的消息，其他角色直接保留喵
+        if msg.get("role") == "assistant" and "reasoning_content" in msg:
+            # 浅拷贝后删除 reasoning_content，原字典不动喵
+            clean_msg = dict(msg)
+            del clean_msg["reasoning_content"]
+            cleaned.append(clean_msg)
+        else:
+            # 其余消息原样保留，不做任何拷贝，省内存喵
+            cleaned.append(msg)
+    return cleaned
+
+
 def build_upstream_body(body_obj: dict[str, Any], candidate: Candidate) -> bytes:
     """
     构造发给上游的请求体喵~
 
-    只改一个字段：把顶层的 model 换成候选的真实模型名。其余字段（messages、tools、
-    temperature、上游自定义扩展字段）一律原样保留，做到最大程度透传喵。
-    OpenAI 的 /v1/chat/completions 和 Anthropic 的 /v1/messages 都把 model 放在顶层，
-    所以这一处替换对两种协议通用，不需要做协议探测喵。
+    做两件事：
+        1. 把顶层 model 替换成候选的真实模型名。
+        2. 若目标是 DeepSeek 模型（模型名含 deepseek，不区分大小写），则自动剥掉
+           messages 里所有 assistant 条目的 reasoning_content 字段。
+
+    为什么要剥 reasoning_content（DeepSeek 专属）：
+        DeepSeek 的 thinking 模式要求「只传回本轮自己生成的」reasoning_content，
+        传错或传多了就会触发 400 invalid_request_error。客户端（如 Cursor、Continue 等）
+        往往会把上一轮 assistant 的全部字段原样带回，包括 reasoning_content，导致
+        DeepSeek 拒绝请求。代理在这里悄悄剥掉，让上游自己重新生成思维链，
+        既符合 DeepSeek 的协议要求，也对客户端完全透明喵。
     """
     # 浅拷贝一份，避免改动调用方持有的原始字典（原字典可能还要用于日志）喵
     new_body = dict(body_obj)
     # 把 model 换成这个候选的真实模型名喵
     new_body["model"] = candidate.model
+    # 判断是否是 DeepSeek 模型（不区分大小写），只有 DeepSeek 才需要剥 reasoning_content 喵
+    is_deepseek = "deepseek" in candidate.model.lower()
+    # DeepSeek 模型且 messages 字段存在时，剥掉 assistant 消息里的 reasoning_content 喵
+    if is_deepseek and isinstance(new_body.get("messages"), list):
+        # 剥掉之后写回 new_body，原始 body_obj 里的 messages 不受影响喵
+        new_body["messages"] = _strip_reasoning_content(new_body["messages"])
     # 序列化成字节，ensure_ascii=False 保留中文原样以减小体积喵
     return json.dumps(new_body, ensure_ascii=False).encode("utf-8")
 
