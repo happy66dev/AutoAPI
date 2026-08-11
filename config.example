@@ -51,6 +51,7 @@ server:
   # 自动避险触发后冻结多少分钟喵
   auto_hedge_minutes: 10
   # 动态 RPM/TPM/平均耗时的滚动窗口，单位：分钟，默认近 30 分钟，可用 REPL 的 set 修改喵
+  # 平均耗时只统计正常完成请求的完整请求耗时，不使用流式「首字」或「请求首字」喵
   metrics_window_minutes: 30
   # 配置文件热重载的轮询间隔，单位：秒。设为 0 表示关闭自动重载喵
   reload_poll_interval: 2.0
