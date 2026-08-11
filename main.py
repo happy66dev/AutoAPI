@@ -249,8 +249,26 @@ def resolve_config_path(raw: str) -> Path:
     return script_candidate
 
 
+def configure_utf8_output() -> None:
+    """尽量把标准输出切换成 UTF-8，避免 Windows 打包版输出中文时报编码错喵~"""
+    # 分别处理标准输出和标准错误，帮助信息与启动错误都能安全显示喵
+    for output_stream in (sys.stdout, sys.stderr):
+        # 喵~防御：某些重定向对象没有 reconfigure 方法时保留原输出行为喵
+        reconfigure = getattr(output_stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            # 使用替换策略兜底，避免终端编码仍异常时让错误输出反过来崩溃喵
+            reconfigure(encoding="utf-8", errors="replace")
+        # 喵~防御：管道或特殊宿主拒绝改编码时不影响代理主体启动喵
+        except (OSError, ValueError):
+            continue
+
+
 def parse_args() -> argparse.Namespace:
     """解析命令行参数喵~"""
+    # 先配置 UTF-8 输出，确保 --help 在 Windows 控制台也能显示中文喵
+    configure_utf8_output()
     # 创建解析器，描述文本会出现在 -h 的输出里喵
     parser = argparse.ArgumentParser(description="autoapi —— LLM API 故障转移代理喵~")
     # -c/--config 指定配置文件路径，默认 config.yaml 喵
