@@ -1949,8 +1949,8 @@ async def test_目标模式首轮失败后第二轮成功(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_目标模式截止后返回429(monkeypatch):
-    """目标模式超过 5 分钟后应返回 429，并附诊断信息喵~"""
+async def test_目标模式截止后返回504(monkeypatch):
+    """目标模式超过配置时长后应返回 504（新默认值），并附诊断信息喵~"""
     current_time = 1000.0
     async def fake_sleep(seconds: float) -> None:
         nonlocal current_time
@@ -1968,14 +1968,109 @@ async def test_目标模式截止后返回429(monkeypatch):
     state.set_target_mode(True)
     # 运行请求喵
     outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
-    # 目标模式应该返回 429 而不是 502 喵
+    # 目标模式应该返回 504（新默认值）而不是 502 喵
     assert outcome.success is False
-    assert outcome.status == 429
+    assert outcome.status == 504
     error = outcome.error_body["error"]
     assert error["target_mode"] is True
-    assert error["type"] == "target_mode_all_unavailable"
+    assert error["type"] == "target_mode_gateway_timeout"
     assert error["rounds"] >= 2
     assert error["waited_seconds"] == 300.0
+
+
+@pytest.mark.asyncio
+async def test_目标模式可配置超时行为_return_429(monkeypatch):
+    """目标模式配置为 return_429 时应返回 429 状态码喵~"""
+    current_time = 1000.0
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+    def fake_monotonic() -> float:
+        return current_time
+    # 注入单调时钟与睡眠喵
+    monkeypatch.setattr("autoapi.proxy.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("autoapi.proxy.asyncio.sleep", fake_sleep)
+    # 永远失败的上游喵
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+    # 造状态并修改配置为 return_429 喵
+    state = make_state()
+    config = state.config
+    # 修改配置中的超时行为喵
+    from dataclasses import replace
+    new_server = replace(config.server, target_mode_timeout_action="return_429")
+    new_config = replace(config, server=new_server)
+    state.replace_config(new_config)
+    state.set_target_mode(True)
+    # 运行请求喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该返回 429 喵
+    assert outcome.success is False
+    assert outcome.status == 429
+    assert outcome.error_body["error"]["type"] == "target_mode_rate_limit"
+
+
+@pytest.mark.asyncio
+async def test_目标模式可配置超时行为_return_502(monkeypatch):
+    """目标模式配置为 return_502 时应返回 502 状态码喵~"""
+    current_time = 1000.0
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+    def fake_monotonic() -> float:
+        return current_time
+    # 注入单调时钟与睡眠喵
+    monkeypatch.setattr("autoapi.proxy.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("autoapi.proxy.asyncio.sleep", fake_sleep)
+    # 永远失败的上游喵
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+    # 造状态并修改配置为 return_502 喵
+    state = make_state()
+    config = state.config
+    from dataclasses import replace
+    new_server = replace(config.server, target_mode_timeout_action="return_502")
+    new_config = replace(config, server=new_server)
+    state.replace_config(new_config)
+    state.set_target_mode(True)
+    # 运行请求喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该返回 502 喵
+    assert outcome.success is False
+    assert outcome.status == 502
+    assert outcome.error_body["error"]["type"] == "target_mode_bad_gateway"
+
+
+@pytest.mark.asyncio
+async def test_目标模式可配置超时行为_drop_connection(monkeypatch):
+    """目标模式配置为 drop_connection 时应返回特殊状态码喵~"""
+    current_time = 1000.0
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal current_time
+        current_time += seconds
+    def fake_monotonic() -> float:
+        return current_time
+    # 注入单调时钟与睡眠喵
+    monkeypatch.setattr("autoapi.proxy.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("autoapi.proxy.asyncio.sleep", fake_sleep)
+    # 永远失败的上游喵
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+    # 造状态并修改配置为 drop_connection 喵
+    state = make_state()
+    config = state.config
+    from dataclasses import replace
+    new_server = replace(config.server, target_mode_timeout_action="drop_connection")
+    new_config = replace(config, server=new_server)
+    state.replace_config(new_config)
+    state.set_target_mode(True)
+    # 运行请求喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 应该返回特殊的断开连接状态码喵
+    assert outcome.success is False
+    from autoapi.proxy import STATUS_DROP_CONNECTION
+    assert outcome.status == STATUS_DROP_CONNECTION
+    assert outcome.error_body["error"]["type"] == "target_mode_drop_connection"
 
 
 def test_目标模式开关默认关闭且不写配置():
