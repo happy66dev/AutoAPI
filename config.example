@@ -189,6 +189,12 @@ rules:
       status: [401, 403, 404]
     action: next
 
+  # 上下文超限不是客户端字段格式错误，换到上下文窗口更大的候选继续尝试喵
+  - match:
+      status: 400
+      body_regex: 'context_length_exceeded'
+    action: next
+
   # 400 通常是客户端自己请求体写错了，换渠道也没用，原样回传让客户端自己看喵
   - match:
       status: 400

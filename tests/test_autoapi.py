@@ -115,6 +115,8 @@ def make_config_dict(**overrides):
             {"match": {"status": "timeout"}, "action": "retry", "max_attempts": 2, "backoff_base": 1.0},
             {"match": {"status": "bad_stream"}, "action": "next"},
             {"match": {"status": [401, 403, 404]}, "action": "next"},
+            # 上下文超限应切换候选，必须排在通用 400 规则之前喵
+            {"match": {"status": 400, "body_regex": r"context_length_exceeded"}, "action": "next"},
             {"match": {"status": 400}, "action": "passthrough"},
         ],
     }
@@ -141,8 +143,8 @@ def test_配置能正常加载():
     assert len(config.virtual_models) == 1
     # 那个虚拟模型应该有两个候选喵
     assert len(config.virtual_models["auto-test"]) == 2
-    # 应该有七条规则喵（freeze、5xx retry、卡流 retry、超时 retry、bad_stream、401 系、400）
-    assert len(config.rules) == 7
+    # 应该有八条规则喵（freeze、5xx retry、卡流 retry、超时 retry、bad_stream、401 系、上下文超限、400）
+    assert len(config.rules) == 8
     # 第一个候选的真实模型名应该被正确解析喵
     assert config.virtual_models["auto-test"][0].model == "gpt-4o"
 
@@ -1206,6 +1208,42 @@ async def test_被冻结的候选会被跳过():
     assert outcome.success is True
     # 应该直接打备用，完全没碰主力喵
     assert hits == ["backup.test"]
+
+
+@pytest.mark.asyncio
+async def test_上下文超限400会切换候选():
+    """上下文窗口不够时应换到候选链中的下一个模型喵~"""
+    # 记录每次请求命中的上游主机喵
+    hits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """假上游：主力上下文超限，备用正常返回喵~"""
+        # 记录当前请求命中的主机喵
+        hits.append(request.url.host)
+        # 主力返回真实格式的上下文超限错误喵
+        if request.url.host == "primary.test":
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "type": "context_length_exceeded",
+                        "message": "maximum context length exceeded",
+                    }
+                },
+            )
+        # 备用返回成功内容喵
+        return httpx.Response(200, json={"choices": [{"message": {"content": "FROM-BACKUP"}}]})
+
+    # 造测试状态喵
+    state = make_state()
+    # 执行一次完整代理请求喵
+    outcome = await run_proxy(make_client(handler), state, {"model": "auto-test"})
+    # 上下文超限后应由备用候选成功喵
+    assert outcome.success is True
+    # 请求顺序必须是主力再备用喵
+    assert hits == ["primary.test", "backup.test"]
+    # 返回体应来自备用候选喵
+    assert b"FROM-BACKUP" in outcome.attempt.body
 
 
 @pytest.mark.asyncio
