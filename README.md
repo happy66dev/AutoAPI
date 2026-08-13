@@ -419,5 +419,11 @@ python smoke_test.py
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=happy66dev/AutoAPI&type=Date)](https://star-history.com/#happy66dev/AutoAPI&Date)
+<a href="https://www.star-history.com/?repos=happy66dev%2FAutoAPI&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=happy66dev/AutoAPI&type=date&theme=dark&legend=top-left&sealed_token=gaO5fgqPoRn51RcqFvGkYCHyixpyO9yPD65650froUViP3AMMC2DQChcSmhwpkaEPOWWdVMt2HRzVlzokORF6iUWFI_1ALW8_uMgCy-Zo377m251MOytOND_k9E0_Z_WUPsEtqeuGnQxLdoRPt5Ozq3Ad4NuSOGGgpPTEGEGI4IF8l5lTgkrgRLbRRXr" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=happy66dev/AutoAPI&type=date&legend=top-left&sealed_token=gaO5fgqPoRn51RcqFvGkYCHyixpyO9yPD65650froUViP3AMMC2DQChcSmhwpkaEPOWWdVMt2HRzVlzokORF6iUWFI_1ALW8_uMgCy-Zo377m251MOytOND_k9E0_Z_WUPsEtqeuGnQxLdoRPt5Ozq3Ad4NuSOGGgpPTEGEGI4IF8l5lTgkrgRLbRRXr" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=happy66dev/AutoAPI&type=date&legend=top-left&sealed_token=gaO5fgqPoRn51RcqFvGkYCHyixpyO9yPD65650froUViP3AMMC2DQChcSmhwpkaEPOWWdVMt2HRzVlzokORF6iUWFI_1ALW8_uMgCy-Zo377m251MOytOND_k9E0_Z_WUPsEtqeuGnQxLdoRPt5Ozq3Ad4NuSOGGgpPTEGEGI4IF8l5lTgkrgRLbRRXr" />
+ </picture>
+</a>
 
