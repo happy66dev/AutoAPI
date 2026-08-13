@@ -8,10 +8,6 @@
 
 ![autoapi 运行示例](images/example.png)
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=happy66dev/AutoAPI&type=Date)](https://star-history.com/#happy66dev/AutoAPI&Date)
-
 ## 它做了什么
 
 - **协议透传**：客户端的请求路径、查询串、请求头、请求体全部原样转发给上游。只有三样东西会被替换 —— `base_url`、`api_key`、请求体顶层的 `model` 字段。所以 OpenAI 的 `/v1/chat/completions` 和 Anthropic 的 `/v1/messages` 都能用，不需要做协议探测喵。
@@ -420,4 +416,8 @@ python smoke_test.py
 ## 许可证
 
 [Apache License 2.0](LICENSE) 喵~
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=happy66dev/AutoAPI&type=Date)](https://star-history.com/#happy66dev/AutoAPI&Date)
 
