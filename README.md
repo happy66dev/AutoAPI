@@ -1,5 +1,7 @@
 # autoapi
 
+[中文](README.md) | [English](README_EN.md)
+
 透明的 LLM API 故障转移代理喵~ 客户端把请求发给它，它按优先级链路转发给上游；上游返回错误、假成功（200 里塞 error）、空流、卡流时，它会静默换下一个候选（换 base_url / api_key / 真实模型名）重发，客户端完全感知不到发生过失败喵。
 
 对客户端来说，它就是一个普通的 OpenAI 兼容端点：把 `base_url` 指向 autoapi，`model` 填一个虚拟模型名，剩下的事情不用管喵。
