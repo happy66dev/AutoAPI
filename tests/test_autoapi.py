@@ -40,8 +40,8 @@ from autoapi.config import (
 )
 # 引入被测的编排层喵
 from autoapi.proxy import detect_stream_flag, handle_request, parse_client_body
-# 引入 count_tokens 路径识别函数，验证它不会触发自动避险喵
-from autoapi.proxy import _is_count_tokens_request
+# 引入接口错误忽略判定函数喵
+from autoapi.proxy import _is_count_tokens_request, _is_ignored_error_endpoint
 # 引入被测的规则引擎喵
 from autoapi.rules import decide
 # 引入被测的 SSE 探测器喵
@@ -149,7 +149,44 @@ def test_配置能正常加载():
     assert config.virtual_models["auto-test"][0].model == "gpt-4o"
 
 
-def test_状态码别名会被翻译成特殊值():
+def test_默认忽略token计数接口且支持自定义规范化():
+    """默认兼容 count_tokens，自定义端点按 method+path 规范化喵~"""
+    # 默认配置应保留旧的 count_tokens 忽略行为喵
+    default_config = parse_config(make_config_dict())
+    # 确认默认端点已加入标准化集合喵
+    assert ("POST", "/v1/messages/count_tokens") in default_config.server.ignored_error_endpoints
+    # 自定义配置应支持方法大小写和多余前导斜杠喵
+    custom_data = make_config_dict(
+        server_overrides={
+            "ignored_error_endpoints": [
+                {"method": " post ", "path": "v1/custom"},
+            ]
+        }
+    )
+    # 解析自定义配置喵
+    custom_config = parse_config(custom_data)
+    # 确认自定义接口被标准化保存喵
+    assert custom_config.server.ignored_error_endpoints == frozenset({("POST", "/v1/custom")})
+
+
+def test_忽略接口配置错误会被拒绝():
+    """忽略接口配置类型或字段错误时应在加载阶段失败喵~"""
+    # 依次覆盖顶层、条目和字段错误喵
+    invalid_values = [
+        "not-a-list",
+        ["not-a-dict"],
+        [{"method": "POST"}],
+        [{"path": "/v1/test"}],
+        [{"method": "", "path": "/v1/test"}],
+        [{"method": "POST", "path": ""}],
+    ]
+    # 每种错误配置都必须抛出统一配置异常喵
+    for invalid_value in invalid_values:
+        data = make_config_dict(server_overrides={"ignored_error_endpoints": invalid_value})
+        with pytest.raises(ConfigError):
+            parse_config(data)
+
+
     """bad_stream 和 network 这两个别名应该被翻译成内部负数状态码喵~"""
     # 造一份只有一条 network 规则的配置喵
     data = make_config_dict(rules=[{"match": {"status": "network"}, "action": "next"}])
@@ -2382,7 +2419,26 @@ async def test_避险后不会继续原地重试():
     assert hits == ["primary.test", "backup.test"]
 
 
-def test_count_tokens请求只精确匹配():
+def test_配置接口精确匹配():
+    """忽略接口匹配 method+path，查询串不参与且尾斜杠有区别喵~"""
+    # 解析一个自定义接口配置喵
+    config = parse_config(
+        make_config_dict(
+            server_overrides={
+                "ignored_error_endpoints": [{"method": "POST", "path": "/v1/custom"}]
+            }
+        )
+    )
+    # 配置一个服务器对象供匹配助手使用喵
+    server_config = config.server
+    # 完全匹配时应命中喵
+    assert _is_ignored_error_endpoint(server_config, "post", "v1/custom") is True
+    # HTTP 方法不同不得命中喵
+    assert _is_ignored_error_endpoint(server_config, "GET", "/v1/custom") is False
+    # 尾斜杠不同不得命中喵
+    assert _is_ignored_error_endpoint(server_config, "POST", "/v1/custom/") is False
+
+
     """只有 POST /v1/messages/count_tokens 才跳过自动避险累计喵~"""
     # 精确接口应被识别喵
     assert _is_count_tokens_request("POST", "/v1/messages/count_tokens") is True

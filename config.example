@@ -6,6 +6,12 @@ server:
   host: 127.0.0.1
   # 代理对外提供服务的端口喵
   port: 8787
+  # 接口错误忽略列表：按 HTTP method + path 精确匹配喵
+  # 命中后仍执行候选规则，但不触发自动避险、目标模式和候选 warning；链耗尽仍返回 502 喵
+  # 未配置时默认忽略 POST /v1/messages/count_tokens；写成 [] 可关闭默认行为喵
+  ignored_error_endpoints:
+    - method: POST
+      path: /v1/messages/count_tokens
   # ===== 三个超时的分工喵 =====
   # 这三项管的是完全不同的三件事，搞清楚了就不会配错喵：
   #

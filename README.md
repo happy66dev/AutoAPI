@@ -181,6 +181,7 @@ cand set auto-strong 1 stream_timeout default
 | `min_content_chars` | `10` | 放行给客户端之前需要先累积够多少个内容字符。不设成 1 是因为「先吐一两个字符然后卡死」的上游会骗过检查 —— 字节一出门就再也换不了候选了。整条流在凑够之前就正常结束（短回答），或者模型只调工具不吐文字，都会照常放行，不会让客户端干等喵 |
 | `auto_hedge_threshold` | `5` | 一个节点连续失败多少次就自动避险。设成 `0` 表示关闭自动避险喵 |
 | `auto_hedge_minutes` | `10` | 自动避险触发后冻结多少分钟喵 |
+| `ignored_error_endpoints` | 默认忽略 `POST /v1/messages/count_tokens` | 按 HTTP method + path 精确匹配的接口列表。命中后候选内部规则仍执行，但不累计自动避险、不进入目标模式、不输出候选 warning；候选全部失败时只记一条 info，客户端仍收到 502。显式写 `[]` 可关闭默认忽略喵 |
 | `reload_poll_interval` | `2.0` | 配置热重载的轮询间隔，单位：秒。设成 `0` 表示关闭自动重载喵 |
 
 ### `virtual_models` 段

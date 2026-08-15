@@ -216,10 +216,16 @@ class Rule:
         return f"status=[{codes}] 正则={pattern} → {self.action}{extra}"
 
 
+# 默认忽略 token 计数接口，保持项目原有的 count_tokens 故障语义喵
+DEFAULT_IGNORED_ERROR_ENDPOINTS = frozenset({("POST", "/v1/messages/count_tokens")})
+
+
 @dataclass
 class ServerConfig:
     """服务器与超时相关的配置喵~"""
 
+    # 被忽略错误接口的标准化标识集合，默认保留 token 计数接口兼容行为喵
+    ignored_error_endpoints: frozenset[tuple[str, str]] = DEFAULT_IGNORED_ERROR_ENDPOINTS
     # 监听地址，默认只绑本地回环喵
     host: str = "127.0.0.1"
     # 监听端口喵
@@ -514,6 +520,46 @@ def _parse_candidate(raw: Any, vm_name: str, index: int) -> Candidate:
     )
 
 
+def _parse_ignored_error_endpoints(raw: Any) -> frozenset[tuple[str, str]]:
+    """解析需要静默处理的接口列表喵~"""
+    # 未配置时返回默认集合，保持项目原有 count_tokens 故障处理喵
+    if raw is None:
+        return DEFAULT_IGNORED_ERROR_ENDPOINTS
+    # 喵~防御：顶层必须是列表，避免把单个字典误当成多条配置喵
+    if not isinstance(raw, list):
+        raise ConfigError("server.ignored_error_endpoints 必须是列表喵")
+    # 用集合去重并让运行时只做常数时间匹配喵
+    endpoints: set[tuple[str, str]] = set()
+    # 逐条解析接口配置喵
+    for index, endpoint_raw in enumerate(raw):
+        # 记录具体条目位置，方便定位配置错误喵
+        where = f"server.ignored_error_endpoints 第 {index + 1} 条"
+        # 喵~防御：每条接口配置必须是字典喵
+        if not isinstance(endpoint_raw, dict):
+            raise ConfigError(f"{where} 必须是字典喵")
+        # 读取 HTTP 方法原始值喵
+        method_raw = endpoint_raw.get("method")
+        # 读取路径原始值喵
+        path_raw = endpoint_raw.get("path")
+        # 喵~防御：方法和路径都必须是非空字符串喵
+        if not isinstance(method_raw, str) or not method_raw.strip():
+            raise ConfigError(f"{where} 的 method 必须是非空字符串喵")
+        # 喵~防御：路径必须是非空字符串喵
+        if not isinstance(path_raw, str) or not path_raw.strip():
+            raise ConfigError(f"{where} 的 path 必须是非空字符串喵")
+        # 方法统一大写，路径只统一前导斜杠与首尾空白喵
+        normalized_method = method_raw.strip().upper()
+        # 去掉多余前导斜杠，避免配置格式差异造成重复标识喵
+        normalized_path = "/" + path_raw.strip().lstrip("/")
+        # 喵~防御：斜杠以外没有实际路径时拒绝配置喵
+        if normalized_path == "/":
+            raise ConfigError(f"{where} 的 path 不能只有斜杠喵")
+        # 保存标准化接口标识喵
+        endpoints.add((normalized_method, normalized_path))
+    # 返回不可变集合，避免运行时配置被意外修改喵
+    return frozenset(endpoints)
+
+
 def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
     """
     把已经解析成 Python 对象的 YAML 数据转成 AppConfig 喵~
@@ -539,6 +585,10 @@ def parse_config(data: Any, source_path: Path | None = None) -> AppConfig:
             warnings.append(f"server.{retired_key} 已不再生效喵：{advice}")
     # 构造服务器配置，各数值字段都做类型转换与安全下限处理喵
     server = ServerConfig(
+        # 解析需要忽略外围错误处理的 method+path 接口集合喵
+        ignored_error_endpoints=_parse_ignored_error_endpoints(
+            server_raw.get("ignored_error_endpoints")
+        ),
         # 监听地址，默认只绑本地喵
         host=str(server_raw.get("host", "127.0.0.1")),
         # 监听端口喵

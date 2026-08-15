@@ -39,8 +39,8 @@ from typing import Any
 # httpx 提供复用的异步客户端类型喵
 import httpx
 
-# 引入候选类型喵
-from .config import Candidate
+# 引入候选和服务器配置类型喵
+from .config import Candidate, ServerConfig
 # 引入规则引擎喵
 from .rules import decide
 # 引入运行时状态喵
@@ -53,10 +53,21 @@ logger = logging.getLogger("autoapi.proxy")
 
 
 # count_tokens 只做 token 计数，不代表 LLM 输出能力喵~
+def _is_ignored_error_endpoint(server: ServerConfig, method: str, path: str) -> bool:
+    """判断请求是否命中配置的接口错误忽略列表喵~"""
+    # 统一方法大小写和首尾空白，与配置解析后的格式保持一致喵
+    normalized_method = method.strip().upper()
+    # 只去掉多余前导斜杠，保留尾斜杠以实现路径精确匹配喵
+    normalized_path = "/" + path.strip().lstrip("/")
+    # method 与 path 必须同时存在于配置集合中喵
+    return (normalized_method, normalized_path) in server.ignored_error_endpoints
+
+
 def _is_count_tokens_request(method: str, path: str) -> bool:
-    """判断请求是否为 Anthropic 的 token 计数接口喵~"""
-    # 统一方法和路径格式，兼容大小写与多余斜杠喵
+    """判断请求是否为默认的 Anthropic token 计数接口喵~"""
+    # 使用旧特例的标准化方式保留测试和内部调用兼容性喵
     normalized_method = method.upper().strip()
+    # 保留尾斜杠差异以符合接口精确匹配语义喵
     normalized_path = "/" + path.strip().lstrip("/")
     # 仅精确匹配 POST /v1/messages/count_tokens，避免误伤其他接口喵
     return normalized_method == "POST" and normalized_path == "/v1/messages/count_tokens"
@@ -187,6 +198,7 @@ async def _run_one_candidate(
     req_id: str,
     virtual_model: str,
     request_started_at: float,
+    ignored_error_endpoint: bool,
 ) -> tuple[str, AttemptResult]:
     """
     在一个候选上尝试到底（含该候选内部的退避重试）喵~
@@ -260,10 +272,10 @@ async def _run_one_candidate(
                 )
             # 返回成功结论喵
             return "ok", result
-        # count_tokens 错误不影响 LLM 输出能力，不计入自动避险连续失败次数喵
-        if _is_count_tokens_request(method, path):
+        # 被忽略接口不参与自动避险失败累计，避免接口缺失冻结正常候选喵
+        if ignored_error_endpoint:
             hedge_hits = 0
-        # 其他请求失败仍按配置累计自动避险次数喵
+        # 普通接口继续按原逻辑累计自动避险失败喵
         else:
             # 阈值从配置里取，所以主人改了 auto_hedge_threshold 能立即生效喵
             hedge_hits = state.record_failure(
@@ -278,33 +290,34 @@ async def _run_one_candidate(
         if hedge_hits > 0:
             # 把分钟换算成秒喵
             hedge_seconds = config.server.auto_hedge_minutes * 60.0
-            # 写入冻结表，原因里写清楚是自动避险而不是上游告知的额度限制，
-            # 这样在 freeze ls 里能一眼区分两种冻结的来路喵
+            # 写入冻结表，原因里写清楚是自动避险而不是上游告知的额度限制喵
             state.freeze(
                 candidate,
                 hedge_seconds,
                 f"自动避险：连续失败 {hedge_hits} 次（最近一次：{result.error_text[:120]}）",
             )
-            # 记一条醒目的日志，把触发条件和冻结时长都写上喵
-            logger.warning(
-                "[%s] 自动避险 %s：连续失败 %d 次达到阈值，冻结 %.0f 分钟喵",
-                req_id,
-                candidate.label,
-                hedge_hits,
-                config.server.auto_hedge_minutes,
-            )
+            # 普通接口才输出自动避险警告，忽略接口保持静默喵
+            if not ignored_error_endpoint:
+                logger.warning(
+                    "[%s] 自动避险 %s：连续失败 %d 次达到阈值，冻结 %.0f 分钟喵",
+                    req_id,
+                    candidate.label,
+                    hedge_hits,
+                    config.server.auto_hedge_minutes,
+                )
         # 问规则引擎该怎么办喵
         decision = decide(config.rules, result.status, result.error_text, result.retry_after)
-        # 打一条失败日志，把状态码、决策和命中的规则都写清楚喵
-        logger.warning(
-            "[%s] 失败 %s 状态=%s 决策=%s 依据=%s 原因=%s 喵",
-            req_id,
-            candidate.label,
-            result.status,
-            decision.action,
-            decision.matched_by,
-            result.error_text[:200],
-        )
+        # 普通接口输出候选失败警告，忽略接口不升级为 warning 喵
+        if not ignored_error_endpoint:
+            logger.warning(
+                "[%s] 失败 %s 状态=%s 决策=%s 依据=%s 原因=%s 喵",
+                req_id,
+                candidate.label,
+                result.status,
+                decision.action,
+                decision.matched_by,
+                result.error_text[:200],
+            )
         # 规则要求原样回传上游响应，不再做任何转移喵
         if decision.action == "passthrough":
             return "passthrough", result
@@ -312,10 +325,11 @@ async def _run_one_candidate(
         if decision.action == "freeze":
             # 写入冻结表，时长由规则引擎算好（可能是从上游消息里抽出来的）喵
             state.freeze(candidate, decision.freeze_seconds, result.error_text)
-            # 记一条冻结日志，写明冻多久喵
-            logger.warning(
-                "[%s] 冻结 %s 共 %.0f 秒喵", req_id, candidate.label, decision.freeze_seconds
-            )
+            # 规则冻结动作仍然执行，但忽略接口不输出候选级 warning 喵
+            if not ignored_error_endpoint:
+                logger.warning(
+                    "[%s] 冻结 %s 共 %.0f 秒喵", req_id, candidate.label, decision.freeze_seconds
+                )
             # 冻结之后换下一个候选喵
             return "next", result
         # 喵~防御：如果这个节点刚刚被自动避险冻结了，就别再原地重试它了。
@@ -428,14 +442,16 @@ async def handle_request(
     target_mode = state.target_mode_enabled
     # 取一份配置快照，用于读取目标模式的各项配置喵
     config = state.config
+    # 判断请求是否命中配置的接口错误忽略列表喵
+    ignored_error_endpoint = _is_ignored_error_endpoint(config.server, method, path)
     # 目标模式请求的截止时刻，使用单调时钟避免系统时间跳变喵
     target_deadline = (
         time.monotonic() + config.server.target_mode_max_wait_seconds if target_mode else None
     )
     # 目标模式已经循环了多少轮喵
     target_rounds = 0
-    # 目标模式开始时记录日志喵
-    if target_mode:
+    # 目标模式开始时记录日志；忽略接口不会进入目标模式喵
+    if target_mode and not ignored_error_endpoint:
         logger.warning(
             "[%s] 目标模式已接管虚拟模型 %s：链路全失效后每 %.0f 秒重试，最长 %.0f 分钟喵",
             req_id, virtual_model, config.server.target_mode_round_interval_seconds,
@@ -460,7 +476,7 @@ async def handle_request(
             # 在这个候选上尝试到底（含内部退避重试）喵
             verdict, result = await _run_one_candidate(
                 client, state, candidate, method, path, query, headers, body_obj,
-                is_stream, req_id, virtual_model, request_started_at,
+                is_stream, req_id, virtual_model, request_started_at, ignored_error_endpoint,
             )
             # 成功了，直接返回，后面的候选不再尝试喵
             if verdict == "ok":
@@ -472,19 +488,29 @@ async def handle_request(
             failures.append(f"{candidate.label} → 状态 {result.status}：{result.error_text[:150]}")
         # 整条候选链都走完了还没成功喵
         state.total_exhausted += 1
-        # count_tokens 失败不代表 LLM 输出链路失效，目标模式不得为它循环重试喵
-        if not target_mode or _is_count_tokens_request(method, path):
-            # count_tokens 也沿用普通失败响应，避免进入目标模式等待循环喵
-            if _is_count_tokens_request(method, path):
-                logger.warning(
-                    "[%s] count_tokens 失败，跳过目标模式重试喵：%s",
-                    req_id,
-                    " | ".join(failures),
-                )
-            else:
-                logger.error(
-                    "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
-                )
+        # 忽略接口链耗尽后直接返回普通 502，只输出一条 info，不进入目标模式喵
+        if ignored_error_endpoint:
+            logger.info(
+                "[%s] 虚拟模型 %s 的接口 %s 全部不可用喵",
+                req_id,
+                virtual_model,
+                path,
+            )
+            return ProxyOutcome(
+                success=False,
+                status=502,
+                error_body={"error": {
+                    "message": f"虚拟模型 {virtual_model} 的所有候选都不可用喵",
+                    "type": "upstream_all_failed",
+                    "virtual_model": virtual_model,
+                    "attempts": failures,
+                }},
+            )
+        # 普通接口未开启目标模式时回传 502，开启时才继续后续目标模式逻辑喵
+        if not target_mode:
+            logger.error(
+                "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
+            )
             return ProxyOutcome(
                 success=False,
                 status=502,
@@ -553,6 +579,7 @@ async def handle_request(
                 }},
             )
         # 还没到截止时间，等待配置的间隔后从链首开始下一轮喵
+        # 目标模式下的等待日志保留 warning，普通接口行为不变喵
         logger.warning(
             "[%s] 目标模式第%d轮链路全部不可用，%.0f秒后从链首重试喵：%s",
             req_id, target_rounds, config.server.target_mode_round_interval_seconds, " | ".join(failures),
