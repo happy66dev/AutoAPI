@@ -187,6 +187,7 @@ def test_忽略接口配置错误会被拒绝():
             parse_config(data)
 
 
+def test_状态码别名会被翻译成特殊值():
     """bad_stream 和 network 这两个别名应该被翻译成内部负数状态码喵~"""
     # 造一份只有一条 network 规则的配置喵
     data = make_config_dict(rules=[{"match": {"status": "network"}, "action": "next"}])
@@ -2437,9 +2438,12 @@ def test_配置接口精确匹配():
     assert _is_ignored_error_endpoint(server_config, "GET", "/v1/custom") is False
     # 尾斜杠不同不得命中喵
     assert _is_ignored_error_endpoint(server_config, "POST", "/v1/custom/") is False
+    # 查询串由请求处理层单独传递，不参与 path 精确匹配喵
+    assert _is_ignored_error_endpoint(server_config, "POST", "/v1/custom?debug=true") is False
 
 
-    """只有 POST /v1/messages/count_tokens 才跳过自动避险累计喵~"""
+def test_count_tokens请求只精确匹配():
+    """只有 POST /v1/messages/count_tokens 才能被旧兼容助手识别喵~"""
     # 精确接口应被识别喵
     assert _is_count_tokens_request("POST", "/v1/messages/count_tokens") is True
     # 方法不同不能误判喵
