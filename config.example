@@ -9,6 +9,7 @@ server:
   # 接口错误忽略列表：按 HTTP method + path 精确匹配喵
   # 命中后仍执行候选规则，但不触发自动避险、目标模式和候选 warning；链耗尽仍返回 502 喵
   # 未配置时默认忽略 POST /v1/messages/count_tokens；写成 [] 可关闭默认行为喵
+  # 非空自定义列表会整体替换默认项，需要保留 count_tokens 时请一并写入喵
   ignored_error_endpoints:
     - method: POST
       path: /v1/messages/count_tokens

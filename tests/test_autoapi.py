@@ -167,6 +167,14 @@ def test_默认忽略token计数接口且支持自定义规范化():
     custom_config = parse_config(custom_data)
     # 确认自定义接口被标准化保存喵
     assert custom_config.server.ignored_error_endpoints == frozenset({("POST", "/v1/custom")})
+    # 自定义非空列表采用整体替换语义，不会隐式保留默认接口喵
+    assert ("POST", "/v1/messages/count_tokens") not in custom_config.server.ignored_error_endpoints
+    # 显式空列表应关闭所有默认忽略行为喵
+    disabled_config = parse_config(
+        make_config_dict(server_overrides={"ignored_error_endpoints": []})
+    )
+    # 空列表必须原样解析为空集合喵
+    assert disabled_config.server.ignored_error_endpoints == frozenset()
 
 
 def test_忽略接口配置错误会被拒绝():
@@ -179,6 +187,9 @@ def test_忽略接口配置错误会被拒绝():
         [{"path": "/v1/test"}],
         [{"method": "", "path": "/v1/test"}],
         [{"method": "POST", "path": ""}],
+        [{"method": "HEAD", "path": "/v1/test"}],
+        [{"method": "POST", "path": "/v1/test?debug=true"}],
+        [{"method": "POST", "path": "/v1/test#fragment"}],
     ]
     # 每种错误配置都必须抛出统一配置异常喵
     for invalid_value in invalid_values:
@@ -2487,6 +2498,113 @@ async def test_count_tokens错误不触发自动避险():
     assert state.is_frozen(candidate) == 0
 
 
+@pytest.mark.asyncio
+async def test_自定义忽略接口跨模块静默且跳过目标模式与自动避险(caplog, monkeypatch):
+    """
+    自定义忽略接口遇到假成功错误时，代理层和上游层都不得输出 warning 喵~
+
+    同时验证该接口不会进入目标模式等待、不会触发自动避险，并在候选链耗尽后
+    保持原有 502 错误结构且只记录一条“全部不可用”的结果 info 喵。
+    """
+    # 收集异步等待调用，忽略接口不应出现候选重试或目标模式轮询等待喵
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        """记录意外发生的异步等待秒数喵~"""
+        # 保存等待时长，便于确认目标模式没有接管请求喵
+        sleep_calls.append(seconds)
+
+    # 替换代理层睡眠，避免缺陷导致测试真的等待喵
+    monkeypatch.setattr("autoapi.proxy.asyncio.sleep", fake_sleep)
+
+    # 假上游用 HTTP 200 包裹 error，覆盖 upstream 模块的假成功 warning 路径喵
+    def handler(request: httpx.Request) -> httpx.Response:
+        """让每个候选都返回需要识别的假成功错误喵~"""
+        # 返回带 error 字段的 200 响应，模拟接口未实现的中转站喵
+        return httpx.Response(200, json={"error": {"message": "endpoint unavailable"}})
+
+    # 配置一个自定义忽略接口，并让一次失败足以触发自动避险以暴露错误累计喵
+    config_data = make_config_dict(
+        server_overrides={
+            "ignored_error_endpoints": [{"method": "POST", "path": "/v1/custom"}],
+            "auto_hedge_threshold": 1,
+        }
+    )
+    # 创建状态并开启目标模式，确认接口级配置优先跳过目标循环喵
+    state = RuntimeState(parse_config(config_data))
+    # 开启纯内存目标模式喵
+    state.set_target_mode(True)
+    # 同时收集代理层和上游层的 info/warning 日志喵
+    caplog.set_level(logging.INFO)
+    # 发送自定义忽略接口请求喵
+    outcome = await handle_request(
+        make_client(handler),
+        state,
+        "POST",
+        "/v1/custom",
+        "",
+        {},
+        json.dumps({"model": "auto-test"}).encode("utf-8"),
+    )
+    # 候选链耗尽仍应返回兼容的 502 错误结果喵
+    assert outcome.success is False
+    # 状态码保持原有网关失败语义喵
+    assert outcome.status == 502
+    # 错误类型保持客户端兼容喵
+    assert outcome.error_body["error"]["type"] == "upstream_all_failed"
+    # 忽略接口不得进入候选退避或目标模式轮询喵
+    assert sleep_calls == []
+    # 两个候选都不应因该接口失败而被冻结喵
+    assert all(state.is_frozen(candidate) == 0 for candidate in state.config.virtual_models["auto-test"])
+    # 跨代理层和上游层都不能残留任何 warning 级别错误日志喵
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+    # 链耗尽的结果日志应恰好只有一条，避免每个候选重复刷屏喵
+    exhausted_logs = [
+        record
+        for record in caplog.records
+        if "接口 /v1/custom 全部不可用" in record.getMessage()
+    ]
+    # 结果日志数量必须精确为一条喵
+    assert len(exhausted_logs) == 1
+    # 最终结果使用 info 等级喵
+    assert exhausted_logs[0].levelno == logging.INFO
+
+
+@pytest.mark.asyncio
+async def test_自定义忽略流式接口抑制假成功warning(caplog):
+    """自定义忽略接口走流式假成功路径时也不应输出上游 warning 喵~"""
+    # 上游返回内容不足的 SSE，触发流式假成功探测路径喵
+    def handler(request: httpx.Request) -> httpx.Response:
+        """返回空 SSE 流以模拟中转站的流式假成功喵~"""
+        # 明确标记为 SSE，但不提供有效内容喵
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=b"")
+
+    # 配置自定义忽略接口，并把内容门槛保持为默认值喵
+    state = RuntimeState(
+        parse_config(
+            make_config_dict(
+                server_overrides={
+                    "ignored_error_endpoints": [{"method": "POST", "path": "/v1/custom-stream"}]
+                }
+            )
+        )
+    )
+    # 捕获所有模块的日志，确认流式探测不会绕过静默配置喵
+    caplog.set_level(logging.INFO)
+    # 发送流式请求，促使上游走 StreamProbe 的假成功分支喵
+    outcome = await handle_request(
+        make_client(handler),
+        state,
+        "POST",
+        "/v1/custom-stream",
+        "",
+        {},
+        json.dumps({"model": "auto-test", "stream": True}).encode("utf-8"),
+    )
+    # 流式假成功仍应以候选链耗尽的 502 回给客户端喵
+    assert outcome.status == 502
+    # 上游流式探测产生的 warning 必须被接口忽略配置抑制喵
+    assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
 
 
 def test_倒计时格式():

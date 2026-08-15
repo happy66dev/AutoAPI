@@ -502,6 +502,8 @@ async def _attempt_stream(
     body: bytes,
     timeouts: EffectiveTimeouts,
     min_content_chars: int,
+    # 忽略接口传入真值时，仅抑制本函数的假成功观测 warning 喵
+    suppress_error_warnings: bool = False,
 ) -> AttemptResult:
     """
     走流式路径打一次上游喵~
@@ -509,6 +511,7 @@ async def _attempt_stream(
     成功的定义：HTTP 200，且在总预算 stream_timeout 之内探测到「这条流是健康的」，
     期间上游的静默时长也没超过 stall_timeout。
     失败时会就地关掉响应连接，客户端完全感知不到这次尝试发生过喵。
+    当 suppress_error_warnings 为真时，仍返回相同失败结果，但不记录假成功 warning 喵。
 
     注意总预算只管到「放行」为止。一旦确认健康、字节开始流向客户端，我们就不再计时了 ——
     模型愿意写多久就写多久，中途掐断一个正在正常输出的回答是最糟糕的行为喵。
@@ -688,23 +691,21 @@ async def _attempt_stream(
         )
     # 其余情况（空流、流内 error、缓冲区溢出）都归为「200 假成功」喵
     #
-    # 观测日志喵：这里把 Content-Type 和 buffered 前缀一起打出来，因为有些中转站
-    # 会用「HTTP 200 + 纯 JSON body」把上游的 400/5xx 藏起来，如果不打日志我们
-    # 就只能看到「流的内容为空」这种没营养的摘要，永远查不到真实错误。
-    # 日志走 warning 等级，因为 bad_stream 本身就是需要关注的事件，不会喧宾夺主喵。
-    logger.warning(
-        "假成功流被拦下喵：verdict=%s content_type=%s buffered=%d字节 detail=%s body_head=%s",
-        # 探测结论，帮主人一眼看出是空流/error/缓冲溢出中的哪一种喵
-        verdict,
-        # 上游给的 Content-Type，如果这里不是 text/event-stream 基本就实锤了「假流」喵
-        response.headers.get("content-type", "<缺失>"),
-        # 已经读到的原始字节数，配合 buffered_head 一起判断 body 是否被截断喵
-        len(buffered),
-        # 探测器/探测函数给出的原始说明文本喵
-        detail,
-        # buffered 的前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
-        _snapshot_body_for_log(bytes(buffered)),
-    )
+    # 忽略接口仍返回失败结果给代理层，但抑制上游模块的候选级 warning 喵
+    if not suppress_error_warnings:
+        logger.warning(
+            "假成功流被拦下喵：verdict=%s content_type=%s buffered=%d字节 detail=%s body_head=%s",
+            # 探测结论，帮主人一眼看出是空流/error/缓冲溢出中的哪一种喵
+            verdict,
+            # 上游给的 Content-Type，如果这里不是 text/event-stream 基本就实锤了「假流」喵
+            response.headers.get("content-type", "<缺失>"),
+            # 已经读到的原始字节数，配合 buffered_head 一起判断 body 是否被截断喵
+            len(buffered),
+            # 探测器/探测函数给出的原始说明文本喵
+            detail,
+            # buffered 的前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
+            _snapshot_body_for_log(bytes(buffered)),
+        )
     return AttemptResult(
         ok=False,
         status=STATUS_BAD_STREAM,
@@ -776,11 +777,14 @@ async def _attempt_nonstream(
     headers: dict[str, str],
     body: bytes,
     timeouts: EffectiveTimeouts,
+    # 忽略接口传入真值时，仅抑制本函数的假成功观测 warning 喵
+    suppress_error_warnings: bool = False,
 ) -> AttemptResult:
     """
     走非流式路径打一次上游喵~
 
     成功的定义：在 nonstream_timeout 总预算之内拿到 HTTP 200，且响应体里没有 error 字段。
+    当 suppress_error_warnings 为真时，仍按原规则返回失败，但不记录假成功 warning 喵。
 
     为什么非流式的预算天生要比流式大：
         流式是「一点点吐」，所以我们能在几秒内就判断出这条流健不健康，剩下的时间交给客户端。
@@ -847,20 +851,19 @@ async def _attempt_nonstream(
     fake = _nonstream_fake_success(raw)
     # 检测到假成功，用 bad_stream 状态返回（这个状态泛指「表面 200 实则失败」）喵
     if fake:
-        # 观测日志喵：和流式路径一样，把 Content-Type 和完整 body 前缀一起记录下来。
-        # 非流式 body 是一次性读完的，所以 raw 一定就是完整响应体（不像流式的 buffered
-        # 可能是被 error 事件截断的前缀），这里能拿到最完整的现场信息喵。
-        logger.warning(
-            "假成功响应被拦下喵：content_type=%s body_len=%d detail=%s body_head=%s",
-            # 上游 Content-Type，配合 body_head 判断是不是根本没走标准协议喵
-            response.headers.get("content-type", "<缺失>"),
-            # 完整 body 的字节数，主人扫一眼就知道响应大小是否合理喵
-            len(raw),
-            # 假成功检测函数给出的错误消息，一般就是 body 里的 error.message 喵
-            fake,
-            # body 前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
-            _snapshot_body_for_log(raw),
-        )
+        # 假成功的错误观测对普通接口保留 warning，忽略接口不得输出候选级错误日志喵
+        if not suppress_error_warnings:
+            logger.warning(
+                "假成功响应被拦下喵：content_type=%s body_len=%d detail=%s body_head=%s",
+                # 上游 Content-Type，配合 body_head 判断是不是根本没走标准协议喵
+                response.headers.get("content-type", "<缺失>"),
+                # 完整 body 的字节数，主人扫一眼就知道响应大小是否合理喵
+                len(raw),
+                # 假成功检测函数给出的错误消息，一般就是 body 里的 error.message 喵
+                fake,
+                # body 前 2 KiB 可读片段，主人拿到这个就能定位真实的 400/5xx 消息喵
+                _snapshot_body_for_log(raw),
+            )
         return AttemptResult(ok=False, status=STATUS_BAD_STREAM, error_text=fake)
     # 真正的成功，把完整响应体和响应头一起交回去喵
     return AttemptResult(
@@ -889,6 +892,8 @@ async def try_candidate(
     body_obj: dict[str, Any],
     is_stream: bool,
     server_cfg: ServerConfig,
+    # 忽略接口传入真值时，仅抑制假成功观测 warning，不改变失败结果喵
+    suppress_error_warnings: bool = False,
 ) -> AttemptResult:
     """
     用一个候选打一次上游，这是本模块唯一的公开入口喵~
@@ -903,6 +908,7 @@ async def try_candidate(
         body_obj      客户端原始请求体（已解析成字典）
         is_stream     这是不是一个流式请求
         server_cfg    超时等服务器配置
+        suppress_error_warnings 命中接口错误忽略配置时抑制本层错误 warning
     输出：AttemptResult
     """
     # 拼出完整的上游地址：候选的根地址 + 客户端原始路径喵
@@ -928,9 +934,18 @@ async def try_candidate(
             body,
             timeouts,
             server_cfg.min_content_chars,
+            suppress_error_warnings,
         )
-    # 非流式路径一次读完喵
-    return await _attempt_nonstream(client, method, url, headers, body, timeouts)
+    # 非流式路径一次读完，并按调用方要求控制错误观测 warning 喵
+    return await _attempt_nonstream(
+        client,
+        method,
+        url,
+        headers,
+        body,
+        timeouts,
+        suppress_error_warnings,
+    )
 
 
 async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:

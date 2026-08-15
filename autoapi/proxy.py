@@ -236,6 +236,8 @@ async def _run_one_candidate(
             is_stream,
             # 超时配置喵
             config.server,
+            # 是否抑制上游模块针对忽略接口的假成功 warning 喵
+            suppress_error_warnings=ignored_error_endpoint,
         )
         # 成功了，记一笔成功（顺带会自动解冻这个候选）然后返回喵
         if result.ok:

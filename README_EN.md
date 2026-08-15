@@ -108,7 +108,7 @@ Important server settings:
 | `connect_timeout` | `15` | Upstream connection timeout, in seconds. |
 | `auto_hedge_threshold` | `5` | Consecutive failures before automatic freezing; `0` disables it. |
 | `auto_hedge_minutes` | `10` | Automatic freeze duration, in minutes. |
-| `ignored_error_endpoints` | `POST /v1/messages/count_tokens` | Exact `method + path` endpoint list. Matching endpoints still follow candidate rules, but skip automatic hedging, target-mode retries, and candidate warnings; exhausted chains log one info entry and still return `502`. Set `[]` to disable the default entry. |
+| `ignored_error_endpoints` | `POST /v1/messages/count_tokens` | Exact `method + path` endpoint list. Only `POST`, `PUT`, `PATCH`, `GET`, and `DELETE` are routable, and paths cannot contain `?` or `#`. Matching endpoints still follow candidate rules, but skip automatic hedging, target-mode retries, and candidate warnings; exhausted chains log one info entry and still return `502`. When omitted, the default entry is used; `[]` disables all defaults; any non-empty list replaces the defaults, so include the default entry explicitly when it should remain ignored. |
 
 For the complete REPL command reference, advanced timeout behavior, rule syntax, hot reload details, and target mode, see the [Chinese full documentation](README.md).
 

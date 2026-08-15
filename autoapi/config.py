@@ -219,6 +219,9 @@ class Rule:
 # 默认忽略 token 计数接口，保持项目原有的 count_tokens 故障语义喵
 DEFAULT_IGNORED_ERROR_ENDPOINTS = frozenset({("POST", "/v1/messages/count_tokens")})
 
+# 通配代理路由实际接受的方法集合，配置中的方法必须能到达该路由喵
+PROXY_ROUTE_METHODS = frozenset({"POST", "PUT", "PATCH", "GET", "DELETE"})
+
 
 @dataclass
 class ServerConfig:
@@ -549,6 +552,15 @@ def _parse_ignored_error_endpoints(raw: Any) -> frozenset[tuple[str, str]]:
             raise ConfigError(f"{where} 的 path 必须是非空字符串喵")
         # 方法统一大写，路径只统一前导斜杠与首尾空白喵
         normalized_method = method_raw.strip().upper()
+        # 喵~防御：拒绝没有通配路由承接的方法，避免配置看似生效却永远无法命中喵
+        if normalized_method not in PROXY_ROUTE_METHODS:
+            allowed_methods = ", ".join(sorted(PROXY_ROUTE_METHODS))
+            raise ConfigError(
+                f"{where} 的 method={normalized_method!r} 无法匹配代理路由，只支持：{allowed_methods} 喵"
+            )
+        # 喵~防御：查询串和片段由请求层单独处理，不能写进精确匹配路径喵
+        if "?" in path_raw or "#" in path_raw:
+            raise ConfigError(f"{where} 的 path 不能包含查询串或片段标记 ?/# 喵")
         # 去掉多余前导斜杠，避免配置格式差异造成重复标识喵
         normalized_path = "/" + path_raw.strip().lstrip("/")
         # 喵~防御：斜杠以外没有实际路径时拒绝配置喵
