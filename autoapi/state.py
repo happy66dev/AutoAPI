@@ -305,6 +305,10 @@ class RuntimeState:
         with self._lock:
             # 冻结开始时间，避免同一条记录里多次取单调时钟造成边界不一致喵
             frozen_started_at = time.monotonic()
+            # 已经存在冻结时先归档旧区间，避免重复冻结覆盖历史喵
+            previous_info = self._freezes.get(candidate.identity)
+            if previous_info is not None:
+                self._record_freeze_interval_locked(candidate.identity, previous_info, frozen_started_at)
             # 记录到期时刻、可读标签和原因喵
             self._freezes[candidate.identity] = FreezeInfo(
                 # 候选的可读标签，展示用喵
@@ -335,6 +339,10 @@ class RuntimeState:
         with self._lock:
             # 先记下数量用于返回喵
             count = len(self._freezes)
+            # 逐条归档当前冻结区间，避免 freeze clear 丢失历史图信息喵
+            clear_time = time.monotonic()
+            for identity, info in self._freezes.items():
+                self._record_freeze_interval_locked(identity, info, clear_time)
             # 清空字典喵
             self._freezes.clear()
             # 返回清理条数喵
@@ -364,9 +372,10 @@ class RuntimeState:
                 # 还有效的收进结果列表喵
                 else:
                     result.append((info.label, remaining, info.reason))
-            # 统一清理过期记录喵
+            # 统一清理过期记录并归档冻结区间喵
             for identity in expired:
-                del self._freezes[identity]
+                info = self._freezes.pop(identity)
+                self._record_freeze_interval_locked(identity, info, info.until)
         # 按剩余时间从短到长排序，快恢复的排前面喵
         result.sort(key=lambda row: row[1])
         # 返回结果喵
@@ -718,8 +727,10 @@ class RuntimeState:
             # 连续失败计数清零 —— 这是「连续」的含义所在：中间只要成功过一次，
             # 之前攒的失败次数就不该再算进自动避险的账上喵
             stats.consecutive_failures = 0
-            # 既然成功了就说明它已经恢复，立刻解冻，不用等倒计时走完喵
-            self._freezes.pop(candidate.identity, None)
+            # 既然成功了就说明它已经恢复，归档并立刻解冻，不用等倒计时走完喵
+            active_freeze = self._freezes.pop(candidate.identity, None)
+            if active_freeze is not None:
+                self._record_freeze_interval_locked(candidate.identity, active_freeze, time.monotonic())
 
     def record_failure(self, candidate: Candidate, error: str, hedge_threshold: int = 0) -> int:
         """

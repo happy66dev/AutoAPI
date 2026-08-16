@@ -2055,8 +2055,10 @@ async def test_目标模式首轮失败后第二轮成功(monkeypatch):
     # 第二轮成功，客户端不应看到失败喵
     assert outcome.success is True
     assert request_count == 2
-    # 目标模式等待间隔应包含候选内部已有的重试退避；这里第一轮 503 先重试 1 秒喵
-    assert sleep_calls == [1.0]
+    # 第二轮成功时只能记录一条最终成功事件，不能把首轮失败算进去喵
+    health = state.snapshot_virtual_model_health("auto-test")
+    assert health.all_time.success == 1
+    assert health.all_time.total == 1
 
 
 @pytest.mark.asyncio
@@ -2087,6 +2089,10 @@ async def test_目标模式截止后返回504(monkeypatch):
     assert error["type"] == "target_mode_gateway_timeout"
     assert error["rounds"] >= 2
     assert error["waited_seconds"] == 300.0
+    # 多轮目标模式最终超时只能记一条虚拟模型失败喵
+    health = state.snapshot_virtual_model_health("auto-test")
+    assert health.all_time.success == 0
+    assert health.all_time.total == 1
 
 
 @pytest.mark.asyncio
@@ -2642,6 +2648,26 @@ def test_冻结自然过期后历史区间会被记录():
     assert state.is_frozen(candidate) == 0
     # 历史冻结区间应已经写入内部历史表喵
     assert state._freeze_intervals[candidate.identity]
+@pytest.mark.asyncio
+async def test_忽略接口成功不进入虚拟模型统计():
+    """忽略接口即使返回成功，也不能污染虚拟模型成功率喵~"""
+    # 造状态和一个正常返回的假上游喵
+    state = make_state()
+    client = make_client(lambda request: httpx.Response(200, json={"ok": True}))
+    # 使用默认忽略的 count_tokens 路径发起请求喵
+    outcome = await handle_request(
+        client,
+        state,
+        "POST",
+        "/v1/messages/count_tokens",
+        "",
+        {},
+        json.dumps({"model": "auto-test"}).encode("utf-8"),
+    )
+    # 请求本身仍然成功喵
+    assert outcome.success is True
+    # 忽略接口不应产生虚拟模型健康事件喵
+    assert state.snapshot_virtual_model_health("auto-test").all_time.total == 0
 
 
     """倒计时应该按「xx 分 xx 秒」补零显示喵~"""
@@ -2658,6 +2684,7 @@ def test_冻结自然过期后历史区间会被记录():
     # 喵~防御：负数和 0 都按 0 秒显示，不能出现「-1 分」这种怪东西喵
     assert format_countdown(0) == "00 分 00 秒"
     assert format_countdown(-5) == "00 分 00 秒"
+
 
 
 def test_没有冻结时横幅显示全部可用():

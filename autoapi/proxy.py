@@ -248,7 +248,7 @@ async def _run_one_candidate(
                 (time.monotonic() - request_started_at) * 1000 if not is_stream else None,
             )
             # 非流式完整请求按虚拟模型记录一次最终成功喵
-            if not is_stream:
+            if not is_stream and not ignored_error_endpoint:
                 state.record_virtual_model_health(
                     virtual_model,
                     True,
@@ -497,21 +497,26 @@ async def handle_request(
                 return ProxyOutcome(success=True, attempt=result, is_stream=is_stream)
             # 规则要求原样回传上游响应（比如 400），绝不能被目标模式重试喵
             if verdict == "passthrough":
+                # 忽略接口不纳入虚拟模型健康统计，普通接口把客户端可见错误记为失败喵
+                if not ignored_error_endpoint:
+                    state.record_virtual_model_health(virtual_model, False)
                 return ProxyOutcome(success=True, attempt=result, is_stream=False)
             # 这个候选不行，记下原因然后试下一个喵
             failures.append(f"{candidate.label} → 状态 {result.status}：{result.error_text[:150]}")
-        # 整条候选链都走完了还没成功喵
-        state.total_exhausted += 1
-        # 候选链耗尽按一次客户端最终失败记入虚拟模型健康统计喵
-        state.record_virtual_model_health(virtual_model, False)
+        # 整条候选链本轮都走完了，目标模式可能还会继续重试喵
+        # total_exhausted 和虚拟模型失败只在下面真正终态返回时结算一次喵
         # 忽略接口链耗尽后直接返回普通 502，只输出一条 info，不进入目标模式喵
         if ignored_error_endpoint:
+            # 被忽略接口的耗尽仍保留原有总耗尽计数，但不进入虚拟模型健康统计喵
+            state.total_exhausted += 1
+            # 记录单条最终信息，保持忽略接口的日志静默语义喵
             logger.info(
                 "[%s] 虚拟模型 %s 的接口 %s 全部不可用喵",
                 req_id,
                 virtual_model,
                 path,
             )
+            # 返回忽略接口的普通 502 结果喵
             return ProxyOutcome(
                 success=False,
                 status=502,
@@ -524,6 +529,10 @@ async def handle_request(
             )
         # 普通接口未开启目标模式时回传 502，开启时才继续后续目标模式逻辑喵
         if not target_mode:
+            # 普通接口最终失败才增加整条链耗尽计数喵
+            state.total_exhausted += 1
+            # 非忽略接口在真正终态返回前只记录一次虚拟模型失败喵
+            state.record_virtual_model_health(virtual_model, False)
             logger.error(
                 "[%s] 虚拟模型 %s 的所有候选都失败了喵：%s", req_id, virtual_model, " | ".join(failures)
             )
@@ -549,6 +558,9 @@ async def handle_request(
             )
             # drop_connection：断开连接不返回任何响应，客户端会感知为网络超时喵
             if action == "drop_connection":
+                # 目标模式最终失败时才增加整条链耗尽计数喵
+                state.total_exhausted += 1
+                state.record_virtual_model_health(virtual_model, False)
                 return ProxyOutcome(
                     success=False,
                     status=STATUS_DROP_CONNECTION,
@@ -581,6 +593,10 @@ async def handle_request(
                 error_type = "target_mode_timeout"
                 message = f"目标模式超时（未知行为 {action}）喵"
             # 返回对应的错误响应喵
+            # 目标模式最终失败时才增加整条链耗尽计数喵
+            state.total_exhausted += 1
+            # 目标模式最终失败只结算一次虚拟模型失败喵
+            state.record_virtual_model_health(virtual_model, False)
             return ProxyOutcome(
                 success=False,
                 status=status_code,

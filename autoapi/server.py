@@ -332,22 +332,20 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                 finally:
                     # 无论流如何结束都计算客户端视角的完整生命周期耗时供日志使用喵
                     total_ms = (time.monotonic() - stream_started_at) * 1000
-                    # 流结束后统一创建 RPM/TPM 事件，保持既有成功流速率统计语义喵
-                    if attempt.virtual_model is not None:
+                    if attempt.virtual_model is not None and stream_completed_normally:
+                        # 正常结束时才建立速率事件，避免未完成流污染请求统计喵
                         attempt.rate_event = state.record_rate_event(
                             attempt.virtual_model,
                             attempt.usage_tokens,
                         )
                         # 正常结束的流按一次客户端最终成功记入虚拟模型健康统计喵
-                        if stream_completed_normally:
-                            state.record_virtual_model_health(
-                                attempt.virtual_model,
-                                True,
-                                attempt.usage_tokens,
-                                total_ms,
-                            )
-                    # 只有正常结束的流才补写完整耗时，异常流不污染平均值喵
-                    if stream_completed_normally and attempt.rate_event is not None:
+                        state.record_virtual_model_health(
+                            attempt.virtual_model,
+                            True,
+                            attempt.usage_tokens,
+                            total_ms,
+                        )
+                        # 把完整流耗时补到速率事件中喵
                         state.attach_elapsed_ms(attempt.rate_event, total_ms)
                     logger.info(
                         "流式请求结束 虚拟模型=%s 返回请求耗时=%.0fms 正常完成=%s usage_tokens=%s 喵",
