@@ -42,11 +42,11 @@ FAKE_SUCCESS_LOG_BYTES = 2048
 
 # 引入候选类型和两个特殊状态码喵
 from .config import (
+    Candidate,
     STATUS_BAD_STREAM,
     STATUS_NETWORK_ERROR,
     STATUS_STALLED_STREAM,
     STATUS_TIMEOUT,
-    Candidate,
     EffectiveTimeouts,
     ServerConfig,
     resolve_timeouts,
@@ -152,6 +152,8 @@ class AttemptResult:
     stream_completed_normally: bool = False
     # 统计所属的虚拟模型名，流结束时由 server 用于补写 TPM 喵
     virtual_model: str | None = None
+    # 这次实际发往上游的候选，流结束时由 server 结算候选资源统计喵
+    candidate: Candidate | None = None
     # RPM 事件对象，流结束时补写最终 usage 喵
     rate_event: Any | None = None
 
@@ -580,6 +582,7 @@ async def _attempt_stream(
             ok=False,
             status=STATUS_NETWORK_ERROR,
             error_text=f"连接上游超时（{timeouts.connect:.0f} 秒内没握上手）：{exc}",
+            started_at=request_started_at,
         )
     # 喵~防御：其余超时（读、写、连接池排队）说明上游可达但太慢，归为 timeout 状态喵
     except httpx.TimeoutException as exc:
@@ -869,6 +872,7 @@ async def _attempt_nonstream(
             ok=False,
             status=STATUS_NETWORK_ERROR,
             error_text=f"连接上游超时（{timeouts.connect:.0f} 秒内没握上手）：{exc}",
+            started_at=request_started_at,
         )
     # 喵~防御：其余超时（读、写、连接池排队）说明上游可达但太慢，归为 timeout 状态喵
     except httpx.TimeoutException as exc:
@@ -977,10 +981,12 @@ async def try_candidate(
     body = build_upstream_body(body_obj, candidate)
     # 算出这次实际生效的超时值：节点上配了专属值就用它，没配就用 server 段的全局值喵
     timeouts = resolve_timeouts(server_cfg, candidate)
+    # 计算这次真实发往上游的统一计时起点，覆盖建连、读响应头和完整读取喵
+    attempt_started_at = time.monotonic()
     # 按是否流式分派到两条不同的路径喵
     if is_stream:
         # 流式路径要先探测这条流健不健康才放行喵
-        return await _attempt_stream(
+        result = await _attempt_stream(
             client,
             candidate,
             method,
@@ -991,16 +997,24 @@ async def try_candidate(
             server_cfg.min_content_chars,
             suppress_error_warnings,
         )
-    # 非流式路径一次读完，并按调用方要求控制错误观测 warning 喵
-    return await _attempt_nonstream(
-        client,
-        method,
-        url,
-        headers,
-        body,
-        timeouts,
-        suppress_error_warnings,
-    )
+    else:
+        # 非流式路径一次读完，并按调用方要求控制错误观测 warning 喵
+        result = await _attempt_nonstream(
+            client,
+            method,
+            url,
+            headers,
+            body,
+            timeouts,
+            suppress_error_warnings,
+        )
+    # 喵~防御：底层某个失败分支没有携带起始时间时由统一入口补齐，保证每次尝试可归属喵
+    if result.started_at is None:
+        result.started_at = attempt_started_at
+    # 保存候选归属，流式响应交给 server 后仍能写回同一候选喵
+    result.candidate = candidate
+    # 返回这一次真实上游尝试的最终探测结果喵
+    return result
 
 
 async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:

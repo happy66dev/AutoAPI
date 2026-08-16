@@ -229,6 +229,8 @@ async def _run_one_candidate(
     attempt_no = 1
     # 无限循环，靠内部的 return 退出；退避重试就在这个循环里打转喵
     while True:
+        # 每次 try_candidate 都代表一次真实发往上游的尝试，先记下其统一起始时刻喵
+        attempt_started_at = time.monotonic()
         # 用这个候选打一次上游喵
         result = await try_candidate(
             # 复用的 HTTP 客户端喵
@@ -254,6 +256,24 @@ async def _run_one_candidate(
         )
         # 成功了，记一笔成功（顺带会自动解冻这个候选）然后返回喵
         if result.ok:
+            # 流式此刻只有探测成功，终态资源事件留给 server 消费完整流时写入喵
+            if not is_stream:
+                # 非流完整响应已读完，耗时从上游请求起点计算喵
+                upstream_elapsed_ms = (
+                    (time.monotonic() - result.started_at) * 1000
+                    if result.started_at is not None
+                    else (time.monotonic() - attempt_started_at) * 1000
+                )
+                # 每次非流成功尝试只写一条候选资源终态事件喵
+                state.record_candidate_health(
+                    candidate,
+                    True,
+                    result.usage_tokens,
+                    upstream_elapsed_ms,
+                    result.input_tokens,
+                    result.cached_tokens,
+                    result.started_at or attempt_started_at,
+                )
             # 更新统计并解冻喵
             state.record_success(
                 candidate,
@@ -306,6 +326,17 @@ async def _run_one_candidate(
                 )
             # 返回成功结论喵
             return "ok", result
+        # 记录候选失败，但上下文超限属于用户侧问题，不计入上游模型错误统计喵
+        # 失败尝试仍属于真实上游调用，因此保留一条不计平均耗时的候选资源事件喵
+        state.record_candidate_health(
+            candidate,
+            False,
+            result.usage_tokens,
+            None,
+            result.input_tokens,
+            result.cached_tokens,
+            result.started_at or attempt_started_at,
+        )
         # 记录候选失败，但上下文超限属于用户侧问题，不计入上游模型错误统计喵
         if _is_context_limit_error(result.status, result.error_text):
             hedge_hits = 0

@@ -332,6 +332,23 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                 finally:
                     # 无论流如何结束都计算客户端视角的完整生命周期耗时供日志使用喵
                     total_ms = (time.monotonic() - stream_started_at) * 1000
+                    # 计算这条流在上游侧从发起请求到最终结束的完整耗时喵
+                    upstream_elapsed_ms = (
+                        (time.monotonic() - attempt.started_at) * 1000
+                        if attempt.started_at is not None
+                        else None
+                    )
+                    # 流式候选尝试只在这里结算一次，未自然结束时记失败且不进入上游平均耗时喵
+                    if attempt.candidate is not None:
+                        state.record_candidate_health(
+                            attempt.candidate,
+                            stream_completed_normally,
+                            attempt.usage_tokens,
+                            upstream_elapsed_ms if stream_completed_normally else None,
+                            attempt.input_tokens,
+                            attempt.cached_tokens,
+                            attempt.started_at,
+                        )
                     if attempt.virtual_model is not None and stream_completed_normally:
                         # 正常结束时才建立速率事件，避免未完成流污染请求统计喵
                         attempt.rate_event = state.record_rate_event(

@@ -37,7 +37,6 @@ HEALTH_BUCKET_SECONDS = 10 * 60.0
 # 新版 stats 的滚动窗口，名称和秒数保持稳定，方便 REPL 与测试复用喵
 HEALTH_WINDOWS_SECONDS = (
     ("近10分钟", 10 * 60.0),
-    ("近15分钟", 15 * 60.0),
     ("近30分钟", 30 * 60.0),
     ("近1小时", 60 * 60.0),
     ("近6小时", 6 * 60 * 60.0),
@@ -203,6 +202,8 @@ class RuntimeState:
         self._rate_events: dict[str, list[RequestMetric]] = {}
         # 候选健康历史：候选身份串 → 最近 24 小时的成功/失败尝试喵
         self._candidate_health_events: dict[str, list[HealthEvent]] = {}
+        # 候选累计资源统计：候选身份串 → (成功数、总数、Token数、耗时总和、完成数、缓存输入数、缓存读取数)喵
+        self._candidate_health_totals: dict[str, list[float]] = {}
         # 虚拟模型健康历史：虚拟模型名 → 最近 24 小时的最终请求结果喵
         self._virtual_health_events: dict[str, list[HealthEvent]] = {}
         # 虚拟模型累计统计：虚拟模型名 → (成功数、总数、Token数、耗时总和、完成数)喵
@@ -446,22 +447,60 @@ class RuntimeState:
                 else:
                     del event_map[event_key]
 
-    def record_candidate_health(self, candidate: Candidate, success: bool, usage_tokens: int | None = None, elapsed_ms: float | None = None) -> None:
-        """记录一次候选尝试的健康结果，供 stats 画出上游历史喵~"""
-        # 取当前单调时钟和墙上时间，分别服务窗口计算和错误时间展示喵
+    def record_candidate_health(
+        self,
+        candidate: Candidate,
+        success: bool,
+        usage_tokens: int | None = None,
+        elapsed_ms: float | None = None,
+        input_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        at: float | None = None,
+        wall_time: float | None = None,
+    ) -> None:
+        """记录一次候选实际尝试的终态，供 stats 画出上游资源历史喵~"""
+        # 喵~防御：只接受非负整数 Token，避免异常上游数据污染聚合结果喵
+        valid_usage_tokens = usage_tokens if isinstance(usage_tokens, int) and not isinstance(usage_tokens, bool) and usage_tokens >= 0 else 0
+        # 喵~防御：输入 Token 非法时不参与缓存命中率分母喵
+        valid_input_tokens = input_tokens if isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens >= 0 else None
+        # 喵~防御：缓存 Token 非法时视为未上报，不伪造命中率喵
+        valid_cached_tokens = cached_tokens if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool) and cached_tokens >= 0 else None
+        # 使用调用方传入的上游事件时刻，缺失时才回退到当前时钟喵
+        event_at = at if isinstance(at, (int, float)) else time.monotonic()
+        # 使用调用方传入的墙上时间，缺失时才回退到当前时间喵
+        event_wall_time = wall_time if isinstance(wall_time, (int, float)) else time.time()
+        # 组装一条候选尝试事件喵
         event = HealthEvent(
-            at=time.monotonic(),
-            wall_time=time.time(),
+            at=float(event_at),
+            wall_time=float(event_wall_time),
             success=bool(success),
-            usage_tokens=max(0, int(usage_tokens or 0)),
-            elapsed_ms=elapsed_ms,
+            usage_tokens=valid_usage_tokens,
+            input_tokens=valid_input_tokens,
+            cached_tokens=valid_cached_tokens,
+            elapsed_ms=max(0.0, float(elapsed_ms)) if isinstance(elapsed_ms, (int, float)) and not isinstance(elapsed_ms, bool) else None,
         )
-        # 加锁追加健康历史并清理过期事件喵
+        # 加锁追加健康历史、更新累计资源统计并清理过期事件喵
         with self._lock:
             # 候选身份作为健康历史的稳定键喵
             events = self._candidate_health_events.setdefault(candidate.identity, [])
-            # 追加一条候选事件喵
+            # 追加一条候选实际尝试事件喵
             events.append(event)
+            # 累计字段依次为成功数、总数、Token数、耗时总和、完成数、缓存输入数、缓存读取数喵
+            totals = self._candidate_health_totals.setdefault(candidate.identity, [0.0] * 7)
+            # 成功数按布尔值累计喵
+            totals[0] += int(event.success)
+            # 每次真实上游尝试都计入总数喵
+            totals[1] += 1
+            # 缺失 usage 按零累计，保持与 stats 展示约定一致喵
+            totals[2] += event.usage_tokens
+            # 只有完整结束的尝试才进入平均耗时分母喵
+            if event.elapsed_ms is not None:
+                totals[3] += event.elapsed_ms
+                totals[4] += 1
+            # 只有同时明确上报输入和缓存字段且输入大于零才进入缓存加权统计喵
+            if event.input_tokens is not None and event.input_tokens > 0 and event.cached_tokens is not None:
+                totals[5] += event.input_tokens
+                totals[6] += event.cached_tokens
             # 顺手清理 24 小时之外的历史喵
             self._prune_health_events_locked(event.at)
 
@@ -584,18 +623,23 @@ class RuntimeState:
                 freeze_infos.append(FreezeInterval(current_freeze.started_at, current_freeze.until))
             # 加入历史冻结区间，当前格有请求时渲染逻辑仍会优先使用状态色喵
             freeze_infos.extend(self._freeze_intervals.get(candidate.identity, []))
-            # 候选累计计数比 24 小时事件更适合表达「所有时间」喵
-            candidate_totals = self._stats.get(candidate.identity, CandidateStats())
-            # 返回窗口和历史条快照，并保留进程内累计成功率喵
+            # 计算候选最近 24 小时窗口和历史条喵
             snapshot = self._health_snapshot_locked(events, now, freeze_infos)
-            # 候选累计总数来自原有永久统计，避免 24 小时清理改变所有时间口径喵
+            # 候选累计计数比 24 小时事件更适合表达「所有时间」喵
+            candidate_totals = self._candidate_health_totals.get(candidate.identity, [0.0] * 7)
+            # 计算候选累计平均耗时，没有完整尝试时保持未知喵
+            lifetime_average = candidate_totals[3] / candidate_totals[4] if candidate_totals[4] > 0 else None
+            # 计算候选累计输入 Token 加权缓存命中率，没有可用分母时保持未上报喵
+            lifetime_cache_rate = candidate_totals[6] / candidate_totals[5] if candidate_totals[5] > 0 else None
+            # 返回窗口和历史条快照，并保留候选进程内累计资源统计喵
             lifetime_window = HealthWindow(
-                candidate_totals.success,
-                candidate_totals.success + candidate_totals.failure,
-                0,
-                None,
+                int(candidate_totals[0]),
+                int(candidate_totals[1]),
+                int(candidate_totals[2]),
+                lifetime_average,
+                lifetime_cache_rate,
             )
-            # 用累计窗口替换历史窗口，其余滚动窗口仍严格限制在 24 小时内喵
+            # 用候选资源累计窗口替换历史窗口，其余滚动窗口仍严格限制在 24 小时内喵
             return HealthSnapshot(lifetime_window, snapshot.windows, snapshot.buckets)
 
     def snapshot_virtual_model_health(self, virtual_model: str) -> HealthSnapshot:

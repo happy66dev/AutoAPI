@@ -612,7 +612,7 @@ class Repl:
             snapshot = self.state.snapshot_candidate_health(candidate) if candidate is not None else None
             if snapshot is not None:
                 print(f"    {_ansi('成功率:', '33')}")
-                for window_name in ("所有时间", "近6小时", "近1小时", "近30分钟", "近15分钟"):
+                for window_name in ("所有时间", "近6小时", "近1小时", "近30分钟", "近10分钟"):
                     # 从快照中按用户指定顺序取窗口喵
                     window = snapshot.all_time if window_name == "所有时间" else snapshot.windows.get(window_name)
                     # 缺少窗口时按暂无请求处理，避免热重载期间异常喵
@@ -625,6 +625,18 @@ class Repl:
                 # 历史条宽度扣除缩进和说明文字，剩余空间用于 144 格历史喵
                 terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
                 print(f"      {_ansi('渲染图:', '33')} {_render_history(snapshot, max(1, terminal_width - 18))}")
+                # 追加上游实际尝试的资源统计，时间从大到小并使用上游完成耗时喵
+                for window_name, window in (("所有时间", snapshot.all_time), ("近6小时", snapshot.windows.get("近6小时")), ("近1小时", snapshot.windows.get("近1小时")), ("近30分钟", snapshot.windows.get("近30分钟")), ("近10分钟", snapshot.windows.get("近10分钟"))):
+                    # 喵~防御：热重载期间快照缺少窗口时按无请求展示，避免 stats 命令报错喵
+                    if window is None:
+                        window = HealthWindow(0, 0, 0, None, None)
+                    # 同时显示紧凑和完整 Token 数，方便终端浏览与精确核对喵
+                    token_text = f"{_format_compact(window.tokens)}({_format_count(window.tokens)})"
+                    print(
+                        f"    {_ansi(window_name, '33')} 共 {_format_count(window.total)} 个请求 "
+                        f"总Token数量: {token_text} 平均耗时: {_format_duration(window.average_elapsed_ms)} "
+                        f"平均缓存命中率: {_format_cache_hit_rate(window.average_cache_hit_rate)}"
+                    )
             # 展示连续失败与自动避险提示喵
             threshold = self.state.config.server.auto_hedge_threshold
             if row.consecutive_failures > 0:
