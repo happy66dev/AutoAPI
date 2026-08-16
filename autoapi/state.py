@@ -20,16 +20,82 @@ from __future__ import annotations
 
 # threading 提供跨线程互斥锁喵
 import threading
-# time 用来取单调时钟，算冻结倒计时喵
-import time
 # dataclass 用来定义统计数据的小容器喵
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+# time 用来取墙上时间和单调时钟喵
+import time
 
 # 从配置模块引入候选和配置类型喵
 from .config import AppConfig, Candidate
 
 # RPM 和 TPM 固定只统计最近 60 秒的成功请求喵~
 RATE_WINDOW_SECONDS = 60.0
+# 新版 stats 最多保留最近 24 小时的历史事件喵
+HEALTH_HISTORY_SECONDS = 24 * 60 * 60.0
+# 可用率历史条每格代表 10 分钟喵
+HEALTH_BUCKET_SECONDS = 10 * 60.0
+# 新版 stats 的滚动窗口，名称和秒数保持稳定，方便 REPL 与测试复用喵
+HEALTH_WINDOWS_SECONDS = (
+    ("近10分钟", 10 * 60.0),
+    ("近15分钟", 15 * 60.0),
+    ("近30分钟", 30 * 60.0),
+    ("近1小时", 60 * 60.0),
+    ("近6小时", 6 * 60 * 60.0),
+)
+
+
+@dataclass
+class HealthEvent:
+    """候选尝试或虚拟模型最终请求的一条健康事件喵~"""
+
+    # 单调时钟时间，用于窗口计算，单位：秒喵
+    at: float
+    # 墙上时钟时间，用于最近错误展示，单位：Unix 秒喵
+    wall_time: float
+    # 这次事件是否成功喵
+    success: bool
+    # 上游明确上报的 Token，统计展示缺失时按 0 处理喵
+    usage_tokens: int = 0
+    # 完整请求耗时，单位：毫秒；失败或未完整结束时为空喵
+    elapsed_ms: float | None = None
+
+
+@dataclass(frozen=True)
+class HealthWindow:
+    """一个时间窗口里的成功、请求、Token 和耗时快照喵~"""
+
+    # 窗口成功请求数喵
+    success: int
+    # 窗口总请求数喵
+    total: int
+    # 窗口 Token 总量，缺失 usage 已按 0 计入喵
+    tokens: int
+    # 窗口内完成请求的平均耗时，单位：毫秒喵
+    average_elapsed_ms: float | None
+
+
+@dataclass(frozen=True)
+class HealthBucket:
+    """十分钟历史条的一格快照喵~"""
+
+    # 这格成功请求数喵
+    success: int
+    # 这格总请求数喵
+    total: int
+    # 查询快照时是否仍被冻结喵
+    frozen: bool
+
+
+@dataclass(frozen=True)
+class HealthSnapshot:
+    """某个候选或虚拟模型的完整 stats 快照喵~"""
+
+    # 所有时间窗口喵
+    all_time: HealthWindow
+    # 固定名称的滚动窗口，键为近15分钟等中文标签喵
+    windows: dict[str, HealthWindow]
+    # 从旧到新的 24 小时十分钟历史格喵
+    buckets: list[HealthBucket]
 
 
 @dataclass
@@ -44,6 +110,8 @@ class CandidateStats:
     frozen_times: int = 0
     # 最近一次失败的简短原因，方便排查喵
     last_error: str = ""
+    # 最近一次失败发生的墙上时钟时间，单位：Unix 秒喵
+    last_error_at: float | None = None
     # 当前连续失败了多少次。成功一次就清零，达到自动避险阈值就冻结这个节点喵
     consecutive_failures: int = 0
     # 因为连续失败而被自动避险的次数喵
@@ -107,6 +175,12 @@ class RuntimeState:
         self._stats: dict[str, CandidateStats] = {}
         # 虚拟模型动态负载：虚拟模型名 → 当前统计窗口内的成功请求记录喵
         self._rate_events: dict[str, list[RequestMetric]] = {}
+        # 候选健康历史：候选身份串 → 最近 24 小时的成功/失败尝试喵
+        self._candidate_health_events: dict[str, list[HealthEvent]] = {}
+        # 虚拟模型健康历史：虚拟模型名 → 最近 24 小时的最终请求结果喵
+        self._virtual_health_events: dict[str, list[HealthEvent]] = {}
+        # 虚拟模型累计统计：虚拟模型名 → (成功数、总数、Token数、耗时总和、完成数)喵
+        self._virtual_health_totals: dict[str, list[float]] = {}
         # 代理累计处理的客户端请求数喵
         self.total_requests = 0
         # 代理累计彻底失败（整条候选链都用尽）的请求数喵
@@ -293,7 +367,167 @@ class RuntimeState:
         # 返回结果喵
         return rows
 
-    # ---------- 动态 RPM / TPM 相关喵 ----------
+    # ---------- 健康历史相关喵 ----------
+
+    def _prune_health_events_locked(self, now: float) -> None:
+        """在持锁状态下清理超过 24 小时的健康历史喵~"""
+        # 计算 24 小时历史的最早保留时刻喵
+        cutoff = now - HEALTH_HISTORY_SECONDS
+        # 逐个清理候选和虚拟模型事件喵
+        for event_map in (self._candidate_health_events, self._virtual_health_events):
+            # 遍历副本，允许删除已经没有事件的键喵
+            for event_key, events in list(event_map.items()):
+                # 只保留历史窗口内的事件喵
+                kept_events = [event for event in events if event.at >= cutoff]
+                # 有事件就写回清理后的列表喵
+                if kept_events:
+                    event_map[event_key] = kept_events
+                # 没有事件就删除键，避免空表持续增长喵
+                else:
+                    del event_map[event_key]
+
+    def record_candidate_health(self, candidate: Candidate, success: bool, usage_tokens: int | None = None, elapsed_ms: float | None = None) -> None:
+        """记录一次候选尝试的健康结果，供 stats 画出上游历史喵~"""
+        # 取当前单调时钟和墙上时间，分别服务窗口计算和错误时间展示喵
+        event = HealthEvent(
+            at=time.monotonic(),
+            wall_time=time.time(),
+            success=bool(success),
+            usage_tokens=max(0, int(usage_tokens or 0)),
+            elapsed_ms=elapsed_ms,
+        )
+        # 加锁追加健康历史并清理过期事件喵
+        with self._lock:
+            # 候选身份作为健康历史的稳定键喵
+            events = self._candidate_health_events.setdefault(candidate.identity, [])
+            # 追加一条候选事件喵
+            events.append(event)
+            # 顺手清理 24 小时之外的历史喵
+            self._prune_health_events_locked(event.at)
+
+    def record_virtual_model_health(self, virtual_model: str, success: bool, usage_tokens: int | None = None, elapsed_ms: float | None = None) -> None:
+        """记录一次虚拟模型最终请求结果，供 stats 按客户端请求统计喵~"""
+        # 喵~防御：空虚拟模型名不写入统计，避免产生无法展示的垃圾分组喵
+        if not isinstance(virtual_model, str) or not virtual_model.strip():
+            return
+        # 取当前单调时钟和墙上时间，分别服务窗口计算和调试展示喵
+        event = HealthEvent(
+            at=time.monotonic(),
+            wall_time=time.time(),
+            success=bool(success),
+            usage_tokens=max(0, int(usage_tokens or 0)),
+            elapsed_ms=elapsed_ms,
+        )
+        # 加锁追加虚拟模型事件并更新累计总计喵
+        with self._lock:
+            # 去掉首尾空格，保证配置名和请求名统一喵
+            model_name = virtual_model.strip()
+            # 取得该模型的历史列表喵
+            events = self._virtual_health_events.setdefault(model_name, [])
+            # 追加一条最终请求结果喵
+            events.append(event)
+            # 累计字段按成功数、总数、Token数、耗时总和、完成数排列喵
+            totals = self._virtual_health_totals.setdefault(model_name, [0.0, 0.0, 0.0, 0.0, 0.0])
+            # 成功数按布尔值加一喵
+            totals[0] += int(event.success)
+            # 总请求数每次最终结果加一喵
+            totals[1] += 1
+            # 新版 stats 明确把缺失 usage 当作 0 喵
+            totals[2] += event.usage_tokens
+            # 只有有耗时的完整请求才加入平均值分子喵
+            if event.elapsed_ms is not None:
+                totals[3] += max(0.0, event.elapsed_ms)
+                totals[4] += 1
+            # 清理 24 小时之前的滚动历史，但不影响累计 totals 喵
+            self._prune_health_events_locked(event.at)
+
+    def _health_snapshot_locked(self, events: list[HealthEvent], now: float, frozen: bool = False) -> HealthSnapshot:
+        """在持锁状态下按窗口与十分钟格汇总健康事件喵~"""
+        # 只使用当前仍在 24 小时历史范围内的事件喵
+        recent_events = [event for event in events if event.at >= now - HEALTH_HISTORY_SECONDS]
+        # 汇总一个事件列表为窗口快照喵
+        def summarize(selected_events: list[HealthEvent]) -> HealthWindow:
+            # 统计成功事件数量喵
+            success_count = sum(int(event.success) for event in selected_events)
+            # 统计完整请求耗时列表喵
+            elapsed_values = [event.elapsed_ms for event in selected_events if event.elapsed_ms is not None]
+            # 计算平均耗时，没有完成事件时返回未知喵
+            average_elapsed = sum(elapsed_values) / len(elapsed_values) if elapsed_values else None
+            # 组装窗口统计，Token 缺失已经以 0 存储喵
+            return HealthWindow(success_count, len(selected_events), sum(event.usage_tokens for event in selected_events), average_elapsed)
+        # 计算所有时间窗口，这里指当前进程保留的 24 小时历史范围喵
+        all_time = summarize(recent_events)
+        # 按固定顺序建立各个滚动窗口喵
+        windows = {
+            window_name: summarize([event for event in recent_events if event.at >= now - seconds])
+            for window_name, seconds in HEALTH_WINDOWS_SECONDS
+        }
+        # 计算最近 24 小时的 144 个十分钟历史格，从旧到新排列喵
+        bucket_count = int(HEALTH_HISTORY_SECONDS / HEALTH_BUCKET_SECONDS)
+        bucket_start = now - HEALTH_HISTORY_SECONDS
+        buckets: list[HealthBucket] = []
+        # 逐格汇总成功数和总数喵
+        for bucket_index in range(bucket_count):
+            start = bucket_start + bucket_index * HEALTH_BUCKET_SECONDS
+            end = start + HEALTH_BUCKET_SECONDS
+            bucket_events = [event for event in recent_events if start <= event.at < end]
+            buckets.append(HealthBucket(sum(int(event.success) for event in bucket_events), len(bucket_events), frozen))
+        # 返回完整健康快照喵
+        return HealthSnapshot(all_time, windows, buckets)
+
+    def snapshot_candidate_health(self, candidate: Candidate) -> HealthSnapshot:
+        """返回一个候选的成功率和 24 小时历史快照喵~"""
+        # 加锁清理并读取候选健康事件喵
+        with self._lock:
+            # 取当前时刻作为整份快照的统一边界喵
+            now = time.monotonic()
+            # 清理过期历史，降低长期运行的内存占用喵
+            self._prune_health_events_locked(now)
+            # 查候选事件，没有就按空历史汇总喵
+            events = self._candidate_health_events.get(candidate.identity, [])
+            # 当前冻结状态用于将历史条统一标成青色提醒喵
+            frozen = bool(self._freezes.get(candidate.identity) and self._freezes[candidate.identity].until > now)
+            # 候选累计计数比 24 小时事件更适合表达「所有时间」喵
+            candidate_totals = self._stats.get(candidate.identity, CandidateStats())
+            # 返回窗口和历史条快照，并保留进程内累计成功率喵
+            snapshot = self._health_snapshot_locked(events, now, frozen)
+            # 候选累计总数来自原有永久统计，避免 24 小时清理改变所有时间口径喵
+            lifetime_window = HealthWindow(
+                candidate_totals.success,
+                candidate_totals.success + candidate_totals.failure,
+                0,
+                None,
+            )
+            # 用累计窗口替换历史窗口，其余滚动窗口仍严格限制在 24 小时内喵
+            return HealthSnapshot(lifetime_window, snapshot.windows, snapshot.buckets)
+
+    def snapshot_virtual_model_health(self, virtual_model: str) -> HealthSnapshot:
+        """返回一个虚拟模型的成功率和吞吐耗时快照喵~"""
+        # 加锁清理并读取虚拟模型健康事件喵
+        with self._lock:
+            # 取当前时刻作为整份快照的统一边界喵
+            now = time.monotonic()
+            # 清理过期历史，保证历史条只保留 24 小时喵
+            self._prune_health_events_locked(now)
+            # 取虚拟模型事件，没有就按空历史汇总喵
+            events = self._virtual_health_events.get(virtual_model, [])
+            # 读取进程生命周期累计值，避免清理 24 小时历史后所有时间统计归零喵
+            totals = self._virtual_health_totals.get(virtual_model, [0.0, 0.0, 0.0, 0.0, 0.0])
+            # 计算累计平均耗时，没有完整请求时保持未知喵
+            lifetime_average = totals[3] / totals[4] if totals[4] > 0 else None
+            # 虚拟模型冻结由其候选链任意节点冻结表示，当前先按模型整体不可用处理喵
+            frozen = any(
+                info.until > now
+                for identity, info in self._freezes.items()
+                if any(candidate.identity == identity for candidate in self._config.virtual_models.get(virtual_model, []))
+            )
+            # 返回窗口和历史条快照喵
+            snapshot = self._health_snapshot_locked(events, now, frozen)
+            # 所有时间窗口使用进程内累计成功、请求、Token 和平均耗时喵
+            lifetime_window = HealthWindow(int(totals[0]), int(totals[1]), int(totals[2]), lifetime_average)
+            # 保留滚动窗口和历史条，替换掉仅限 24 小时的所有时间窗口喵
+            return HealthSnapshot(lifetime_window, snapshot.windows, snapshot.buckets)
+
 
     def record_rate_event(self, virtual_model: str, usage_tokens: int | None = None) -> RequestMetric:
         """
@@ -415,7 +649,7 @@ class RuntimeState:
 
     # ---------- 统计相关喵 ----------
 
-    def record_success(self, candidate: Candidate) -> None:
+    def record_success(self, candidate: Candidate, usage_tokens: int | None = None, elapsed_ms: float | None = None) -> None:
         """记录一次成功，顺手解冻这个候选并清零它的连续失败计数喵~"""
         # 加锁更新统计并删除冻结记录喵
         with self._lock:
@@ -423,6 +657,12 @@ class RuntimeState:
             stats = self._stats.setdefault(candidate.identity, CandidateStats())
             # 成功次数加一喵
             stats.success += 1
+            # 追加候选成功事件，成功尝试不携带 Token 和耗时也不影响可用率计算喵
+            self._candidate_health_events.setdefault(candidate.identity, []).append(
+                HealthEvent(time.monotonic(), time.time(), True, max(0, int(usage_tokens or 0)), elapsed_ms)
+            )
+            # 清理 24 小时外的候选与虚拟模型历史喵
+            self._prune_health_events_locked(time.monotonic())
             # 连续失败计数清零 —— 这是「连续」的含义所在：中间只要成功过一次，
             # 之前攒的失败次数就不该再算进自动避险的账上喵
             stats.consecutive_failures = 0
@@ -455,6 +695,14 @@ class RuntimeState:
             stats = self._stats.setdefault(candidate.identity, CandidateStats())
             # 失败次数加一喵
             stats.failure += 1
+            # 记录最近错误发生的墙上时间，供 stats 展示报错时间喵
+            stats.last_error_at = time.time()
+            # 追加候选失败事件，保留原始错误文本在 CandidateStats 中供详情展示喵
+            self._candidate_health_events.setdefault(candidate.identity, []).append(
+                HealthEvent(time.monotonic(), stats.last_error_at, False)
+            )
+            # 清理 24 小时外的候选与虚拟模型历史喵
+            self._prune_health_events_locked(time.monotonic())
             # 连续失败次数也加一喵
             stats.consecutive_failures += 1
             # 记下最近一次失败原因，截断到 200 字符防止内存膨胀喵

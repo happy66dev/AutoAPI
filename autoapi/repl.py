@@ -24,6 +24,12 @@ from __future__ import annotations
 
 # copy 用来深拷贝配置字典，避免改动影响到原件喵
 import copy
+# datetime 用来格式化最近错误发生时间喵
+from datetime import datetime
+# os 用来读取 NO_COLOR 环境变量喵
+import os
+# shutil 用来读取终端窗口宽度喵
+import shutil
 # json 用来解析 rule add 命令的参数、以及打印规则内容喵
 import json
 # threading 用来跑独立线程和退出信号喵
@@ -42,7 +48,7 @@ from .config import (
     parse_config,
 )
 # 引入运行时状态喵
-from .state import RuntimeState
+from .state import HEALTH_BUCKET_SECONDS, HealthSnapshot, HealthWindow, RuntimeState
 
 # help 命令要打印的帮助文本喵
 HELP_TEXT = """
@@ -137,6 +143,125 @@ HELP_TEXT = """
     nonstream_timeout   非流式请求的总预算。非流式要等上游憋完整篇，天生该等更久。
 """.strip()
 
+
+def _ansi(text: str, code: str) -> str:
+    """按终端能力给 stats 文字加 ANSI 颜色喵~"""
+    # 喵~防御：NO_COLOR 或非 TTY 输出时返回纯文本，保证重定向内容可读喵
+    if os.environ.get("NO_COLOR") or not getattr(__import__("sys").stdout, "isatty", lambda: False)():
+        return text
+    # 返回颜色码、正文和复位码组成的完整片段喵
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _rate_color(rate: float | None) -> str:
+    """按成功率返回 ANSI 颜色编号喵~"""
+    # 无请求窗口没有成功率，灰色表示暂无数据喵
+    if rate is None:
+        return "90"
+    # 85% 及以上显示绿色喵
+    if rate >= 85:
+        return "32"
+    # 60% 到不足 85% 显示黄色喵
+    if rate >= 60:
+        return "33"
+    # 30% 到不足 60% 显示橙色喵
+    if rate >= 30:
+        return "38;5;208"
+    # 不足 30% 显示红色喵
+    return "31"
+
+
+def _format_count(value: int | float) -> str:
+    """用三位分组法展示整数喵~"""
+    # 喵~防御：非有限数值回退为 0，避免格式化异常污染 stats 喵
+    try:
+        return f"{max(0, int(value)):,}"
+    except (TypeError, ValueError, OverflowError):
+        return "0"
+
+
+def _format_compact(value: int | float) -> str:
+    """将 Token 数量压缩成 K/M/B 并保留合理精度喵~"""
+    # 喵~防御：非法数值回退为 0，避免命令输出中断喵
+    try:
+        numeric_value = max(0.0, float(value))
+    except (TypeError, ValueError, OverflowError):
+        numeric_value = 0.0
+    # 依次尝试十亿、百万和千单位喵
+    for unit, divisor in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
+        # 大于等于单位时显示两位小数喵
+        if numeric_value >= divisor:
+            return f"{numeric_value / divisor:.2f}{unit}"
+    # 小数不足一千时直接显示分组整数喵
+    return _format_count(numeric_value)
+
+
+def _format_duration(milliseconds: float | None) -> str:
+    """同时展示秒和毫秒的平均耗时喵~"""
+    # 没有完整请求时明确显示暂无数据喵
+    if milliseconds is None:
+        return "暂无数据"
+    # 喵~防御：负数耗时按 0 处理，避免显示不可能的负时长喵
+    safe_milliseconds = max(0.0, milliseconds)
+    # 返回示例中的秒和毫秒双重展示喵
+    return f"{safe_milliseconds / 1000:.2f}s({_format_count(round(safe_milliseconds))}ms)"
+
+
+def _format_health_window(window: HealthWindow) -> tuple[str, str]:
+    """把窗口快照格式化为成功率和吞吐统计文本喵~"""
+    # 无请求时返回灰色暂无数据提示喵
+    if window.total <= 0:
+        return "暂无请求", "暂无请求"
+    # 计算成功率百分比，分母始终是窗口总请求数喵
+    rate = window.success / window.total * 100
+    # 成功率保留两位小数并展示成功/总数喵
+    rate_text = f"{rate:.2f}% {_format_count(window.success)}/{_format_count(window.total)}"
+    # Token 和平均耗时按用户要求同时显示紧凑值与原始值喵
+    token_text = f"{_format_compact(window.tokens)}({_format_count(window.tokens)})"
+    duration_text = _format_duration(window.average_elapsed_ms)
+    # 返回成功率文本以及尾部统计文本喵
+    return rate_text, f"{token_text} 平均耗时: {duration_text}"
+
+
+def _render_history(snapshot: HealthSnapshot, width: int) -> str:
+    """把最近 24 小时的十分钟健康桶渲染成彩色历史条喵~"""
+    # 喵~防御：终端宽度过小时仍保留至少一个历史格喵
+    visible_width = max(1, width)
+    # 只取最新的可容纳历史格，避免超出终端窗口喵
+    buckets = snapshot.buckets[-visible_width:]
+    # 每个历史格用一个半高块字符，颜色表达可用率喵
+    fragments: list[str] = []
+    # 逐个历史格生成彩色字符喵
+    for bucket in buckets:
+        # 冻结状态优先使用青色提醒喵
+        if bucket.frozen:
+            color_code = "36"
+            block = "█"
+        # 无请求历史格用灰色空槽喵
+        elif bucket.total <= 0:
+            color_code = "90"
+            block = "·"
+        else:
+            # 按这格成功率选择同一套阈值颜色喵
+            color_code = _rate_color(bucket.success / bucket.total * 100)
+            # 根据可用率选择高度字符，颜色和高度共同表达健康程度喵
+            block = "█" if bucket.success == bucket.total else ("▄" if bucket.success * 2 >= bucket.total else "▁")
+        # 追加单格颜色文本喵
+        fragments.append(_ansi(block, color_code))
+    # 拼接历史条并返回喵
+    return "".join(fragments)
+
+
+def _format_error_time(timestamp: float | None) -> str:
+    """格式化最近错误时间，无法取得时显示未知喵~"""
+    # 没有时间戳时返回明确占位文本喵
+    if timestamp is None:
+        return "未知"
+    # 喵~防御：时间格式化异常时不影响 stats 其他内容喵
+    try:
+        return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return "未知"
 
 def format_countdown(seconds: float) -> str:
     """
@@ -429,42 +554,106 @@ class Repl:
             print(f"                原因：{reason[:120]}")
 
     def cmd_stats(self) -> None:
-        """打印每个候选的成败统计喵~"""
-        # 取统计快照喵
+        """打印彩色的上游与虚拟模型健康统计喵~"""
+        # 取累计候选统计快照喵
         stats = self.state.snapshot_stats()
-        # 打印总体计数喵
-        print(f"\n累计处理 {self.state.total_requests} 条请求，其中 {self.state.total_exhausted} 条把整条候选链都用尽了喵")
-        # 喵~防御：还没有任何候选被用过时给提示喵
-        if not stats:
+        # 取当前配置快照，用于把身份串反查成候选和虚拟模型喵
+        config = self.state.config
+        # 打印总体累计计数，保留原有 stats 信息喵
+        print(
+            f"\n累计处理 {_format_count(self.state.total_requests)} 条请求，其中 "
+            f"{_format_count(self.state.total_exhausted)} 条把整条候选链都用尽了喵"
+        )
+        # 没有任何统计时仍打印虚拟模型标题，方便主人确认命令正常工作喵
+        if not stats and not config.virtual_models:
             print("还没有任何候选被使用过喵~")
             return
-        # 打印表头喵
-        print("\n各候选统计喵：")
-        # 逐个候选打印统计喵
+        # 按用户要求打印上游统计标题喵
+        print(_ansi("\n各上游统计喵：", "33"))
+        # 逐个配置候选打印，即使暂时没有请求也能看到暂无数据喵
+        known_candidates = {
+            candidate.identity: (virtual_model, candidate)
+            for virtual_model, chain in config.virtual_models.items()
+            for candidate in chain
+        }
+        # 统计表中可能存在已从配置删掉的历史候选，也继续展示其累计信息喵
         for identity, row in stats.items():
-            # 身份串里第一段是 base_url、第三段是模型名，取出来做展示喵
+            known_candidates.setdefault(identity, ("未知虚拟模型", None))
+        # 逐个候选输出完整健康信息喵
+        for identity, (virtual_model, candidate) in known_candidates.items():
+            # 从配置候选或身份串取得展示字段喵
             parts = identity.split("|")
-            # 喵~防御：身份串格式异常时退回打印整个串，不让展示逻辑炸掉喵
-            shown = f"{parts[2]} @ {parts[0]}" if len(parts) >= 3 else identity
-            # 打印成功、失败、被冻结次数喵
-            print(f"  {shown}")
-            print(f"    成功 {row.success} 次 / 失败 {row.failure} 次 / 被冻结 {row.frozen_times} 次")
-            # 当前连续失败了几次，配合阈值能看出这个节点离自动避险还有多远喵
+            model_id = candidate.model if candidate is not None else (parts[2] if len(parts) >= 3 else identity)
+            base_url = candidate.base_url if candidate is not None else (parts[0] if parts else identity)
+            # 没有累计行时建立默认计数对象喵
+            row = stats.get(identity)
+            if row is None:
+                from .state import CandidateStats
+                row = CandidateStats()
+            # 打印模型 ID、灰色连接符和地址喵
+            print(f"  {_ansi(model_id, '36')} {_ansi('@', '90')} {_ansi(base_url, '90')}")
+            # 按指定颜色展示累计计数喵
+            print(
+                f"    {_ansi('成功', '32')} {_format_count(row.success)} 次 / "
+                f"{_ansi('失败', '31')} {_format_count(row.failure)} 次 / "
+                f"{_ansi('被冻结', '36')} {_format_count(row.frozen_times)} 次"
+            )
+            # 展示五个成功率窗口喵
+            snapshot = self.state.snapshot_candidate_health(candidate) if candidate is not None else None
+            if snapshot is not None:
+                print(f"    {_ansi('成功率:', '33')}")
+                for window_name, window in (("所有时间", snapshot.all_time), *snapshot.windows.items()):
+                    # 计算窗口百分比并选择阈值颜色喵
+                    rate = window.success / window.total * 100 if window.total else None
+                    rate_text, _ = _format_health_window(window)
+                    print(f"      {_ansi(window_name, '33')}: {_ansi(rate_text, _rate_color(rate))}")
+                # 历史条宽度扣除缩进和说明文字，剩余空间用于 144 格历史喵
+                terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+                print(f"      {_ansi('渲染图:', '33')} {_render_history(snapshot, max(1, terminal_width - 18))}")
+            # 展示连续失败与自动避险提示喵
+            threshold = self.state.config.server.auto_hedge_threshold
             if row.consecutive_failures > 0:
-                # 取出当前阈值一起显示，方便主人判断喵
-                threshold = self.state.config.server.auto_hedge_threshold
-                # 阈值大于 0 才显示「离触发还差多少」，否则只显示当前次数喵
                 if threshold > 0:
-                    print(f"    连续失败 {row.consecutive_failures}/{threshold} 次（再失败 {threshold - row.consecutive_failures} 次就自动避险）")
+                    remaining_failures = max(0, threshold - row.consecutive_failures)
+                    print(
+                        f"    {_ansi('连续失败', '31')} {row.consecutive_failures}/{threshold} 次"
+                        f"（再失败 {remaining_failures} 次就自动避险）"
+                    )
                 else:
-                    print(f"    连续失败 {row.consecutive_failures} 次（自动避险已关闭）")
-            # 被自动避险过的次数，说明这个节点历史上不太稳定喵
-            if row.hedged_times > 0:
-                print(f"    曾因连续失败被自动避险 {row.hedged_times} 次")
-            # 有最近错误就打印出来喵
+                    print(f"    {_ansi('连续失败', '31')} {row.consecutive_failures} 次（自动避险已关闭）")
+            # 展示最近错误原文和报错时间，不修改上游返回内容喵
             if row.last_error:
-                # 截断到 120 字符保持整洁喵
-                print(f"    最近错误：{row.last_error[:120]}")
+                print(f"    {_ansi('最近错误:', '33')}")
+                print(f"      {_ansi('返回的内容:', '33')} {row.last_error}")
+                print(f"      {_ansi('报错时间:', '33')} {_format_error_time(row.last_error_at)}")
+        # 打印虚拟模型统计标题喵
+        print(_ansi("\n虚拟模型统计喵：", "33"))
+        # 逐个配置虚拟模型输出客户端请求口径的统计喵
+        for virtual_model in config.virtual_models:
+            # 取虚拟模型健康快照喵
+            snapshot = self.state.snapshot_virtual_model_health(virtual_model)
+            # 打印模型名并复用同一套成功率和历史条格式喵
+            print(f"  {_ansi(virtual_model, '36')}")
+            print(f"    {_ansi('成功率:', '33')}")
+            for window_name, window in (("所有时间", snapshot.all_time), *snapshot.windows.items()):
+                # 计算窗口百分比并选择阈值颜色喵
+                rate = window.success / window.total * 100 if window.total else None
+                rate_text, _ = _format_health_window(window)
+                print(f"      {_ansi(window_name, '33')}: {_ansi(rate_text, _rate_color(rate))}")
+            # 历史条统一使用最近 24 小时十分钟格喵
+            terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+            print(f"      {_ansi('渲染图:', '33')} {_render_history(snapshot, max(1, terminal_width - 18))}")
+            # 追加用户要求的五个吞吐与平均耗时窗口喵
+            for window_name, window in (("近10分钟", snapshot.windows.get("近10分钟")), ("近30分钟", snapshot.windows.get("近30分钟")), ("近1小时", snapshot.windows.get("近1小时")), ("近6小时", snapshot.windows.get("近6小时")), ("所有时间", snapshot.all_time)):
+                # 近十分钟直接使用状态层的十分钟窗口，避免历史格边界误差喵
+                if window is None:
+                    window = HealthWindow(0, 0, 0, None)
+                # 只展示请求数、Token 数和平均耗时，缺 usage 按 0 体现喵
+                token_text = f"{_format_compact(window.tokens)}({_format_count(window.tokens)})"
+                print(
+                    f"    {_ansi(window_name, '33')} 共 {_format_count(window.total)} 个请求 "
+                    f"总Token数量: {token_text} 平均耗时: {_format_duration(window.average_elapsed_ms)}"
+                )
 
     # ---------- 改规则类命令喵 ----------
 

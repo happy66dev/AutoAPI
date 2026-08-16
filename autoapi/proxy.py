@@ -242,7 +242,19 @@ async def _run_one_candidate(
         # 成功了，记一笔成功（顺带会自动解冻这个候选）然后返回喵
         if result.ok:
             # 更新统计并解冻喵
-            state.record_success(candidate)
+            state.record_success(
+                candidate,
+                result.usage_tokens,
+                (time.monotonic() - request_started_at) * 1000 if not is_stream else None,
+            )
+            # 非流式完整请求按虚拟模型记录一次最终成功喵
+            if not is_stream:
+                state.record_virtual_model_health(
+                    virtual_model,
+                    True,
+                    result.usage_tokens,
+                    (time.monotonic() - request_started_at) * 1000,
+                )
             # 记录 RPM/TPM 事件：非流式完整响应已经结束，立即统一上报喵
             # 流式必须等整条流结束后再由 server 统一上报，放行时不能提前增加 RPM 喵
             if not is_stream:
@@ -490,6 +502,8 @@ async def handle_request(
             failures.append(f"{candidate.label} → 状态 {result.status}：{result.error_text[:150]}")
         # 整条候选链都走完了还没成功喵
         state.total_exhausted += 1
+        # 候选链耗尽按一次客户端最终失败记入虚拟模型健康统计喵
+        state.record_virtual_model_health(virtual_model, False)
         # 忽略接口链耗尽后直接返回普通 502，只输出一条 info，不进入目标模式喵
         if ignored_error_endpoint:
             logger.info(

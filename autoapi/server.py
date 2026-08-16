@@ -338,6 +338,14 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                             attempt.virtual_model,
                             attempt.usage_tokens,
                         )
+                        # 正常结束的流按一次客户端最终成功记入虚拟模型健康统计喵
+                        if stream_completed_normally:
+                            state.record_virtual_model_health(
+                                attempt.virtual_model,
+                                True,
+                                attempt.usage_tokens,
+                                total_ms,
+                            )
                     # 只有正常结束的流才补写完整耗时，异常流不污染平均值喵
                     if stream_completed_normally and attempt.rate_event is not None:
                         state.attach_elapsed_ms(attempt.rate_event, total_ms)
