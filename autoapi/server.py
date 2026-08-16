@@ -163,9 +163,9 @@ def create_app(state: RuntimeState) -> FastAPI:
             # 保持活跃的连接数，复用连接能省掉每次的 TLS 握手，显著降延迟喵
             max_keepalive_connections=50,
         )
-        # 创建全程复用的异步客户端喵
-        # follow_redirects 打开，因为部分中转站会用 301 把 /v1 重定向到实际路径喵
-        async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=True) as client:
+        # 创建全程复用的异步客户端，禁止自动跟随重定向以保护候选鉴权头喵
+        # 喵~防御：3xx 目标可能跨域，httpx 会携带自定义 x-api-key 到新主机喵
+        async with httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False) as client:
             # 把客户端挂到 app.state 上，路由函数通过它取用喵
             app.state.http_client = client
             # 热重载任务的句柄，默认没有喵
@@ -349,7 +349,14 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                             attempt.cached_tokens,
                             attempt.started_at,
                         )
-                    if attempt.virtual_model is not None and stream_completed_normally:
+                        # 自然结束的流才更新候选成功状态，探测放行本身不代表请求完成喵
+                        if stream_completed_normally:
+                            state.record_success(
+                                attempt.candidate,
+                                attempt.usage_tokens,
+                                upstream_elapsed_ms,
+                            )
+                    if attempt.virtual_model is not None and stream_completed_normally and not attempt.ignored_error_endpoint:
                         # 正常结束时才建立速率事件，避免未完成流污染请求统计喵
                         attempt.rate_event = state.record_rate_event(
                             attempt.virtual_model,

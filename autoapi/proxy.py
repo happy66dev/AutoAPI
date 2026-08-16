@@ -274,12 +274,13 @@ async def _run_one_candidate(
                     result.cached_tokens,
                     result.started_at or attempt_started_at,
                 )
-            # 更新统计并解冻喵
-            state.record_success(
-                candidate,
-                result.usage_tokens,
-                (time.monotonic() - request_started_at) * 1000 if not is_stream else None,
-            )
+            # 非流响应已完整结束，此刻才更新候选成功状态并解除冻结喵
+            if not is_stream:
+                state.record_success(
+                    candidate,
+                    result.usage_tokens,
+                    (time.monotonic() - request_started_at) * 1000,
+                )
             # 非流式完整请求按虚拟模型记录一次最终成功喵
             if not is_stream and not ignored_error_endpoint:
                 state.record_virtual_model_health(
@@ -301,6 +302,8 @@ async def _run_one_candidate(
                 )
             # 保存虚拟模型名，流结束时 server 需要用它补写尾包 usage 喵
             result.virtual_model = virtual_model
+            # 保存忽略接口标志，避免流结束时误写虚拟模型统计喵
+            result.ignored_error_endpoint = ignored_error_endpoint
             # 非流式请求此刻已经完整结束，立即补上完整耗时；流式要等生成器结束后再补喵
             if not is_stream and result.rate_event is not None:
                 state.attach_elapsed_ms(result.rate_event, (time.monotonic() - request_started_at) * 1000)

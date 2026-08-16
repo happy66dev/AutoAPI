@@ -2687,7 +2687,7 @@ def test_冻结空闲历史格显示青色且有请求格仍按状态色(monkeyp
     # 冻结 60 秒并取得当前冻结信息喵
     state.freeze(candidate, 60, "测试冻结")
     # 构造一条落在同一格的请求，验证有请求会压过冻结色喵
-    state.record_success(candidate)
+    state.record_candidate_health(candidate, True)
     # 将快照时刻推到该十分钟格的右边界，使刚才的事件被归入最后一个格喵
     monkeypatch.setattr("autoapi.state.time.monotonic", lambda: 1_000_000.0)
     # 取健康快照喵
@@ -2734,6 +2734,7 @@ async def test_忽略接口成功不进入虚拟模型统计():
     assert state.snapshot_virtual_model_health("auto-test").all_time.total == 0
 
 
+def test_倒计时格式化():
     """倒计时应该按「xx 分 xx 秒」补零显示喵~"""
     # 引入格式化函数喵
     from autoapi.repl import format_countdown

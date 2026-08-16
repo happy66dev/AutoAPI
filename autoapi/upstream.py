@@ -154,6 +154,8 @@ class AttemptResult:
     virtual_model: str | None = None
     # 这次实际发往上游的候选，流结束时由 server 结算候选资源统计喵
     candidate: Candidate | None = None
+    # 这次请求是否命中忽略错误接口，流结束时保持虚拟模型统计口径一致喵
+    ignored_error_endpoint: bool = False
     # RPM 事件对象，流结束时补写最终 usage 喵
     rate_event: Any | None = None
 
@@ -181,10 +183,18 @@ def _valid_nonnegative_token(value: Any) -> int | None:
 def _extract_usage_info(payload: Any) -> UsageInfo:
     """从标准 usage 对象提取总 Token、输入 Token 和缓存读取 Token 喵~"""
     # 喵~防御：顶层或 usage 不是字典时全部保持未知喵
-    if not isinstance(payload, dict) or not isinstance(payload.get("usage"), dict):
+    if not isinstance(payload, dict):
+        return UsageInfo(None, None, None)
+    # 优先读取顶层 usage，Anthropic message_start 也可能把 usage 放在 message 内喵
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        message = payload.get("message")
+        usage = message.get("usage") if isinstance(message, dict) else None
+    # 喵~防御：没有可解析的 usage 字典时全部保持未知喵
+    if not isinstance(usage, dict):
         return UsageInfo(None, None, None)
     # 取标准 usage 字典喵
-    usage = payload["usage"]
+    usage = usage
     # 优先读取总 Token，缺失时再按对应协议输入加输出计算喵
     total_tokens = _valid_nonnegative_token(usage.get("total_tokens"))
     # OpenAI 的输入 Token 字段喵
@@ -252,39 +262,94 @@ class StreamUsageObserver:
         self._pending_line = ""
         # 最新一次从上游明确解析到的 token 使用信息喵
         self.usage_info = UsageInfo(None, None, None)
+        # 已观察到的输入 Token，用于合并 Anthropic 分离上报的 usage 喵
+        self._input_tokens: int | None = None
+        # 已观察到的缓存读取 Token，用于合并 Anthropic 分离上报的 usage 喵
+        self._cached_tokens: int | None = None
+        # 已观察到的输出 Token，用于合并 Anthropic 分离上报的 usage 喵
+        self._output_tokens: int | None = None
+        # 已观察到的明确总 Token，优先于分段计算值喵
+        self._explicit_total_tokens: int | None = None
         # 向后兼容现有调用方的总 Token 属性喵
         self.tokens: int | None = None
+
+    def _consume_line(self, line: str) -> None:
+        """解析一行 SSE data，并将分离 usage 字段合并到当前观察结果喵~"""
+        # 去除 SSE 行首尾空白喵
+        stripped = line.strip()
+        # 非 data 行不携带标准 JSON usage喵
+        if not stripped.startswith("data:"):
+            return
+        # 取出 data: 后面的 JSON 文本喵
+        payload_text = stripped[5:].strip()
+        # 空负载和结束标记不携带 Token喵
+        if not payload_text or payload_text == "[DONE]":
+            return
+        # 喵~防御：上游可能发送非 JSON 的 SSE 文本，解析失败时忽略这一行喵
+        try:
+            payload = json.loads(payload_text)
+        except (json.JSONDecodeError, ValueError):
+            return
+        # 统一提取总量、输入和缓存读取 Token 喵
+        usage_info = _extract_usage_info(payload)
+        # 取出原始 usage 对象以便获得分事件的 output_tokens 喵
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        # Anthropic message_start 可能把 usage 放在 message.usage 中喵
+        if not isinstance(usage, dict) and isinstance(payload, dict):
+            message = payload.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+        # Anthropic message_delta 常只提供 output_tokens，此字段必须保留下来喵
+        output_tokens = _valid_nonnegative_token(usage.get("output_tokens") if isinstance(usage, dict) else None)
+        # 只在字段明确出现时更新累计输入 Token 喵
+        if usage_info.input_tokens is not None:
+            self._input_tokens = usage_info.input_tokens
+        # 只在字段明确出现时更新累计缓存 Token 喵
+        if usage_info.cached_tokens is not None:
+            self._cached_tokens = usage_info.cached_tokens
+        # 只在字段明确出现时更新累计输出 Token 喵
+        if output_tokens is not None:
+            self._output_tokens = output_tokens
+        # 直接总 Token 优先保留，避免对 OpenAI 重复片段做错误累加喵
+        if usage_info.total_tokens is not None:
+            self._explicit_total_tokens = usage_info.total_tokens
+        # 分事件 usage 没有直接总量时，用已知输入和输出计算总量喵
+        calculated_total = (
+            self._input_tokens + self._output_tokens
+            if self._input_tokens is not None and self._output_tokens is not None
+            else None
+        )
+        # 计算当前对外暴露的 usage，缓存字段沿用最后一次明确值喵
+        current_total = self._explicit_total_tokens if self._explicit_total_tokens is not None else calculated_total
+        self.usage_info = UsageInfo(current_total, self._input_tokens, self._cached_tokens)
+        # 同步旧接口的总 Token 属性喵
+        self.tokens = current_total
+
+    def _consume_text(self, text: str, flush_pending: bool = False) -> None:
+        """按换行消费 SSE 文本，可在 EOF 时额外消费最后一行喵~"""
+        # 将新增文本接到上一次未完成的行尾喵
+        combined_text = self._pending_line + text
+        # 统一 CRLF 后按换行拆分喵
+        lines = combined_text.replace("\r\n", "\n").split("\n")
+        # EOF 时最后一段也是完整行，否则继续保留为 pending喵
+        self._pending_line = "" if flush_pending else lines.pop()
+        # 逐行解析 SSE data 负载喵
+        for line in lines:
+            self._consume_line(line)
+
+    def finish(self) -> None:
+        """在上游自然 EOF 时刷新解码器并消费未换行的最后 SSE 行喵~"""
+        # 刷新可能残留的 UTF-8 解码字节喵
+        decoder_tail = self._decoder.decode(b"", final=True)
+        # 喵~防御：无论解码器是否有尾字节，都要把 pending 行作为完整行消费喵
+        self._consume_text(decoder_tail, flush_pending=True)
 
     def feed(self, chunk: bytes) -> None:
         """观察一段原始 SSE 字节，能解析 usage 就更新 tokens 喵~"""
         # 空块没有可观察内容喵
         if not chunk:
             return
-        # 增量解码并拼上残行喵
-        text = self._pending_line + self._decoder.decode(chunk)
-        # 统一换行后拆成行喵
-        lines = text.replace("\r\n", "\n").split("\n")
-        # 最后一行可能不完整，留给下个 chunk 喵
-        self._pending_line = lines.pop()
-        # 逐行找 SSE data 负载喵
-        for line in lines:
-            stripped = line.strip()
-            if not stripped.startswith("data:"):
-                continue
-            payload_text = stripped[5:].strip()
-            if not payload_text or payload_text == "[DONE]":
-                continue
-            try:
-                payload = json.loads(payload_text)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            # 统一提取总量、输入和缓存读取 Token 喵
-            usage_info = _extract_usage_info(payload)
-            # 只有总量或输入/缓存信息明确时才覆盖之前的尾包状态喵
-            if usage_info.total_tokens is not None or usage_info.input_tokens is not None or usage_info.cached_tokens is not None:
-                self.usage_info = usage_info
-                self.tokens = usage_info.total_tokens
-
+        # 增量解码并消费完整行，残行留到后续 chunk喵
+        self._consume_text(self._decoder.decode(chunk))
 
 def build_timeout(timeouts: EffectiveTimeouts, is_stream: bool) -> httpx.Timeout:
     """
@@ -1039,8 +1104,7 @@ async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:
     try:
         # 先吐探测阶段缓冲的前缀字节喵
         if result.buffered:
-            if result.usage_observer is not None:
-                result.usage_observer.feed(result.buffered)
+            # 探测阶段已经观察过前缀，转发时只透传而不重复解析喵
             yield result.buffered
         # 再从同一个迭代器接着读，把上游剩下的字节一块块转发出去喵
         async for chunk in result.iterator:
@@ -1053,6 +1117,12 @@ async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:
                 result.input_tokens = result.usage_observer.usage_info.input_tokens
                 result.cached_tokens = result.usage_observer.usage_info.cached_tokens
             yield chunk
+        # 自然耗尽时刷掉没有换行的最后 usage 行，再同步最终字段喵
+        if result.usage_observer is not None:
+            result.usage_observer.finish()
+            result.usage_tokens = result.usage_observer.tokens
+            result.input_tokens = result.usage_observer.usage_info.input_tokens
+            result.cached_tokens = result.usage_observer.usage_info.cached_tokens
         # 只有 async for 自然耗尽才标记正常完成，异常路径不会执行到这里喵
         result.stream_completed_normally = True
     # 喵~防御：上游中途断连时不再抛给客户端（此时响应头已经发出去了，抛异常也没用），

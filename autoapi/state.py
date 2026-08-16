@@ -206,7 +206,7 @@ class RuntimeState:
         self._candidate_health_totals: dict[str, list[float]] = {}
         # 虚拟模型健康历史：虚拟模型名 → 最近 24 小时的最终请求结果喵
         self._virtual_health_events: dict[str, list[HealthEvent]] = {}
-        # 虚拟模型累计统计：虚拟模型名 → (成功数、总数、Token数、耗时总和、完成数)喵
+        # 虚拟模型累计统计：虚拟模型名 → (成功数、总数、Token数、耗时总和、完成数、缓存输入数、缓存读取数)喵
         self._virtual_health_totals: dict[str, list[float]] = {}
         # 代理累计处理的客户端请求数喵
         self.total_requests = 0
@@ -509,17 +509,25 @@ class RuntimeState:
         # 喵~防御：空虚拟模型名不写入统计，避免产生无法展示的垃圾分组喵
         if not isinstance(virtual_model, str) or not virtual_model.strip():
             return
+        # 喵~防御：非法 usage 按未上报处理，避免字符串转换异常打断请求喵
+        valid_usage_tokens = usage_tokens if isinstance(usage_tokens, int) and not isinstance(usage_tokens, bool) and usage_tokens >= 0 else 0
+        # 喵~防御：非法输入 Token 不参与缓存命中率分母喵
+        valid_input_tokens = input_tokens if isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens >= 0 else None
+        # 喵~防御：非法缓存 Token 按未上报处理，避免伪造命中率喵
+        valid_cached_tokens = cached_tokens if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool) and cached_tokens >= 0 else None
+        # 喵~防御：非法耗时不进入平均耗时分母喵
+        valid_elapsed_ms = max(0.0, float(elapsed_ms)) if isinstance(elapsed_ms, (int, float)) and not isinstance(elapsed_ms, bool) else None
         # 取当前单调时钟和墙上时间，分别服务窗口计算和调试展示喵
         event = HealthEvent(
             at=time.monotonic(),
             wall_time=time.time(),
             success=bool(success),
-            usage_tokens=max(0, int(usage_tokens or 0)),
+            usage_tokens=valid_usage_tokens,
             # 虚拟模型事件明确保存输入与缓存 Token 喵
-            input_tokens=input_tokens if isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens >= 0 else None,
-            cached_tokens=cached_tokens if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool) and cached_tokens >= 0 else None,
-            # 完整耗时喵
-            elapsed_ms=elapsed_ms,
+            input_tokens=valid_input_tokens,
+            cached_tokens=valid_cached_tokens,
+            # 完整耗时使用已经校验过的数值喵
+            elapsed_ms=valid_elapsed_ms,
         )
         # 加锁追加虚拟模型健康事件并更新累计总计喵
         with self._lock:
@@ -529,8 +537,8 @@ class RuntimeState:
             events = self._virtual_health_events.setdefault(model_name, [])
             # 追加一条最终请求结果喵
             events.append(event)
-            # 累计字段按成功数、总数、Token数、耗时总和、完成数排列喵
-            totals = self._virtual_health_totals.setdefault(model_name, [0.0, 0.0, 0.0, 0.0, 0.0])
+            # 累计字段按成功数、总数、Token数、耗时总和、完成数、缓存输入数、缓存读取数排列喵
+            totals = self._virtual_health_totals.setdefault(model_name, [0.0] * 7)
             # 成功数按布尔值加一喵
             totals[0] += int(event.success)
             # 总请求数每次最终结果加一喵
@@ -539,8 +547,12 @@ class RuntimeState:
             totals[2] += event.usage_tokens
             # 只有有耗时的完整请求才加入平均值分子喵
             if event.elapsed_ms is not None:
-                totals[3] += max(0.0, event.elapsed_ms)
+                totals[3] += event.elapsed_ms
                 totals[4] += 1
+            # 只有明确输入和缓存字段且输入大于零时才累计永久缓存分子分母喵
+            if event.input_tokens is not None and event.input_tokens > 0 and event.cached_tokens is not None:
+                totals[5] += event.input_tokens
+                totals[6] += event.cached_tokens
             # 清理 24 小时之前的滚动历史，但不影响累计 totals 喵
             self._prune_health_events_locked(event.at)
 
@@ -653,9 +665,11 @@ class RuntimeState:
             # 取虚拟模型事件，没有就按空历史汇总喵
             events = self._virtual_health_events.get(virtual_model, [])
             # 读取进程生命周期累计值，避免清理 24 小时历史后所有时间统计归零喵
-            totals = self._virtual_health_totals.get(virtual_model, [0.0, 0.0, 0.0, 0.0, 0.0])
+            totals = self._virtual_health_totals.get(virtual_model, [0.0] * 7)
             # 计算累计平均耗时，没有完整请求时保持未知喵
             lifetime_average = totals[3] / totals[4] if totals[4] > 0 else None
+            # 计算累计缓存命中率，没有有效输入分母时保持未上报喵
+            lifetime_cache_rate = totals[6] / totals[5] if totals[5] > 0 else None
             # 收集该虚拟模型每个候选的当前和历史冻结区间喵
             freeze_infos: list[FreezeInterval] = []
             for candidate in self._config.virtual_models.get(virtual_model, []):
@@ -671,7 +685,7 @@ class RuntimeState:
                 int(totals[1]),
                 int(totals[2]),
                 lifetime_average,
-                snapshot.all_time.average_cache_hit_rate,
+                lifetime_cache_rate,
             )
             # 保留滚动窗口和历史条，替换掉仅限 24 小时的所有时间窗口喵
             return HealthSnapshot(lifetime_window, snapshot.windows, snapshot.buckets)
@@ -822,12 +836,6 @@ class RuntimeState:
             stats = self._stats.setdefault(candidate.identity, CandidateStats())
             # 成功次数加一喵
             stats.success += 1
-            # 追加候选成功事件，成功尝试不携带 Token 和耗时也不影响可用率计算喵
-            self._candidate_health_events.setdefault(candidate.identity, []).append(
-                HealthEvent(time.monotonic(), time.time(), True, max(0, int(usage_tokens or 0)), elapsed_ms)
-            )
-            # 清理 24 小时外的候选与虚拟模型历史喵
-            self._prune_health_events_locked(time.monotonic())
             # 连续失败计数清零 —— 这是「连续」的含义所在：中间只要成功过一次，
             # 之前攒的失败次数就不该再算进自动避险的账上喵
             stats.consecutive_failures = 0
@@ -867,12 +875,6 @@ class RuntimeState:
             stats.failure += 1
             # 记录最近错误发生的墙上时间，供 stats 展示报错时间喵
             stats.last_error_at = time.time()
-            # 追加候选失败事件，保留原始错误文本在 CandidateStats 中供详情展示喵
-            self._candidate_health_events.setdefault(candidate.identity, []).append(
-                HealthEvent(time.monotonic(), stats.last_error_at, False)
-            )
-            # 清理 24 小时外的候选与虚拟模型历史喵
-            self._prune_health_events_locked(time.monotonic())
             # 连续失败次数也加一喵
             stats.consecutive_failures += 1
             # 记下最近一次失败原因，截断到 200 字符防止内存膨胀喵
