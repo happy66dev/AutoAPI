@@ -602,7 +602,12 @@ class Repl:
             snapshot = self.state.snapshot_candidate_health(candidate) if candidate is not None else None
             if snapshot is not None:
                 print(f"    {_ansi('成功率:', '33')}")
-                for window_name, window in (("所有时间", snapshot.all_time), *snapshot.windows.items()):
+                for window_name in ("所有时间", "近6小时", "近1小时", "近30分钟", "近15分钟"):
+                    # 从快照中按用户指定顺序取窗口喵
+                    window = snapshot.all_time if window_name == "所有时间" else snapshot.windows.get(window_name)
+                    # 缺少窗口时按暂无请求处理，避免热重载期间异常喵
+                    if window is None:
+                        window = HealthWindow(0, 0, 0, None)
                     # 计算窗口百分比并选择阈值颜色喵
                     rate = window.success / window.total * 100 if window.total else None
                     rate_text, _ = _format_health_window(window)
