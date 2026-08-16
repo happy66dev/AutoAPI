@@ -2732,6 +2732,39 @@ async def test_忽略接口成功不进入虚拟模型统计():
     assert outcome.success is True
     # 忽略接口不应产生虚拟模型健康事件喵
     assert state.snapshot_virtual_model_health("auto-test").all_time.total == 0
+    # 忽略接口不应增加代理总请求数喵
+    assert state.total_requests == 0
+    # 忽略接口不应增加上游候选资源请求数喵
+    candidate = state.config.virtual_models["auto-test"][0]
+    assert state.snapshot_candidate_health(candidate).all_time.total == 0
+    # 忽略接口不应增加 RPM 事件喵
+    assert state.snapshot_virtual_model_rates()[0].rpm == 0
+
+
+@pytest.mark.asyncio
+async def test_成功日志包含本次缓存命中率(caplog):
+    """成功响应上报缓存字段时，日志应显示本次缓存命中率喵~"""
+    # 造状态和带缓存 usage 的非流式上游响应喵
+    state = make_state()
+    client = make_client(
+        lambda request: httpx.Response(
+            200,
+            json={
+                "usage": {
+                    "prompt_tokens": 200,
+                    "completion_tokens": 20,
+                    "prompt_tokens_details": {"cached_tokens": 50},
+                }
+            },
+        )
+    )
+    # 捕获成功日志并发起一次普通请求喵
+    with caplog.at_level(logging.INFO, logger="autoapi.proxy"):
+        outcome = await run_proxy(client, state, {"model": "auto-test"})
+    # 请求应成功返回喵
+    assert outcome.success is True
+    # 成功日志应按缓存输入除以输入 Token 显示 25.0% 喵
+    assert "缓存命中率=25.0%" in caplog.text
 
 
 def test_倒计时格式化():

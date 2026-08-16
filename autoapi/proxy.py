@@ -257,7 +257,7 @@ async def _run_one_candidate(
         # 成功了，记一笔成功（顺带会自动解冻这个候选）然后返回喵
         if result.ok:
             # 流式此刻只有探测成功，终态资源事件留给 server 消费完整流时写入喵
-            if not is_stream:
+            if not is_stream and not ignored_error_endpoint:
                 # 非流完整响应已读完，耗时从上游请求起点计算喵
                 upstream_elapsed_ms = (
                     (time.monotonic() - result.started_at) * 1000
@@ -274,8 +274,7 @@ async def _run_one_candidate(
                     result.cached_tokens,
                     result.started_at or attempt_started_at,
                 )
-            # 非流响应已完整结束，此刻才更新候选成功状态并解除冻结喵
-            if not is_stream:
+                # 非流响应已完整结束，此刻才更新候选成功状态并解除冻结喵
                 state.record_success(
                     candidate,
                     result.usage_tokens,
@@ -293,7 +292,7 @@ async def _run_one_candidate(
                 )
             # 记录 RPM/TPM 事件：非流式完整响应已经结束，立即统一上报喵
             # 流式必须等整条流结束后再由 server 统一上报，放行时不能提前增加 RPM 喵
-            if not is_stream:
+            if not is_stream and not ignored_error_endpoint:
                 result.rate_event = state.record_rate_event(
                     virtual_model,
                     result.usage_tokens,
@@ -309,6 +308,19 @@ async def _run_one_candidate(
                 state.attach_elapsed_ms(result.rate_event, (time.monotonic() - request_started_at) * 1000)
             # 计算从服务端接收客户端请求到成功响应准备完成的全程耗时喵
             elapsed_ms = (time.monotonic() - request_started_at) * 1000
+            # 只有输入和缓存字段都有效时才计算本次请求的缓存命中率喵
+            cache_hit_rate = (
+                result.cached_tokens / result.input_tokens
+                if isinstance(result.input_tokens, int)
+                and not isinstance(result.input_tokens, bool)
+                and result.input_tokens > 0
+                and isinstance(result.cached_tokens, int)
+                and not isinstance(result.cached_tokens, bool)
+                and result.cached_tokens >= 0
+                else None
+            )
+            # 缓存命中率有值时格式化为百分比，否则保持日志不追加该字段喵
+            cache_log_suffix = f" 缓存命中率={cache_hit_rate:.1%}" if cache_hit_rate is not None else ""
             # 流式在此刻只是确认健康并放行，完整总时长要等流结束后才知道喵
             if is_stream:
                 # 计算从本次上游节点请求开始到第一个非空字节到达的节点耗时喵
@@ -318,28 +330,28 @@ async def _run_one_candidate(
                     else 0.0
                 )
                 logger.info(
-                    "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 请求首字=%.0fms",
-                    req_id, candidate.name, attempt_no, first_byte_ms, elapsed_ms,
+                    "[%s] 成功 %s（第 %d 次尝试）喵 流 首字=%.0fms 请求首字=%.0fms%s",
+                    req_id, candidate.name, attempt_no, first_byte_ms, elapsed_ms, cache_log_suffix,
                 )
             # 非流式此时完整响应已读完，记录服务端返回响应前的全程耗时喵
             else:
                 logger.info(
-                    "[%s] 成功 %s（第 %d 次尝试）喵 非流 返回请求耗时=%.0fms",
-                    req_id, candidate.name, attempt_no, elapsed_ms,
+                    "[%s] 成功 %s（第 %d 次尝试）喵 非流 返回请求耗时=%.0fms%s",
+                    req_id, candidate.name, attempt_no, elapsed_ms, cache_log_suffix,
                 )
             # 返回成功结论喵
             return "ok", result
-        # 记录候选失败，但上下文超限属于用户侧问题，不计入上游模型错误统计喵
-        # 失败尝试仍属于真实上游调用，因此保留一条不计平均耗时的候选资源事件喵
-        state.record_candidate_health(
-            candidate,
-            False,
-            result.usage_tokens,
-            None,
-            result.input_tokens,
-            result.cached_tokens,
-            result.started_at or attempt_started_at,
-        )
+        # 忽略接口的失败不写入候选资源统计，避免任何 stats 请求数量污染喵
+        if not ignored_error_endpoint:
+            state.record_candidate_health(
+                candidate,
+                False,
+                result.usage_tokens,
+                None,
+                result.input_tokens,
+                result.cached_tokens,
+                result.started_at or attempt_started_at,
+            )
         # 记录候选失败，但上下文超限属于用户侧问题，不计入上游模型错误统计喵
         if _is_context_limit_error(result.status, result.error_text):
             hedge_hits = 0
@@ -461,8 +473,7 @@ async def handle_request(
     # 给这条请求生成一个短 ID，它会出现在这条请求产生的每一行日志上，
     # 这样并发时也能用它把一条请求的完整转移过程 grep 出来喵
     req_id = new_request_id()
-    # 累计请求数加一，用于 REPL 的 stats 展示喵
-    state.total_requests += 1
+    # 请求总数要等确认不是忽略接口后再增加，避免忽略接口污染 stats 喵
     # 解析客户端请求体喵
     try:
         body_obj = parse_client_body(raw_body)
@@ -516,6 +527,9 @@ async def handle_request(
     config = state.config
     # 判断请求是否命中配置的接口错误忽略列表喵
     ignored_error_endpoint = _is_ignored_error_endpoint(config.server, method, path)
+    # 只有非忽略接口才累计 stats 请求总数喵
+    if not ignored_error_endpoint:
+        state.total_requests += 1
     # 目标模式请求的截止时刻，使用单调时钟避免系统时间跳变喵
     target_deadline = (
         time.monotonic() + config.server.target_mode_max_wait_seconds if target_mode else None
@@ -565,9 +579,7 @@ async def handle_request(
         # total_exhausted 和虚拟模型失败只在下面真正终态返回时结算一次喵
         # 忽略接口链耗尽后直接返回普通 502，只输出一条 info，不进入目标模式喵
         if ignored_error_endpoint:
-            # 被忽略接口的耗尽仍保留原有总耗尽计数，但不进入虚拟模型健康统计喵
-            state.total_exhausted += 1
-            # 记录单条最终信息，保持忽略接口的日志静默语义喵
+            # 被忽略接口完全排除出请求耗尽数量统计喵
             logger.info(
                 "[%s] 虚拟模型 %s 的接口 %s 全部不可用喵",
                 req_id,

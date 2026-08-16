@@ -338,8 +338,8 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                         if attempt.started_at is not None
                         else None
                     )
-                    # 流式候选尝试只在这里结算一次，未自然结束时记失败且不进入上游平均耗时喵
-                    if attempt.candidate is not None:
+                    # 忽略接口的流式请求完全排除出候选资源统计喵
+                    if attempt.candidate is not None and not attempt.ignored_error_endpoint:
                         state.record_candidate_health(
                             attempt.candidate,
                             stream_completed_normally,
@@ -375,12 +375,27 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                         )
                         # 把完整流耗时补到速率事件中喵
                         state.attach_elapsed_ms(attempt.rate_event, total_ms)
+                    # 只有上游输入和缓存字段有效时才计算本次流式请求的缓存命中率喵
+                    cache_hit_rate = (
+                        attempt.cached_tokens / attempt.input_tokens
+                        if isinstance(attempt.input_tokens, int)
+                        and not isinstance(attempt.input_tokens, bool)
+                        and attempt.input_tokens > 0
+                        and isinstance(attempt.cached_tokens, int)
+                        and not isinstance(attempt.cached_tokens, bool)
+                        and attempt.cached_tokens >= 0
+                        else None
+                    )
+                    # 有缓存命中率时格式化为百分比，否则不追加日志字段喵
+                    cache_log_suffix = f" 缓存命中率={cache_hit_rate:.1%}" if cache_hit_rate is not None else ""
+                    # 记录流式请求生命周期日志，并在 usage 完整时附带本次缓存命中率喵
                     logger.info(
-                        "流式请求结束 虚拟模型=%s 返回请求耗时=%.0fms 正常完成=%s usage_tokens=%s 喵",
+                        "流式请求结束 虚拟模型=%s 返回请求耗时=%.0fms 正常完成=%s usage_tokens=%s%s 喵",
                         attempt.virtual_model or "未知",
                         total_ms,
                         stream_completed_normally,
                         attempt.usage_tokens if attempt.usage_tokens is not None else "未上报",
+                        cache_log_suffix,
                     )
                     # 尾包 usage 已在 iterator 结束时观察完成，统计事件直接使用最终值喵
                     # 没有 usage 时保持 None，正常 RPM 已记录但 TPM 仍显示未完整上报喵
