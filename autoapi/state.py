@@ -54,8 +54,12 @@ class HealthEvent:
     wall_time: float
     # 这次事件是否成功喵
     success: bool
-    # 上游明确上报的 Token，统计展示缺失时按 0 处理喵
+    # 上游明确上报的 token 总数；缺失时新 stats 按 0 展示喵
     usage_tokens: int = 0
+    # 上游明确上报的输入 Token，缺失时为 None 喵
+    input_tokens: int | None = None
+    # 上游明确上报的缓存读取 Token，缺失时为 None 喵
+    cached_tokens: int | None = None
     # 完整请求耗时，单位：毫秒；失败或未完整结束时为空喵
     elapsed_ms: float | None = None
 
@@ -72,6 +76,8 @@ class HealthWindow:
     tokens: int
     # 窗口内完成请求的平均耗时，单位：毫秒喵
     average_elapsed_ms: float | None
+    # 加权平均缓存命中率；没有明确缓存字段或有效输入 Token 时为 None 喵
+    average_cache_hit_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,10 @@ class RequestMetric:
     at: float
     # 上游明确上报的 token 总数；None 表示上游没给 usage，绝不本地估算喵
     usage_tokens: int | None = None
+    # 上游明确上报的输入 Token，用于缓存命中率加权分母喵
+    input_tokens: int | None = None
+    # 上游明确上报的缓存读取 Token，None 表示该字段未上报喵
+    cached_tokens: int | None = None
     # 完整请求实际结束后的耗时，单位：毫秒；None 表示流尚未结束，不能计入平均值喵
     elapsed_ms: float | None = None
 
@@ -156,6 +166,8 @@ class VirtualModelRate:
     completed_requests: int
     # 窗口内已完成请求的平均完整耗时，单位：毫秒；没有完成请求时为 None 喵
     average_elapsed_ms: float | None
+    # 近 60 秒输入 Token 加权的缓存命中率喵
+    average_cache_hit_rate: float | None = None
 
 
 @dataclass
@@ -453,7 +465,7 @@ class RuntimeState:
             # 顺手清理 24 小时之外的历史喵
             self._prune_health_events_locked(event.at)
 
-    def record_virtual_model_health(self, virtual_model: str, success: bool, usage_tokens: int | None = None, elapsed_ms: float | None = None) -> None:
+    def record_virtual_model_health(self, virtual_model: str, success: bool, usage_tokens: int | None = None, elapsed_ms: float | None = None, input_tokens: int | None = None, cached_tokens: int | None = None) -> None:
         """记录一次虚拟模型最终请求结果，供 stats 按客户端请求统计喵~"""
         # 喵~防御：空虚拟模型名不写入统计，避免产生无法展示的垃圾分组喵
         if not isinstance(virtual_model, str) or not virtual_model.strip():
@@ -464,9 +476,13 @@ class RuntimeState:
             wall_time=time.time(),
             success=bool(success),
             usage_tokens=max(0, int(usage_tokens or 0)),
+            # 虚拟模型事件明确保存输入与缓存 Token 喵
+            input_tokens=input_tokens if isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens >= 0 else None,
+            cached_tokens=cached_tokens if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool) and cached_tokens >= 0 else None,
+            # 完整耗时喵
             elapsed_ms=elapsed_ms,
         )
-        # 加锁追加虚拟模型事件并更新累计总计喵
+        # 加锁追加虚拟模型健康事件并更新累计总计喵
         with self._lock:
             # 去掉首尾空格，保证配置名和请求名统一喵
             model_name = virtual_model.strip()
@@ -495,6 +511,9 @@ class RuntimeState:
         recent_events = [event for event in events if event.at >= now - HEALTH_HISTORY_SECONDS]
         # 喵~防御：调用方没有冻结历史时按空列表处理，方便独立测试和复用喵
         freeze_intervals = freeze_intervals or []
+        # 没有任何虚拟模型请求时，冻结区间不应把空白图染成青色喵
+        if not recent_events:
+            freeze_intervals = []
         # 汇总一个事件列表为窗口快照喵
         def summarize(selected_events: list[HealthEvent]) -> HealthWindow:
             # 统计成功事件数量喵
@@ -503,8 +522,26 @@ class RuntimeState:
             elapsed_values = [event.elapsed_ms for event in selected_events if event.elapsed_ms is not None]
             # 计算平均耗时，没有完成事件时返回未知喵
             average_elapsed = sum(elapsed_values) / len(elapsed_values) if elapsed_values else None
+            # 统计有明确缓存字段且输入 Token 有效的请求喵
+            cache_events = [
+                event for event in selected_events
+                if event.input_tokens is not None and event.input_tokens > 0 and event.cached_tokens is not None
+            ]
+            # 按输入 Token 加权计算缓存命中率，未上报字段不进入分子与分母喵
+            cache_input_total = sum(event.input_tokens for event in cache_events)
+            cache_hit_rate = (
+                sum(event.cached_tokens or 0 for event in cache_events) / cache_input_total
+                if cache_input_total > 0
+                else None
+            )
             # 组装窗口统计，Token 缺失已经以 0 存储喵
-            return HealthWindow(success_count, len(selected_events), sum(event.usage_tokens for event in selected_events), average_elapsed)
+            return HealthWindow(
+                success_count,
+                len(selected_events),
+                sum(event.usage_tokens for event in selected_events),
+                average_elapsed,
+                cache_hit_rate,
+            )
         # 计算所有时间窗口，这里指当前进程保留的 24 小时历史范围喵
         all_time = summarize(recent_events)
         # 按固定顺序建立各个滚动窗口喵
@@ -585,12 +622,18 @@ class RuntimeState:
             # 返回窗口和历史条快照喵
             snapshot = self._health_snapshot_locked(events, now, freeze_infos)
             # 所有时间窗口使用进程内累计成功、请求、Token 和平均耗时喵
-            lifetime_window = HealthWindow(int(totals[0]), int(totals[1]), int(totals[2]), lifetime_average)
+            lifetime_window = HealthWindow(
+                int(totals[0]),
+                int(totals[1]),
+                int(totals[2]),
+                lifetime_average,
+                snapshot.all_time.average_cache_hit_rate,
+            )
             # 保留滚动窗口和历史条，替换掉仅限 24 小时的所有时间窗口喵
             return HealthSnapshot(lifetime_window, snapshot.windows, snapshot.buckets)
 
 
-    def record_rate_event(self, virtual_model: str, usage_tokens: int | None = None) -> RequestMetric:
+    def record_rate_event(self, virtual_model: str, usage_tokens: int | None = None, input_tokens: int | None = None, cached_tokens: int | None = None) -> RequestMetric:
         """
         记录一条成功请求，供滚动 60 秒 RPM/TPM 使用喵~
 
@@ -598,7 +641,12 @@ class RuntimeState:
         TPM 则保持「未知覆盖」状态，绝不能用字符数或本地 tokenizer 猜一个数喵。
         """
         # 创建这条事件，时间用单调时钟避免系统时间调整影响滚动窗口喵
-        event = RequestMetric(at=time.monotonic(), usage_tokens=usage_tokens)
+        event = RequestMetric(
+            at=time.monotonic(),
+            usage_tokens=usage_tokens,
+            input_tokens=input_tokens if isinstance(input_tokens, int) and not isinstance(input_tokens, bool) and input_tokens >= 0 else None,
+            cached_tokens=cached_tokens if isinstance(cached_tokens, int) and not isinstance(cached_tokens, bool) and cached_tokens >= 0 else None,
+        )
         # 加锁写入该虚拟模型的事件列表喵
         with self._lock:
             # 取出列表，不存在就新建喵
@@ -672,7 +720,7 @@ class RuntimeState:
             rate_cutoff = now - RATE_WINDOW_SECONDS
             # 计算平均耗时配置窗口边界喵
             elapsed_cutoff = now - (self._config.server.metrics_window_minutes * 60.0)
-            # 按当前配置顺序遍历，这样横幅顺序稳定喵
+            # 按当前配置顺序逐个虚拟模型喵
             rows: list[VirtualModelRate] = []
             for virtual_model in self._config.virtual_models:
                 # 没有记录时用空列表喵
@@ -694,6 +742,17 @@ class RuntimeState:
                 completed = [event.elapsed_ms for event in elapsed_events]
                 # 结束请求越多，平均值越稳定；没有完成请求时保持未知喵
                 average_elapsed_ms = sum(completed) / len(completed) if completed else None
+                # 统计速率窗口内有效输入与缓存 Token 的加权命中率喵
+                cache_events = [
+                    event for event in rate_events
+                    if event.input_tokens is not None and event.input_tokens > 0 and event.cached_tokens is not None
+                ]
+                cache_input_total = sum(event.input_tokens for event in cache_events)
+                average_cache_hit_rate = (
+                    sum(event.cached_tokens or 0 for event in cache_events) / cache_input_total
+                    if cache_input_total > 0
+                    else None
+                )
                 # 组装这一行快照喵
                 rows.append(
                     VirtualModelRate(
@@ -703,6 +762,7 @@ class RuntimeState:
                         tpm=tpm,
                         completed_requests=len(completed),
                         average_elapsed_ms=average_elapsed_ms,
+                        average_cache_hit_rate=average_cache_hit_rate,
                     )
                 )
         # 返回拷贝出来的快照，REPL 在锁外慢慢渲染喵
@@ -732,7 +792,7 @@ class RuntimeState:
             if active_freeze is not None:
                 self._record_freeze_interval_locked(candidate.identity, active_freeze, time.monotonic())
 
-    def record_failure(self, candidate: Candidate, error: str, hedge_threshold: int = 0) -> int:
+    def record_failure(self, candidate: Candidate, error: str, hedge_threshold: int = 0, count_health: bool = True) -> int:
         """
         记录一次失败，并判断是否该触发自动避险喵~
 
@@ -756,6 +816,9 @@ class RuntimeState:
         with self._lock:
             # 取出（或新建）该候选的统计对象喵
             stats = self._stats.setdefault(candidate.identity, CandidateStats())
+            # 失败次数只有在 count_health 为真时才进入候选 stats 喵
+            if not count_health:
+                return 0
             # 失败次数加一喵
             stats.failure += 1
             # 记录最近错误发生的墙上时间，供 stats 展示报错时间喵

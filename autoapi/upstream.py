@@ -89,6 +89,18 @@ DROP_RESPONSE_HEADERS = {
 }
 
 
+@dataclass(frozen=True)
+class UsageInfo:
+    """上游明确上报的总量、输入和缓存读取 Token 喵~"""
+
+    # 上游明确给出的总 Token，缺失时为 None 喵
+    total_tokens: int | None
+    # 上游明确给出的输入 Token，缺失时为 None 喵
+    input_tokens: int | None
+    # 上游明确给出的缓存读取 Token，缺失时为 None 喵
+    cached_tokens: int | None
+
+
 @dataclass
 class AttemptResult:
     """
@@ -124,6 +136,10 @@ class AttemptResult:
     # 这次成功从上游明确得到的 token 总数。None 表示上游没有报 usage，
     # 必须保持未知，绝不能按字符数或本地 tokenizer 瞎估喵。
     usage_tokens: int | None = None
+    # 上游明确上报的输入 Token，用于加权计算缓存命中率喵
+    input_tokens: int | None = None
+    # 上游明确上报的缓存读取 Token，None 表示未上报而非零命中喵
+    cached_tokens: int | None = None
     # 这次尝试开始向上游发请求的单调时钟时刻，单位：秒喵
     started_at: float | None = None
     # 流式时首次收到上游任意字节的单调时钟时刻，None 表示放行前还没收到字节喵
@@ -151,6 +167,48 @@ class AttemptResult:
         return "application/json"
 
 
+def _valid_nonnegative_token(value: Any) -> int | None:
+    """验证上游 token 字段是否为合法非负整数喵~"""
+    # 喵~防御：bool 是 int 子类，必须排除以免把 True 统计成一个 Token 喵
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    # 非法值保持未知喵
+    return None
+
+
+def _extract_usage_info(payload: Any) -> UsageInfo:
+    """从标准 usage 对象提取总 Token、输入 Token 和缓存读取 Token 喵~"""
+    # 喵~防御：顶层或 usage 不是字典时全部保持未知喵
+    if not isinstance(payload, dict) or not isinstance(payload.get("usage"), dict):
+        return UsageInfo(None, None, None)
+    # 取标准 usage 字典喵
+    usage = payload["usage"]
+    # 优先读取总 Token，缺失时再按对应协议输入加输出计算喵
+    total_tokens = _valid_nonnegative_token(usage.get("total_tokens"))
+    # OpenAI 的输入 Token 字段喵
+    input_tokens = _valid_nonnegative_token(usage.get("prompt_tokens"))
+    # OpenAI 的输出 Token 字段喵
+    output_tokens = _valid_nonnegative_token(usage.get("completion_tokens"))
+    # Anthropic 字段作为 OpenAI 字段缺失时的兼容回退喵
+    if input_tokens is None:
+        input_tokens = _valid_nonnegative_token(usage.get("input_tokens"))
+    if output_tokens is None:
+        output_tokens = _valid_nonnegative_token(usage.get("output_tokens"))
+    # 没有直接总量时，只在输入和输出都明确时计算总量喵
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    # OpenAI 缓存明细位于 prompt_tokens_details.cached_tokens 喵
+    prompt_details = usage.get("prompt_tokens_details")
+    cached_tokens = _valid_nonnegative_token(
+        prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
+    )
+    # Anthropic 缓存读取字段作为兼容回退喵
+    if cached_tokens is None:
+        cached_tokens = _valid_nonnegative_token(usage.get("cache_read_input_tokens"))
+    # 返回统一的 usage 信息，缺失字段保留 None 喵
+    return UsageInfo(total_tokens, input_tokens, cached_tokens)
+
+
 def _extract_usage_tokens(payload: Any) -> int | None:
     """
     只从上游响应明确提供的 usage 字段提取 token 总数喵~
@@ -159,43 +217,26 @@ def _extract_usage_tokens(payload: Any) -> int | None:
     input_tokens + output_tokens。没有 usage、字段不是合法非负整数时一律返回 None；
     绝不按字符数、字节数或本地 tokenizer 估算，因为那样的 TPM 是假的喵。
     """
-    # 喵~防御：顶层不是字典就不可能有标准 usage，保守返回未知喵
-    if not isinstance(payload, dict):
-        return None
-    # 取 usage 子对象喵
-    usage = payload.get("usage")
-    # 喵~防御：usage 缺失或不是字典，说明上游没有上报喵
-    if not isinstance(usage, dict):
-        return None
-    # 先尝试优先级最高的 total_tokens 喵
-    total = usage.get("total_tokens")
-    # bool 是 int 子类，必须挡掉避免 True 被统计成 1 token 喵
-    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
-        return total
-    # OpenAI 没有 total 时，仅在同一份 usage 中把输入和输出 token 相加喵
-    prompt = usage.get("prompt_tokens")
-    completion = usage.get("completion_tokens")
-    if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (prompt, completion)):
-        return prompt + completion
-    # Anthropic 的 usage 用 input_tokens / output_tokens 命名喵
-    input_tokens = usage.get("input_tokens")
-    output_tokens = usage.get("output_tokens")
-    if all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (input_tokens, output_tokens)):
-        return input_tokens + output_tokens
-    # 字段不完整时保持未知，不能擅自把其中一项当总数喵
-    return None
+    # 使用统一解析器获取总 Token，缓存字段不会影响既有 TPM 语义喵
+    return _extract_usage_info(payload).total_tokens
+
+
+def extract_usage_info_from_body(body: bytes) -> UsageInfo:
+    """从非流式完整 JSON 响应体取统一 usage 信息喵~"""
+    # 尝试解析 JSON 喵
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    # 喵~防御：非 JSON 接口没有标准 usage，全部保持未上报喵
+    except (json.JSONDecodeError, ValueError):
+        return UsageInfo(None, None, None)
+    # 交给统一提取器喵
+    return _extract_usage_info(payload)
 
 
 def extract_usage_from_body(body: bytes) -> int | None:
     """从非流式完整 JSON 响应体里取上游明确上报的 token 数喵~"""
-    # 尝试解析 JSON 喵
-    try:
-        payload = json.loads(body.decode("utf-8", errors="replace"))
-    # 喵~防御：非 JSON 接口没有标准 usage，保持未知喵
-    except (json.JSONDecodeError, ValueError):
-        return None
-    # 交给统一提取器喵
-    return _extract_usage_tokens(payload)
+    # 交给统一提取器并只返回旧接口要求的总 Token 喵
+    return extract_usage_info_from_body(body).total_tokens
 
 
 class StreamUsageObserver:
@@ -207,7 +248,9 @@ class StreamUsageObserver:
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         # 没拼成完整行的尾巴喵
         self._pending_line = ""
-        # 最新一次从上游明确解析到的 token 总数喵
+        # 最新一次从上游明确解析到的 token 使用信息喵
+        self.usage_info = UsageInfo(None, None, None)
+        # 向后兼容现有调用方的总 Token 属性喵
         self.tokens: int | None = None
 
     def feed(self, chunk: bytes) -> None:
@@ -233,9 +276,12 @@ class StreamUsageObserver:
                 payload = json.loads(payload_text)
             except (json.JSONDecodeError, ValueError):
                 continue
-            tokens = _extract_usage_tokens(payload)
-            if tokens is not None:
-                self.tokens = tokens
+            # 统一提取总量、输入和缓存读取 Token 喵
+            usage_info = _extract_usage_info(payload)
+            # 只有总量或输入/缓存信息明确时才覆盖之前的尾包状态喵
+            if usage_info.total_tokens is not None or usage_info.input_tokens is not None or usage_info.cached_tokens is not None:
+                self.usage_info = usage_info
+                self.tokens = usage_info.total_tokens
 
 
 def build_timeout(timeouts: EffectiveTimeouts, is_stream: bool) -> httpx.Timeout:
@@ -657,6 +703,10 @@ async def _attempt_stream(
             iterator=iterator,
             # 探测阶段观察到的 usage，常见情况为 None 表示上游没有上报喵
             usage_tokens=usage_observer.tokens,
+            # 探测阶段观察到的输入 Token 喵
+            input_tokens=usage_observer.usage_info.input_tokens,
+            # 探测阶段观察到的缓存读取 Token 喵
+            cached_tokens=usage_observer.usage_info.cached_tokens,
             # 流式转发继续复用同一个 usage 观察器喵
             usage_observer=usage_observer,
             # 这次请求的开始时刻喵
@@ -866,6 +916,7 @@ async def _attempt_nonstream(
             )
         return AttemptResult(ok=False, status=STATUS_BAD_STREAM, error_text=fake)
     # 真正的成功，把完整响应体和响应头一起交回去喵
+    usage_info = extract_usage_info_from_body(raw)
     return AttemptResult(
         # 成功喵
         ok=True,
@@ -874,7 +925,11 @@ async def _attempt_nonstream(
         # 完整响应体字节，proxy 会原样回传给客户端喵
         body=raw,
         # 成功响应里上游明确提供的 usage token 喵
-        usage_tokens=extract_usage_from_body(raw),
+        usage_tokens=usage_info.total_tokens,
+        # 成功响应里上游明确提供的输入 Token 喵
+        input_tokens=usage_info.input_tokens,
+        # 成功响应里上游明确提供的缓存读取 Token 喵
+        cached_tokens=usage_info.cached_tokens,
         # 非流式请求从发出到完整读完的计时起点喵
         started_at=request_started_at,
         # 过滤后的响应头喵
@@ -981,6 +1036,8 @@ async def iter_upstream_bytes(result: AttemptResult) -> AsyncIterator[bytes]:
             # 让最新 usage 对外可见喵
             if result.usage_observer is not None:
                 result.usage_tokens = result.usage_observer.tokens
+                result.input_tokens = result.usage_observer.usage_info.input_tokens
+                result.cached_tokens = result.usage_observer.usage_info.cached_tokens
             yield chunk
         # 只有 async for 自然耗尽才标记正常完成，异常路径不会执行到这里喵
         result.stream_completed_normally = True

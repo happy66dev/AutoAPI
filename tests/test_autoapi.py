@@ -781,6 +781,58 @@ def make_state() -> RuntimeState:
     return RuntimeState(parse_config(make_config_dict()))
 
 
+def test_无请求虚拟模型冻结时历史图保持灰色():
+    """虚拟模型完全没有请求时，即使候选被冻结也不应显示青色冻结条喵~"""
+    # 引入状态快照与冻结配置喵
+    state = make_state()
+    # 冻结该虚拟模型的一个候选喵
+    state.freeze(state.config.virtual_models["auto-test"][0], 600, "测试冻结")
+    # 取虚拟模型健康快照喵
+    snapshot = state.snapshot_virtual_model_health("auto-test")
+    # 没有请求时所有历史格都不能标记冻结喵
+    assert snapshot.all_time.total == 0
+    assert all(bucket.frozen is False for bucket in snapshot.buckets)
+@pytest.mark.asyncio
+async def test_上下文超限不计入上游失败统计但计入虚拟模型():
+    """上下文超限属于用户侧问题，不污染候选失败率但要保留虚拟模型失败结果喵~"""
+    # 引入规则和上游请求测试所需对象喵
+    from autoapi.state import CandidateStats
+    state = make_state()
+    # 让上游返回上下文超限错误喵
+    client = make_client(lambda request: httpx.Response(400, json={"error": {"message": "context_length_exceeded"}}))
+    # 执行一次完整请求喵
+    outcome = await run_proxy(client, state, {"model": "auto-test"})
+    # 整条候选链失败喵
+    assert outcome.success is False
+    # 第一个候选不应增加错误统计喵
+    candidate = state.config.virtual_models["auto-test"][0]
+    assert state.snapshot_stats().get(candidate.identity, CandidateStats()).failure == 0
+    # 虚拟模型仍应记录一次最终失败喵
+    assert state.snapshot_virtual_model_health("auto-test").all_time.total == 1
+
+
+def test_缓存Token提取与加权命中率():
+    # 引入上游 usage 解析和运行时状态喵
+    from autoapi.upstream import _extract_usage_info
+    # OpenAI usage 应识别输入和缓存 Token 喵
+    usage_info = _extract_usage_info({"usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {"cached_tokens": 40}}})
+    assert usage_info.total_tokens == 120
+    assert usage_info.input_tokens == 100
+    assert usage_info.cached_tokens == 40
+    # Anthropic usage 应识别缓存读取 Token 喵
+    anthropic_info = _extract_usage_info({"usage": {"input_tokens": 80, "output_tokens": 10, "cache_read_input_tokens": 20}})
+    assert anthropic_info.cached_tokens == 20
+    # 造状态并写入两个不同输入规模的请求喵
+    state = make_state()
+    state.record_virtual_model_health("auto-test", True, 120, 10, 100, 40)
+    state.record_virtual_model_health("auto-test", True, 220, 20, 200, 100)
+    # 再写一条没有缓存字段的请求，它不进入命中率分母喵
+    state.record_virtual_model_health("auto-test", True, 50, 5, 50, None)
+    snapshot = state.snapshot_virtual_model_health("auto-test")
+    # 加权命中率为 140/300，而不是逐请求平均的 45% 喵
+    assert snapshot.all_time.average_cache_hit_rate == pytest.approx(140 / 300)
+
+
 def test_滚动RPM和TPM只统计上游明确usage():
     """
     RPM 统计每条成功请求，TPM 只能统计上游明确报的 usage，绝不本地猜喵~
@@ -802,6 +854,18 @@ def test_滚动RPM和TPM只统计上游明确usage():
     assert row.usage_reported_requests == 1
     # TPM 必须保持未知，绝不显示 120 或本地估算值喵
     assert row.tpm is None
+
+
+def test_速率快照显示缓存命中率():
+    """持久状态栏使用的速率快照应携带输入加权缓存命中率喵~"""
+    # 造状态并写入一条含缓存字段的成功速率事件喵
+    state = make_state()
+    # 记录总 Token、输入 Token 和缓存读取 Token 喵
+    state.record_rate_event("auto-test", 120, 100, 40)
+    # 取速率快照喵
+    row = state.snapshot_virtual_model_rates()[0]
+    # 缓存命中率应为 40% 喵
+    assert row.average_cache_hit_rate == pytest.approx(0.4)
 
 
 def test_滚动RPM和TPM在全量上报时求和():
@@ -2858,7 +2922,27 @@ def make_repl(tmp_path):
     return Repl(state), path
 
 
-def test_REPL补全包含完整命令和新字段():
+def test_热更新删除候选后stats不再展示(tmp_path, capsys):
+    """配置删除候选后，stats 只应展示当前配置仍存在的上游喵~"""
+    # 造可写配置的 REPL 喵
+    repl, _ = make_repl(tmp_path)
+    # 先为两个候选制造统计记录喵
+    chain = repl.state.config.virtual_models["auto-test"]
+    repl.state.record_success(chain[0])
+    repl.state.record_success(chain[1])
+    # 构造删除第二个候选后的热更新配置喵
+    data = make_config_dict()
+    data["virtual_models"]["auto-test"] = [data["virtual_models"]["auto-test"][0]]
+    repl.state.replace_config(parse_config(data))
+    # 输出 stats 并读取文本喵
+    repl.cmd_stats()
+    output = capsys.readouterr().out
+    # 仍在配置中的首个模型应出现喵
+    assert "gpt-4o @ https://primary.test" in output
+    # 已删除的备用模型不应再出现喵
+    assert "claude-sonnet @ https://backup.test" not in output
+
+
     """
     Tab 补全必须覆盖 dispatch 实际支持的命令，尤其是 freeze add / freeze rm 喵~
 

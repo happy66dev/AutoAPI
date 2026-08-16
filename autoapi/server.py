@@ -337,6 +337,8 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                         attempt.rate_event = state.record_rate_event(
                             attempt.virtual_model,
                             attempt.usage_tokens,
+                            attempt.input_tokens,
+                            attempt.cached_tokens,
                         )
                         # 正常结束的流按一次客户端最终成功记入虚拟模型健康统计喵
                         state.record_virtual_model_health(
@@ -344,6 +346,8 @@ def _register_routes(app: FastAPI, state: RuntimeState) -> None:
                             True,
                             attempt.usage_tokens,
                             total_ms,
+                            attempt.input_tokens,
+                            attempt.cached_tokens,
                         )
                         # 把完整流耗时补到速率事件中喵
                         state.attach_elapsed_ms(attempt.rate_event, total_ms)

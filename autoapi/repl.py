@@ -252,6 +252,15 @@ def _render_history(snapshot: HealthSnapshot, width: int) -> str:
     return "".join(fragments)
 
 
+def _format_cache_hit_rate(rate: float | None) -> str:
+    """格式化平均缓存命中率，未上报时明确提示喵~"""
+    # 没有输入 Token 或缓存字段时不伪造百分比喵
+    if rate is None:
+        return "未上报"
+    # 喵~防御：命中率限制在 0% 到 100%，避免异常上游数据污染展示喵
+    return f"{max(0.0, min(1.0, rate)) * 100:.2f}%"
+
+
 def _format_error_time(timestamp: float | None) -> str:
     """格式化最近错误时间，无法取得时显示未知喵~"""
     # 没有时间戳时返回明确占位文本喵
@@ -262,6 +271,7 @@ def _format_error_time(timestamp: float | None) -> str:
         return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     except (OverflowError, OSError, ValueError):
         return "未知"
+
 
 def format_countdown(seconds: float) -> str:
     """
@@ -329,9 +339,11 @@ def render_freeze_banner(state: RuntimeState) -> list[tuple[str, str]]:
         # 每个有流量的虚拟模型一行，动态值会随配置窗口刷新喵
         if fragments:
             fragments.append(("", "\n"))
+        # 平均耗时右侧追加缓存命中率，沿用速率窗口的完整上报语义喵
+        cache_rate_text = _format_cache_hit_rate(rate.average_cache_hit_rate)
         fragments.extend([
             ("class:node", f"{rate.virtual_model}"),
-            ("", f"  RPM={rate.rpm}  TPM={tpm_text}  平均耗时={average_text}"),
+            ("", f"  RPM={rate.rpm}  TPM={tpm_text}  平均耗时={average_text} 平均缓存命中率={cache_rate_text}"),
         ])
     # 一个都没有就显示「全部可用」那一行喵
     if not rows:
@@ -576,9 +588,7 @@ class Repl:
             for virtual_model, chain in config.virtual_models.items()
             for candidate in chain
         }
-        # 统计表中可能存在已从配置删掉的历史候选，也继续展示其累计信息喵
-        for identity, row in stats.items():
-            known_candidates.setdefault(identity, ("未知虚拟模型", None))
+        # 统计表中已删除的历史候选不再展示，避免热更新后输出失效上游喵
         # 逐个候选输出完整健康信息喵
         for identity, (virtual_model, candidate) in known_candidates.items():
             # 从配置候选或身份串取得展示字段喵
@@ -607,7 +617,7 @@ class Repl:
                     window = snapshot.all_time if window_name == "所有时间" else snapshot.windows.get(window_name)
                     # 缺少窗口时按暂无请求处理，避免热重载期间异常喵
                     if window is None:
-                        window = HealthWindow(0, 0, 0, None)
+                        window = HealthWindow(0, 0, 0, None, None)
                     # 计算窗口百分比并选择阈值颜色喵
                     rate = window.success / window.total * 100 if window.total else None
                     rate_text, _ = _format_health_window(window)
@@ -648,16 +658,18 @@ class Repl:
             # 历史条统一使用最近 24 小时十分钟格喵
             terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
             print(f"      {_ansi('渲染图:', '33')} {_render_history(snapshot, max(1, terminal_width - 18))}")
-            # 追加用户要求的五个吞吐与平均耗时窗口喵
-            for window_name, window in (("近10分钟", snapshot.windows.get("近10分钟")), ("近30分钟", snapshot.windows.get("近30分钟")), ("近1小时", snapshot.windows.get("近1小时")), ("近6小时", snapshot.windows.get("近6小时")), ("所有时间", snapshot.all_time)):
+            # 追加用户要求的五个吞吐与平均耗时窗口，时间从大到小喵
+            for window_name, window in (("所有时间", snapshot.all_time), ("近6小时", snapshot.windows.get("近6小时")), ("近1小时", snapshot.windows.get("近1小时")), ("近30分钟", snapshot.windows.get("近30分钟")), ("近10分钟", snapshot.windows.get("近10分钟"))):
                 # 近十分钟直接使用状态层的十分钟窗口，避免历史格边界误差喵
+                # 缺少窗口时按暂无请求处理，避免热重载期间异常喵
                 if window is None:
-                    window = HealthWindow(0, 0, 0, None)
+                    window = HealthWindow(0, 0, 0, None, None)
                 # 只展示请求数、Token 数和平均耗时，缺 usage 按 0 体现喵
                 token_text = f"{_format_compact(window.tokens)}({_format_count(window.tokens)})"
                 print(
                     f"    {_ansi(window_name, '33')} 共 {_format_count(window.total)} 个请求 "
-                    f"总Token数量: {token_text} 平均耗时: {_format_duration(window.average_elapsed_ms)}"
+                    f"总Token数量: {token_text} 平均耗时: {_format_duration(window.average_elapsed_ms)} "
+                    f"平均缓存命中率: {_format_cache_hit_rate(window.average_cache_hit_rate)}"
                 )
 
     # ---------- 改规则类命令喵 ----------

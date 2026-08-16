@@ -52,6 +52,19 @@ from .upstream import AttemptResult, try_candidate
 logger = logging.getLogger("autoapi.proxy")
 
 
+def _is_context_limit_error(status: int, error_text: str) -> bool:
+    """判断是否为上游报告的上下文超限错误喵~"""
+    # 只把明确的 400 上下文窗口错误视为用户侧问题喵
+    if status != 400:
+        return False
+    # 兼容常见 OpenAI、Anthropic 和中转站错误关键词喵
+    normalized_error = error_text.lower()
+    return any(
+        marker in normalized_error
+        for marker in ("context_length_exceeded", "maximum context length", "context window")
+    )
+
+
 # count_tokens 只做 token 计数，不代表 LLM 输出能力喵~
 def _is_ignored_error_endpoint(server: ServerConfig, method: str, path: str) -> bool:
     """判断请求是否命中配置的接口错误忽略列表喵~"""
@@ -254,11 +267,18 @@ async def _run_one_candidate(
                     True,
                     result.usage_tokens,
                     (time.monotonic() - request_started_at) * 1000,
+                    result.input_tokens,
+                    result.cached_tokens,
                 )
             # 记录 RPM/TPM 事件：非流式完整响应已经结束，立即统一上报喵
             # 流式必须等整条流结束后再由 server 统一上报，放行时不能提前增加 RPM 喵
             if not is_stream:
-                result.rate_event = state.record_rate_event(virtual_model, result.usage_tokens)
+                result.rate_event = state.record_rate_event(
+                    virtual_model,
+                    result.usage_tokens,
+                    result.input_tokens,
+                    result.cached_tokens,
+                )
             # 保存虚拟模型名，流结束时 server 需要用它补写尾包 usage 喵
             result.virtual_model = virtual_model
             # 非流式请求此刻已经完整结束，立即补上完整耗时；流式要等生成器结束后再补喵
@@ -286,14 +306,18 @@ async def _run_one_candidate(
                 )
             # 返回成功结论喵
             return "ok", result
+        # 记录候选失败，但上下文超限属于用户侧问题，不计入上游模型错误统计喵
+        if _is_context_limit_error(result.status, result.error_text):
+            hedge_hits = 0
         # 被忽略接口不参与自动避险失败累计，避免接口缺失冻结正常候选喵
-        if ignored_error_endpoint:
+        elif ignored_error_endpoint:
             hedge_hits = 0
         # 普通接口继续按原逻辑累计自动避险失败喵
         else:
             # 阈值从配置里取，所以主人改了 auto_hedge_threshold 能立即生效喵
             hedge_hits = state.record_failure(
-                candidate, result.error_text, config.server.auto_hedge_threshold
+                candidate, result.error_text, config.server.auto_hedge_threshold,
+                count_health=not _is_context_limit_error(result.status, result.error_text),
             )
         # 达到连续失败阈值，自动把这个节点冻结起来避险喵。
         # 注意这一步和下面规则引擎的决策是独立的两件事：
