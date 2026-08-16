@@ -108,16 +108,37 @@ Important server settings:
 | `connect_timeout` | `15` | Upstream connection timeout, in seconds. |
 | `auto_hedge_threshold` | `5` | Consecutive failures before automatic freezing; `0` disables it. |
 | `auto_hedge_minutes` | `10` | Automatic freeze duration, in minutes. |
+| `metrics_window_minutes` | `30` | Average completion latency and cache-hit-rate window, in minutes. RPM and TPM always use the most recent 60 seconds. |
+| `reload_poll_interval` | `2.0` | Config-file hot-reload polling interval, in seconds; `0` disables automatic reload. |
+| `target_mode_max_wait_seconds` | `300` | Maximum retry duration after a full candidate-chain failure while target mode is on, in seconds. |
+| `target_mode_round_interval_seconds` | `5` | Delay between target-mode candidate-chain rounds, in seconds. |
+| `target_mode_timeout_action` | `return_504` | Timeout result: `return_504`, `return_429`, `return_502`, or `drop_connection`. |
 | `ignored_error_endpoints` | `POST /v1/messages/count_tokens` | Exact `method + path` endpoint list. Only `POST`, `PUT`, `PATCH`, `GET`, and `DELETE` are routable, and paths cannot contain `?` or `#`. Matching endpoints still follow candidate rules, but skip automatic hedging, target-mode retries, and candidate warnings; exhausted chains log one info entry and still return `502`. When omitted, the default entry is used; `[]` disables all defaults; any non-empty list replaces the defaults, so include the default entry explicitly when it should remain ignored. |
 
-For the complete REPL command reference, advanced timeout behavior, rule syntax, hot reload details, and target mode, see the [Chinese full documentation](README.md).
+## Runtime Statistics and REPL
+
+The REPL status bar shows each virtual model's RPM and TPM for the most recent 60 seconds, plus average completed-request latency and weighted average cache-hit rate for `metrics_window_minutes` (30 minutes by default). TPM uses only upstream-reported usage. Cache-hit rate uses explicitly reported cache-read tokens divided by input tokens: `usage.prompt_tokens_details.cached_tokens` for OpenAI-style responses and `usage.cache_read_input_tokens` for Anthropic-style responses. When required upstream fields are missing, the relevant metric is shown as incomplete rather than estimated.
+
+`stats` reports proxy totals (`total_requests` and `total_exhausted`), per-candidate success/failure/freeze and automatic-hedge counts, recent errors, and candidate/virtual-model health and resource data for all time, 6 hours, 1 hour, 30 minutes, and 10 minutes. Resource data includes request count, total tokens, average completed-request latency, and weighted average cache-hit rate.
+
+Useful REPL commands:
+
+| Command | Description |
+| --- | --- |
+| `stats` | Prints proxy, candidate, and virtual-model health/resource statistics. |
+| `cand set <virtual-model> <index> <field> <value>` | Updates candidate fields, including `stall_timeout`, `stream_timeout`, and `nonstream_timeout`. Use `default`, `none`, or `-` for those timeout fields to restore the global `server` value. |
+| `set metrics_window_minutes <minutes>` | Changes the average latency and cache-hit-rate window immediately. |
+| `freeze add/rm/clear ...` | Adds, removes, or clears temporary candidate freezes. |
+| `target on/off/status` | Controls a process-local target-mode switch; it is off again after restart. When enabled, exhausted chains retry from the start until `target_mode_max_wait_seconds`. |
+
+`target_mode_max_wait_seconds`, `target_mode_round_interval_seconds`, and `target_mode_timeout_action` are YAML settings, not `set` fields. Edit the config, then use hot reload, `reload`, or restart. At timeout, `return_504` returns `504` with `target_mode_gateway_timeout`; `return_429` and `return_502` return their respective status with `target_mode_all_unavailable`; `drop_connection` closes the connection.
 
 ## HTTP Endpoints
 
 | Path | Description |
 | --- | --- |
-| `GET /healthz` | Health check with virtual model count, frozen candidate count, request totals, and exhausted-chain totals. |
-| `GET /v1/models` | Lists virtual models in OpenAI format. |
+| `GET /healthz` | Health check returning `status`, `virtual_models`, `frozen_candidates`, `total_requests`, and `total_exhausted`. |
+| `GET /v1/models` | Lists virtual models in OpenAI list format; each item's `id` is the virtual model name. |
 | Any other path | Forwarded transparently to the upstream. |
 
 ## Security Notes

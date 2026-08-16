@@ -109,7 +109,7 @@ Copy-Item config.example config.yaml
 
 | 路径 | 说明 |
 | --- | --- |
-| `GET /healthz` | 健康检查，顺手报告虚拟模型数量、当前冻结数、累计请求数、累计用尽链路的请求数喵 |
+| `GET /healthz` | 健康检查，返回 JSON 字段 `status`、`virtual_models`、`frozen_candidates`、`total_requests`、`total_exhausted` 喵~ |
 | `GET /v1/models` | 按 OpenAI 格式列出所有虚拟模型，很多 GUI 客户端启动时会拉这个来填下拉框喵 |
 | 其余任意路径 | 通配透传，原样转发给上游喵 |
 
@@ -182,6 +182,7 @@ cand set auto-strong 1 stream_timeout default
 | `auto_hedge_threshold` | `5` | 一个节点连续失败多少次就自动避险。设成 `0` 表示关闭自动避险喵 |
 | `auto_hedge_minutes` | `10` | 自动避险触发后冻结多少分钟喵 |
 | `ignored_error_endpoints` | 默认忽略 `POST /v1/messages/count_tokens` | 按 HTTP method + path 精确匹配的接口列表，仅支持代理路由承接的 `POST`、`PUT`、`PATCH`、`GET`、`DELETE`，path 不可包含 `?` 或 `#`。命中后候选内部规则仍执行，但不累计自动避险、不进入目标模式、不输出候选 warning；候选全部失败时只记一条 info，客户端仍收到 502。未配置时使用默认条目；显式写 `[]` 可关闭默认忽略；填写任意非空列表时会整体替换默认条目，如需保留默认接口请一并写入列表喵 |
+| `metrics_window_minutes` | `30` | 平均耗时统计窗口，单位：分钟。RPM/TPM/平均缓存命中率固定统计最近 60 秒，可用 `set metrics_window_minutes <分钟>` 修改喵 |
 | `reload_poll_interval` | `2.0` | 配置热重载的轮询间隔，单位：秒。设成 `0` 表示关闭自动重载喵 |
 
 ### `virtual_models` 段
@@ -268,7 +269,7 @@ INFO autoapi.server 流式请求结束 虚拟模型=auto-strong 返回请求耗�
 - 流式请求的`请求首字`：从服务端收到客户端请求，到代理确认流健康并开始向客户端转发的耗时喵~
 - 流式请求的`返回请求耗时`：从服务端收到客户端请求，到上游流自然结束的完整耗时；放行后不会再受 `stream_timeout` 截断喵~
 
-REPL 底部状态栏会按虚拟模型显示最近 **60 秒** 的动态 RPM/TPM，以及配置窗口内的平均耗时喵~ RPM/TPM 固定统计最近 60 秒，平均耗时统计窗口默认是 30 分钟，可以用 `set metrics_window_minutes <分钟>` 修改喵~ RPM 是 60 秒内成功请求数，TPM **只使用上游响应中的 usage token**，不会按字符数或本地 tokenizer 估算喵~ 如果上游没有返回 usage，RPM 仍会统计，但 TPM 会显示「未完整上报」，避免把不准确的数字当成真实消耗喵~ 没有成功请求的虚拟模型（RPM=0）不会显示，节约状态栏空间喵~ 平均耗时只统计配置窗口内的正常完成请求：非流式响应必须完整成功，流式上游必须自然结束；客户端断开、上游读取异常和其他异常结束的流不会进入平均耗时喵~
+REPL 底部状态栏会按虚拟模型显示最近 **60 秒** 的动态 RPM/TPM，以及配置窗口内的平均耗时和平均缓存命中率喵~ RPM/TPM/平均缓存命中率固定统计最近 60 秒，只有平均耗时使用 `metrics_window_minutes` 配置窗口，默认是 30 分钟，可以用 `set metrics_window_minutes <分钟>` 修改喵~ RPM 是 60 秒内成功请求数，TPM **只使用上游响应中的 usage token**，不会按字符数或本地 tokenizer 估算喵~ 缓存命中率按上游明确上报的缓存读取 Token / 输入 Token 加权计算；OpenAI 使用 `usage.prompt_tokens_details.cached_tokens`，Anthropic 使用 `usage.cache_read_input_tokens`，缺少任一必要字段时显示「未完整上报」而不猜测数值喵~ 没有成功请求的虚拟模型（RPM=0）不会显示，节约状态栏空间喵~ 平均耗时只统计配置窗口内的正常完成请求：非流式响应必须完整成功，流式上游必须自然结束；客户端断开、上游读取异常和其他异常结束的流不会进入平均耗时喵~
 
 常见 usage 字段包括 OpenAI 的 `usage.total_tokens`，或 `prompt_tokens + completion_tokens`，以及 Anthropic 的 `input_tokens + output_tokens` 喵~ 上游不返回这些字段时，代理不会擅自修改请求或猜测 token 数喵。
 
@@ -282,12 +283,12 @@ target on
 target off
 ```
 
-开启后，某个虚拟模型的候选链整轮失败时，代理不会立即把 502 返回给客户端，而是按 `server.target_mode_round_interval_seconds` 从链首重新尝试，最多持续 `server.target_mode_max_wait_seconds` 喵~ 目标模式的超时动作由 `server.target_mode_timeout_action` 配置，可以返回 504、429、502，或直接断开连接喵~
+开启后，某个虚拟模型的候选链整轮失败时，代理不会立即把 502 返回给客户端，而是按 `server.target_mode_round_interval_seconds` 从链首重新尝试，最多持续 `server.target_mode_max_wait_seconds` 喵~ 超时后由 `server.target_mode_timeout_action` 决定结果：`return_504`（默认）返回 `504` 和错误类型 `target_mode_gateway_timeout`，`return_429` 返回 `429` 和 `target_mode_all_unavailable`，`return_502` 返回 `502` 和 `target_mode_all_unavailable`，`drop_connection` 直接断开连接喵~
 
+- `target on/off/status` 只改变当前进程内存状态，重启后自动关闭；`target_mode_max_wait_seconds`、`target_mode_round_interval_seconds`、`target_mode_timeout_action` 是 YAML 配置，需手动编辑后热重载、执行 `reload` 或重启才会更新喵~
 - 已冻结的节点仍然会跳过，不会为了目标模式反复撞额度限制或绕过自动避险喵~
 - `passthrough` 仍然立即回传，不会重试客户端自己的明确错误喵~
-- 5 分钟截止时会让当前轮完成，然后返回 HTTP 429，错误类型是 `target_mode_all_unavailable`，并携带轮数、等待时长和最后一轮失败原因喵~
-- 目标模式会让单个客户端请求最长占用约 5 分钟，请只在确实希望尽量不断线时开启喵~
+- 目标模式会让单个客户端请求最长占用约 `target_mode_max_wait_seconds`，请只在确实希望尽量不断线时开启喵~
 
 代理跑起来之后，同一个终端里就是一个 REPL（提示符 `autoapi> `），可以随时看状态、改配置、清冻结，**改完立即生效，不用重启**喵。它跑在独立线程里，敲命令不会影响正在转发的请求喵。
 
@@ -300,7 +301,15 @@ target off
 | `vm` | 列出所有虚拟模型及其候选链，标注每个节点是可用还是冻结中 | `vm` |
 | `rule ls` | 列出所有规则和它们的序号 | `rule ls` |
 | `freeze ls` | 列出当前所有冻结中的候选、剩余时间和冻结原因 | `freeze ls` |
-| `stats` | 打印每个候选的成功/失败/被冻结次数、当前连续失败数、最近错误 | `stats` |
+| `stats` | 打印代理累计计数，以及候选和虚拟模型的健康、资源与缓存统计，详见下文 | `stats` |
+
+`stats` 会显示：
+
+- 代理累计请求数 `total_requests` 和累计用尽整条候选链数 `total_exhausted`
+- 每个候选的成功/失败/被冻结次数、自动避险次数 `hedged_times`、当前连续失败数和最近错误
+- 候选与虚拟模型在所有时间、近 6 小时、近 1 小时、近 30 分钟、近 10 分钟窗口内的成功率、请求数、Token 数、平均耗时和平均缓存命中率
+
+`stats` 的请求数、Token 数和平均耗时按对应统计窗口展示；缺少 usage 或缓存字段时不会猜测，相关指标显示「未完整上报」喵~
 
 ### 虚拟模型
 
@@ -316,9 +325,9 @@ target off
 | `cand add <虚拟模型> <候选JSON>` | 给候选链末尾追加一个候选（也就是优先级最低） | `cand add auto-strong {"name": "新中转", "base_url": "https://x.com", "api_key": "sk-xxx", "model": "gpt-4o"}` |
 | `cand rm <虚拟模型> <序号>` | 删掉指定序号的候选。链里只剩一个时不许删，要整个不要就用 `vm rm` | `cand rm auto-strong 2` |
 | `cand mv <虚拟模型> <原序号> <新序号>` | 挪动候选位置来调整优先级，第 1 位最优先 | `cand mv auto-strong 3 1` |
-| `cand set <虚拟模型> <序号> <字段> <值>` | 改某个候选的单个字段，位置（优先级）不变。字段可选 `base_url`、`api_key`、`model`、`name`、`auth_style` | `cand set auto-strong 2 api_key sk-new-key-here` |
+| `cand set <虚拟模型> <序号> <字段> <值>` | 改某个候选的单个字段，位置（优先级）不变。字段可选 `base_url`、`api_key`、`model`、`name`、`auth_style`、`stall_timeout`、`stream_timeout`、`nonstream_timeout` | `cand set auto-strong 2 api_key sk-new-key-here` |
 
-`cand set` 比「删了重加」好用得多：不用把整个候选重新敲一遍，节点在链里的位置也不会变。改 `api_key` 时终端不会回显完整的新旧 key，只显示脱敏结果喵。
+`cand set` 比「删了重加」好用得多：不用把整个候选重新敲一遍，节点在链里的位置也不会变。可修改 `base_url`、`api_key`、`model`、`name`、`auth_style`，以及候选级 `stall_timeout`、`stream_timeout`、`nonstream_timeout` 覆盖。候选级超时填 `default`、`none` 或 `-` 可删除覆盖，恢复跟随 `server` 全局值；改 `api_key` 时终端不会回显完整的新旧 key，只显示脱敏结果喵~
 
 ### 规则
 
