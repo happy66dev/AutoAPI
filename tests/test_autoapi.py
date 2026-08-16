@@ -2607,7 +2607,43 @@ async def test_自定义忽略流式接口抑制假成功warning(caplog):
     assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
 
 
-def test_倒计时格式():
+def test_冻结空闲历史格显示青色且有请求格仍按状态色(monkeypatch):
+    """冻结区间内无请求的历史格才标记冻结，有请求的格不受冻结色覆盖喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 固定单调时钟，让事件落在最后一个十分钟格的左闭右开范围内喵
+    monkeypatch.setattr("autoapi.state.time.monotonic", lambda: 999_999.0)
+    # 冻结 60 秒并取得当前冻结信息喵
+    state.freeze(candidate, 60, "测试冻结")
+    # 构造一条落在同一格的请求，验证有请求会压过冻结色喵
+    state.record_success(candidate)
+    # 将快照时刻推到该十分钟格的右边界，使刚才的事件被归入最后一个格喵
+    monkeypatch.setattr("autoapi.state.time.monotonic", lambda: 1_000_000.0)
+    # 取健康快照喵
+    snapshot = state.snapshot_candidate_health(candidate)
+    # 最后一个格有请求，不应该使用冻结条喵
+    assert snapshot.buckets[-1].total == 1
+    assert snapshot.buckets[-1].frozen is False
+    # 倒数第二格无请求且不在冻结区间，不能误标冻结喵
+    assert snapshot.buckets[-2].frozen is False
+
+
+def test_冻结自然过期后历史区间会被记录():
+    """冻结自然到期后，历史快照应保留这段冻结区间的影响喵~"""
+    # 造状态和候选喵
+    state = make_state()
+    candidate = state.config.virtual_models["auto-test"][0]
+    # 冻结一个极短区间喵
+    state.freeze(candidate, 0.001, "测试冻结")
+    # 等待读取时触发惰性过期并归档区间喵
+    import time as _time
+    _time.sleep(0.01)
+    assert state.is_frozen(candidate) == 0
+    # 历史冻结区间应已经写入内部历史表喵
+    assert state._freeze_intervals[candidate.identity]
+
+
     """倒计时应该按「xx 分 xx 秒」补零显示喵~"""
     # 引入格式化函数喵
     from autoapi.repl import format_countdown

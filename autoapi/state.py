@@ -75,6 +75,16 @@ class HealthWindow:
 
 
 @dataclass(frozen=True)
+class FreezeInterval:
+    """候选历史冻结区间喵~"""
+
+    # 冻结开始的单调时刻喵
+    started_at: float
+    # 冻结结束的单调时刻喵
+    ended_at: float
+
+
+@dataclass(frozen=True)
 class HealthBucket:
     """十分钟历史条的一格快照喵~"""
 
@@ -156,6 +166,8 @@ class FreezeInfo:
     label: str
     # 冻结到期的单调时钟时刻，单位：秒喵
     until: float
+    # 本次冻结开始的单调时刻，单位：秒喵
+    started_at: float
     # 冻结原因，通常是上游返回的原始错误摘要喵
     reason: str
 
@@ -171,6 +183,8 @@ class RuntimeState:
         self._config = config
         # 冻结表：候选身份串 → 冻结记录喵
         self._freezes: dict[str, FreezeInfo] = {}
+        # 冻结历史：候选身份串 → 曾经发生过的冻结区间喵
+        self._freeze_intervals: dict[str, list[FreezeInterval]] = {}
         # 统计表：候选身份串 → 统计数据喵
         self._stats: dict[str, CandidateStats] = {}
         # 虚拟模型动态负载：虚拟模型名 → 当前统计窗口内的成功请求记录喵
@@ -240,6 +254,21 @@ class RuntimeState:
 
     # ---------- 冻结相关喵 ----------
 
+    def _record_freeze_interval_locked(self, identity: str, info: FreezeInfo, ended_at: float) -> None:
+        """在持锁状态下保存实际结束的冻结区间，供历史条回看喵~"""
+        # 冻结实际结束不能晚于原计划到期时间喵
+        actual_end = min(max(info.started_at, ended_at), info.until)
+        # 非正长度区间没有可展示价值，直接忽略喵
+        if actual_end <= info.started_at:
+            return
+        # 追加本次实际冻结区间喵
+        self._freeze_intervals.setdefault(identity, []).append(FreezeInterval(info.started_at, actual_end))
+        # 只保留 24 小时历史可能用到的区间，防止长期运行无限增长喵
+        cutoff = time.monotonic() - HEALTH_HISTORY_SECONDS
+        self._freeze_intervals[identity] = [
+            interval for interval in self._freeze_intervals[identity] if interval.ended_at >= cutoff
+        ]
+
     def is_frozen(self, candidate: Candidate) -> float:
         """
         查询候选是否还在冻结中喵~
@@ -260,6 +289,8 @@ class RuntimeState:
             remaining = round(remaining, 9)
             # 喵~防御：已经到期的记录顺手删掉并返回 0，防止冻结表无限膨胀喵
             if remaining <= 0:
+                # 记录自然到期的冻结区间，供历史条显示青色空闲格喵
+                self._record_freeze_interval_locked(candidate.identity, info, info.until)
                 del self._freezes[candidate.identity]
                 return 0.0
             # 还在冻结中，返回剩余秒数喵
@@ -272,12 +303,16 @@ class RuntimeState:
             return
         # 加锁写入冻结表和统计表喵
         with self._lock:
+            # 冻结开始时间，避免同一条记录里多次取单调时钟造成边界不一致喵
+            frozen_started_at = time.monotonic()
             # 记录到期时刻、可读标签和原因喵
             self._freezes[candidate.identity] = FreezeInfo(
                 # 候选的可读标签，展示用喵
                 label=candidate.label,
                 # 到期时刻 = 现在 + 冻结时长喵
-                until=time.monotonic() + seconds,
+                until=frozen_started_at + seconds,
+                # 记录冻结开始时刻，供十分钟历史格判断相交范围喵
+                started_at=frozen_started_at,
                 # 冻结原因，截断到 200 字符防止把整个上游响应体塞进内存喵
                 reason=reason[:200],
             )
@@ -288,7 +323,11 @@ class RuntimeState:
         """立即解冻某个候选，候选成功一次后调用，也供 REPL 手动解冻喵~"""
         # 加锁删除冻结记录，pop 带默认值所以不存在也不会报错喵
         with self._lock:
-            self._freezes.pop(candidate.identity, None)
+            # 取出并删除当前冻结记录喵
+            info = self._freezes.pop(candidate.identity, None)
+            # 有实际冻结记录时保留到当前为止的历史区间喵
+            if info is not None:
+                self._record_freeze_interval_locked(candidate.identity, info, time.monotonic())
 
     def clear_freezes(self) -> int:
         """清空所有冻结记录，返回被清掉的条数，供 REPL 的 freeze clear 用喵~"""
@@ -441,10 +480,12 @@ class RuntimeState:
             # 清理 24 小时之前的滚动历史，但不影响累计 totals 喵
             self._prune_health_events_locked(event.at)
 
-    def _health_snapshot_locked(self, events: list[HealthEvent], now: float, frozen: bool = False) -> HealthSnapshot:
+    def _health_snapshot_locked(self, events: list[HealthEvent], now: float, freeze_intervals: list[FreezeInterval] | None = None) -> HealthSnapshot:
         """在持锁状态下按窗口与十分钟格汇总健康事件喵~"""
         # 只使用当前仍在 24 小时历史范围内的事件喵
         recent_events = [event for event in events if event.at >= now - HEALTH_HISTORY_SECONDS]
+        # 喵~防御：调用方没有冻结历史时按空列表处理，方便独立测试和复用喵
+        freeze_intervals = freeze_intervals or []
         # 汇总一个事件列表为窗口快照喵
         def summarize(selected_events: list[HealthEvent]) -> HealthWindow:
             # 统计成功事件数量喵
@@ -466,12 +507,17 @@ class RuntimeState:
         bucket_count = int(HEALTH_HISTORY_SECONDS / HEALTH_BUCKET_SECONDS)
         bucket_start = now - HEALTH_HISTORY_SECONDS
         buckets: list[HealthBucket] = []
-        # 逐格汇总成功数和总数喵
+        # 逐格汇总成功数、总数以及该格是否完全落在冻结区间喵
         for bucket_index in range(bucket_count):
             start = bucket_start + bucket_index * HEALTH_BUCKET_SECONDS
             end = start + HEALTH_BUCKET_SECONDS
             bucket_events = [event for event in recent_events if start <= event.at < end]
-            buckets.append(HealthBucket(sum(int(event.success) for event in bucket_events), len(bucket_events), frozen))
+            # 只有没有请求且时间格与冻结区间相交时，才使用青色冻结条喵
+            bucket_frozen = (
+                not bucket_events
+                and any(start < interval.ended_at and end > interval.started_at for interval in freeze_intervals)
+            )
+            buckets.append(HealthBucket(sum(int(event.success) for event in bucket_events), len(bucket_events), bucket_frozen))
         # 返回完整健康快照喵
         return HealthSnapshot(all_time, windows, buckets)
 
@@ -486,11 +532,16 @@ class RuntimeState:
             # 查候选事件，没有就按空历史汇总喵
             events = self._candidate_health_events.get(candidate.identity, [])
             # 当前冻结状态用于将历史条统一标成青色提醒喵
-            frozen = bool(self._freezes.get(candidate.identity) and self._freezes[candidate.identity].until > now)
+            freeze_infos = []
+            current_freeze = self._freezes.get(candidate.identity)
+            if current_freeze is not None:
+                freeze_infos.append(FreezeInterval(current_freeze.started_at, current_freeze.until))
+            # 加入历史冻结区间，当前格有请求时渲染逻辑仍会优先使用状态色喵
+            freeze_infos.extend(self._freeze_intervals.get(candidate.identity, []))
             # 候选累计计数比 24 小时事件更适合表达「所有时间」喵
             candidate_totals = self._stats.get(candidate.identity, CandidateStats())
             # 返回窗口和历史条快照，并保留进程内累计成功率喵
-            snapshot = self._health_snapshot_locked(events, now, frozen)
+            snapshot = self._health_snapshot_locked(events, now, freeze_infos)
             # 候选累计总数来自原有永久统计，避免 24 小时清理改变所有时间口径喵
             lifetime_window = HealthWindow(
                 candidate_totals.success,
@@ -515,14 +566,15 @@ class RuntimeState:
             totals = self._virtual_health_totals.get(virtual_model, [0.0, 0.0, 0.0, 0.0, 0.0])
             # 计算累计平均耗时，没有完整请求时保持未知喵
             lifetime_average = totals[3] / totals[4] if totals[4] > 0 else None
-            # 虚拟模型冻结由其候选链任意节点冻结表示，当前先按模型整体不可用处理喵
-            frozen = any(
-                info.until > now
-                for identity, info in self._freezes.items()
-                if any(candidate.identity == identity for candidate in self._config.virtual_models.get(virtual_model, []))
-            )
+            # 收集该虚拟模型每个候选的当前和历史冻结区间喵
+            freeze_infos: list[FreezeInterval] = []
+            for candidate in self._config.virtual_models.get(virtual_model, []):
+                current_freeze = self._freezes.get(candidate.identity)
+                if current_freeze is not None:
+                    freeze_infos.append(FreezeInterval(current_freeze.started_at, current_freeze.until))
+                freeze_infos.extend(self._freeze_intervals.get(candidate.identity, []))
             # 返回窗口和历史条快照喵
-            snapshot = self._health_snapshot_locked(events, now, frozen)
+            snapshot = self._health_snapshot_locked(events, now, freeze_infos)
             # 所有时间窗口使用进程内累计成功、请求、Token 和平均耗时喵
             lifetime_window = HealthWindow(int(totals[0]), int(totals[1]), int(totals[2]), lifetime_average)
             # 保留滚动窗口和历史条，替换掉仅限 24 小时的所有时间窗口喵
